@@ -8,6 +8,13 @@ export struct DiskInfo {
     percent: float,   // used fraction 0.0..1.0
 }
 
+// One GPU row for the GPU panel.
+export struct GpuInfo {
+    label: string,    // "GPU0", "GPU1", etc.
+    detail: string,   // "2048/8192M"
+    percent: float,   // used fraction 0.0..1.0
+}
+
 // --- StatRow ---------------------------------------------------------------
 // A single label / percentage / progress-bar row used for CPU / memory / swap.
 component StatRow inherits HorizontalLayout {
@@ -211,6 +218,7 @@ export component Sidebar inherits Rectangle {
     in property <string> net-selected;
     in property <bool> net-show-selector;
     in property <[DiskInfo]> disks;
+    in property <[GpuInfo]> gpus;          // per-GPU stats (empty = no GPU)
     in property <bool> proc-available;   // a live remote session → show the process button (#23)
     // App version string, injected from Rust (env!("CARGO_PKG_VERSION")) so it
     // always matches Cargo.toml without hand-editing this file.
@@ -315,6 +323,12 @@ export component Sidebar inherits Rectangle {
                 percent: root.swap-percent;
                 detail: root.swap-detail;
                 bar-color: Theme.warning;
+            }
+            for gpu in root.gpus : StatRow {
+                label: gpu.label;
+                percent: gpu.percent;
+                detail: gpu.detail;
+                bar-color: Theme.danger;
             }
         }
 

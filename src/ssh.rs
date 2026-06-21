@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::config::{AuthMethod, Session};
+use crate::system::GpuSnapshot;
 use crate::i18n::t;
 
 // ---------------------------------------------------------------------------
@@ -350,6 +351,8 @@ pub enum SessionEvent {
         disks: Vec<(String, u64, u64)>,
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
+        /// Per-GPU stats from nvidia-smi. Empty if no NVIDIA GPU or command failed.
+        gpus: Vec<GpuSnapshot>,
     },
 
     /// A command the user ran in the terminal, captured via the shell hook
@@ -668,7 +671,7 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __GPU__; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
     let mut mon_channel = match handle.channel_open_session().await {
         Ok(ch) => match ch.exec(true, MON_CMD).await {
             Ok(()) => Some(ch),
@@ -978,6 +981,7 @@ fn parse_monitor_block(
         Top,
         Df,
         Ps,
+        Gpu,
     }
     let mut section = Section::Top;
 
@@ -986,6 +990,9 @@ fn parse_monitor_block(
     // (#27). No real machine has anywhere near this many.
     const MAX_MON_ENTRIES: usize = 64;
 
+    // GPU stats from nvidia-smi — per-GPU.
+    let mut gpus: Vec<GpuSnapshot> = Vec::new();
+
     for line in block.lines() {
         if line == "__DF__" {
             section = Section::Df;
@@ -993,6 +1000,10 @@ fn parse_monitor_block(
         }
         if line == "__PS__" {
             section = Section::Ps;
+            continue;
+        }
+        if line == "__GPU__" {
+            section = Section::Gpu;
             continue;
         }
         match section {
@@ -1013,6 +1024,28 @@ fn parse_monitor_block(
                 continue;
             }
             Section::Top => {}
+            Section::Gpu => {
+                // nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total
+                // --format=csv,noheader,nounits outputs comma-separated values.
+                // e.g. "45, 2048, 16384" (with optional spaces after commas).
+                // One line per GPU.
+                let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                if parts.len() >= 3 {
+                    if let (Ok(util), Ok(used), Ok(total)) = (
+                        parts[0].parse::<f32>(),
+                        parts[1].parse::<u64>(),
+                        parts[2].parse::<u64>(),
+                    ) {
+                        gpus.push(GpuSnapshot {
+                            index: gpus.len() as u32,
+                            gpu_percent: (util / 100.0).clamp(0.0, 1.0),
+                            vram_used_mib: used,
+                            vram_total_mib: total,
+                        });
+                    }
+                }
+                continue;
+            }
         }
         if let Some(rest) = line.strip_prefix("cpu ") {
             let nums: Vec<u64> = rest
@@ -1096,6 +1129,7 @@ fn parse_monitor_block(
         net,
         disks,
         procs,
+        gpus,
     })
 }
 

@@ -1,11 +1,101 @@
-//! Lightweight poller for local machine stats (CPU / memory / network).
+//! Lightweight poller for local machine stats (CPU / memory / network / GPU).
 //!
 //! `sysinfo` is already a dependency for many Rust desktop apps; it gives us
 //! cross-platform data with ~2% CPU overhead at 1-second cadence.
+//!
+//! GPU monitoring uses NVML (NVIDIA Management Library) via `nvml-wrapper`.
 
 use std::time::Duration;
 
 use sysinfo::{Disks, Networks, System};
+
+// ---------------------------------------------------------------------------
+// GPU abstraction
+// ---------------------------------------------------------------------------
+
+/// Per-GPU snapshot returned by any GPU backend.
+#[derive(Debug, Clone, Default)]
+pub struct GpuSnapshot {
+    /// GPU index (0-based).
+    pub index: u32,
+    /// GPU core utilization 0.0..1.0.
+    pub gpu_percent: f32,
+    /// VRAM used in MiB.
+    pub vram_used_mib: u64,
+    /// VRAM total in MiB.
+    pub vram_total_mib: u64,
+}
+
+/// Trait for pluggable GPU backends (NVIDIA, Hygon, Ascend, …).
+#[allow(dead_code)]
+pub trait GpuBackend {
+    /// Human-readable GPU name (e.g. "NVIDIA GeForce RTX 4090").
+    fn name(&self) -> &str;
+    /// Sample current GPU stats for all GPUs. Returns empty vec on failure.
+    fn sample(&self) -> Vec<GpuSnapshot>;
+}
+
+/// NVIDIA GPU backend via NVML.
+#[allow(dead_code)]
+pub struct NvidiaBackend {
+    nvml: nvml_wrapper::Nvml,
+    device_count: u32,
+    name: String,
+}
+
+impl NvidiaBackend {
+    /// Try to initialise the NVML context. Returns `Err` if no NVIDIA driver
+    /// or GPU is present — callers should silently skip.
+    pub fn new() -> Result<Self, nvml_wrapper::error::NvmlError> {
+        let nvml = nvml_wrapper::Nvml::init()?;
+        let device_count = nvml.device_count()?;
+        if device_count == 0 {
+            return Err(nvml_wrapper::error::NvmlError::NotFound);
+        }
+        let device = nvml.device_by_index(0)?;
+        let name = device.name().unwrap_or_else(|_| "NVIDIA GPU".to_string());
+        Ok(Self {
+            nvml,
+            device_count,
+            name,
+        })
+    }
+}
+
+impl GpuBackend for NvidiaBackend {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn sample(&self) -> Vec<GpuSnapshot> {
+        let mut gpus = Vec::with_capacity(self.device_count as usize);
+        for i in 0..self.device_count {
+            let device = match self.nvml.device_by_index(i) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let util = match device.utilization_rates() {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let mem = match device.memory_info() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            gpus.push(GpuSnapshot {
+                index: i,
+                gpu_percent: (util.gpu as f32 / 100.0).clamp(0.0, 1.0),
+                vram_used_mib: mem.used / 1024 / 1024,
+                vram_total_mib: mem.total / 1024 / 1024,
+            });
+        }
+        gpus
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System snapshot
+// ---------------------------------------------------------------------------
 
 /// Snapshot passed to the UI each tick.
 #[derive(Debug, Clone, Default)]
@@ -22,6 +112,8 @@ pub struct SystemSnapshot {
     pub net_tx_per_sec: u64,
     /// Per-filesystem (mount, available_bytes, total_bytes).
     pub disks: Vec<(String, u64, u64)>,
+    /// Per-GPU stats. Empty when no GPU backend is available.
+    pub gpus: Vec<GpuSnapshot>,
 }
 
 /// Stateful sampler. Construct once per process and poll via [`Self::sample`].
@@ -32,6 +124,7 @@ pub struct SystemSampler {
     last_rx_total: u64,
     last_tx_total: u64,
     last_instant: std::time::Instant,
+    gpu: Option<Box<dyn GpuBackend>>,
 }
 
 impl SystemSampler {
@@ -42,6 +135,11 @@ impl SystemSampler {
         let last_rx_total = nets.iter().map(|(_, d)| d.total_received()).sum();
         let last_tx_total = nets.iter().map(|(_, d)| d.total_transmitted()).sum();
         let disks = Disks::new_with_refreshed_list();
+
+        // Try to initialise the NVIDIA GPU backend. Failure is non-fatal.
+        let gpu: Option<Box<dyn GpuBackend>> =
+            NvidiaBackend::new().ok().map(|b| Box::new(b) as Box<dyn GpuBackend>);
+
         Self {
             sys,
             nets,
@@ -49,6 +147,7 @@ impl SystemSampler {
             last_rx_total,
             last_tx_total,
             last_instant: std::time::Instant::now(),
+            gpu,
         }
     }
 
@@ -108,6 +207,9 @@ impl SystemSampler {
             .filter(|(_, _, total)| *total > 0)
             .collect();
 
+        // GPU — sample from the backend if available.
+        let gpus = self.gpu.as_ref().map(|b| b.sample()).unwrap_or_default();
+
         SystemSnapshot {
             cpu_percent,
             mem_percent,
@@ -120,6 +222,7 @@ impl SystemSampler {
             net_rx_per_sec,
             net_tx_per_sec,
             disks,
+            gpus,
         }
     }
 }

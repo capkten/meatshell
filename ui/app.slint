@@ -15,7 +15,7 @@ import "fonts/MeatshellMono-Bold.ttf";
 import "fonts/MaterialIcons-Regular.ttf";
 
 import { Theme } from "theme.slint";
-import { Sidebar, DiskInfo } from "sidebar.slint";
+import { Sidebar, DiskInfo, GpuInfo } from "sidebar.slint";
 import { TabBar, TabInfo } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
@@ -217,6 +217,7 @@ export component AppWindow inherits Window {
     in property <string> net-selected;      // currently selected NIC
     in property <bool> net-show-selector;   // only on a live session tab
     in property <[DiskInfo]> disks;         // active tab's filesystem usage
+    in property <[GpuInfo]> gpus;           // per-GPU stats (empty = no GPU)
     in property <string> app-version;       // from Rust: env!("CARGO_PKG_VERSION")
     callback select-net-iface(string);
 
@@ -611,6 +612,7 @@ export component AppWindow inherits Window {
             net-selected: root.net-selected;
             net-show-selector: root.net-show-selector;
             disks: root.disks;
+            gpus: root.gpus;
             proc-available: root.proc-available;
             app-version: root.app-version;
             select-net-iface(i) => { root.select-net-iface(i); }

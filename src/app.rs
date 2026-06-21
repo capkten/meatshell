@@ -110,6 +110,8 @@ struct TabStatus {
     disks: Vec<(String, u64, u64)>,
     /// Top remote processes by CPU, for the process monitor popup (#23).
     procs: Vec<ProcInfo>,
+    /// Remote GPU stats from nvidia-smi.
+    gpus: Vec<crate::system::GpuSnapshot>,
 }
 type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 /// Last local-machine sample (shown on the welcome tab).
@@ -2086,6 +2088,24 @@ fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
+/// Build the GPU model for the sidebar from local GPU snapshots.
+fn gpu_model(gpus: &[crate::system::GpuSnapshot]) -> ModelRc<GpuInfo> {
+    let rows: Vec<GpuInfo> = gpus
+        .iter()
+        .map(|g| GpuInfo {
+            label: format!("GPU{}", g.index).into(),
+            detail: format_mem(g.vram_used_mib, g.vram_total_mib).into(),
+            percent: g.gpu_percent,
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+/// Build the GPU model for the sidebar from remote GPU data.
+fn gpu_model_remote(gpus: &[crate::system::GpuSnapshot]) -> ModelRc<GpuInfo> {
+    gpu_model(gpus)
+}
+
 /// Build the process-monitor model for the popup (#23). `cpu`/`mem` are
 /// pre-formatted to one decimal; `cpu_frac` (0..1) drives the row's load bar.
 fn proc_rows(procs: &[ProcInfo]) -> Vec<ProcRow> {
@@ -2422,6 +2442,7 @@ fn refresh_sidebar(
         win.set_swap_percent(snap.swap_percent);
         win.set_mem_detail(format_mem(snap.mem_used_mib, snap.mem_total_mib).into());
         win.set_swap_detail(format_mem(snap.swap_used_mib, snap.swap_total_mib).into());
+        win.set_gpus(gpu_model(&snap.gpus));
     };
     let clear_stats = |win: &AppWindow| {
         win.set_cpu_percent(0.0);
@@ -2429,6 +2450,7 @@ fn refresh_sidebar(
         win.set_swap_percent(0.0);
         win.set_mem_detail("".into());
         win.set_swap_detail("".into());
+        win.set_gpus(ModelRc::from(Rc::new(VecModel::<GpuInfo>::default())));
     };
 
     // Process monitor (#23) lives in a shared model (the AppWindow and the
@@ -2470,6 +2492,7 @@ fn refresh_sidebar(
             win.set_swap_detail(
                 format_mem(st.swap_used_kib / 1024, st.swap_total_kib / 1024).into(),
             );
+            win.set_gpus(gpu_model_remote(&st.gpus));
             let (name, rx, tx) = selected_iface(&st);
             win.set_net_top_up(format_bytes_per_sec(tx).into());
             win.set_net_top_down(format_bytes_per_sec(rx).into());
@@ -2649,6 +2672,7 @@ fn apply_session_event_to_window(
             net,
             disks,
             procs,
+            gpus,
         } => {
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.cpu = cpu_percent;
@@ -2659,6 +2683,7 @@ fn apply_session_event_to_window(
                 st.net = net;
                 st.disks = disks;
                 st.procs = procs;
+                st.gpus = gpus;
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;

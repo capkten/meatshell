@@ -26,6 +26,8 @@ thiserror = "1"
 directories = "5"
 chrono = { version = "0.4", features = ["serde"] }
 sysinfo = "0.33"
+# NVIDIA GPU monitoring via NVML (nvidia-smi's underlying C library).
+nvml-wrapper = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "time", "fs"] }
 russh = "0.49"
