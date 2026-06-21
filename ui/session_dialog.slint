@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
+import { TextEdit } from "std-widgets.slint";
 
 // One SSH port-forward row shown in the session dialog (#56). `summary` is a
 // ready-to-display line like "-L 127.0.0.1:8080 → host:80".
@@ -21,6 +22,7 @@ export struct SessionDraft {
     private-key-path: string,
     proxy: string,     // "" | "socks5://host:port" | "http://host:port"
     group: string,     // folder/group name ("" = ungrouped)
+    notes: string,     // user-defined notes/memo
     // Serial-only (ignored unless kind == "serial")
     serial-port: string,
     baud-rate: int,
@@ -105,6 +107,7 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> draft-proxy-hostport;
     in-out property <string> draft-group;
+    in-out property <string> draft-notes;
     in-out property <string> draft-serial-port;
     in-out property <string> draft-baud: "115200";
     in-out property <string> draft-data-bits: "8";
@@ -217,6 +220,22 @@ export component SessionDialog inherits Rectangle {
                 label: @tr("Group (optional)");
                 placeholder: @tr("e.g. Production / Database");
                 value <=> root.draft-group;
+            }
+
+            // Optional notes/memo for this session (multi-line).
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Notes (optional)");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                notes-te := TextEdit {
+                    height: 80px;
+                    text <=> root.draft-notes;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
             }
 
             // ── SSH / Telnet share host + port ──────────────────────────────
@@ -580,6 +599,7 @@ export component SessionDialog inherits Rectangle {
                                  : root.draft-proxy-type == "http" ? "http://" + root.draft-proxy-hostport
                                  : "socks5://" + root.draft-proxy-hostport,
                             group: root.draft-group,
+                            notes: root.draft-notes,
                             serial-port: root.draft-serial-port,
                             baud-rate: root.draft-baud.to-float(),
                             data-bits: root.draft-data-bits.to-float(),

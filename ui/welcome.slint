@@ -13,6 +13,7 @@ export struct SessionInfo {
     group: string,        // folder/group name ("" = ungrouped)
     group-header: string, // set on the first row of each group → render a header
     collapsed: bool,      // group is collapsed → this session row is hidden
+    notes: string,        // user-defined notes/memo
 }
 
 // --- SessionRow ------------------------------------------------------------
@@ -196,7 +197,16 @@ component SessionRow inherits Rectangle {
             color: Theme.text-secondary;
             font-size: Theme.fs-sm;
             vertical-alignment: center;
+            width: 100px;
+            overflow: elide;
+        }
+        if session.notes != "" : Text {
+            text: session.notes;
+            color: Theme.text-muted;
+            font-size: Theme.fs-xs;
+            vertical-alignment: center;
             horizontal-stretch: 1;
+            overflow: elide;
         }
     }
 }

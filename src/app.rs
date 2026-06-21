@@ -1164,6 +1164,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         group: group.into(),
         group_header: group.into(),
         collapsed: false,
+        notes: "".into(),
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
@@ -1198,6 +1199,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                         "".into()
                     },
                     collapsed: false,
+                    notes: s.notes.lines().next().unwrap_or("").to_string().into(),
                 });
             }
         }
@@ -1253,6 +1255,7 @@ fn wire_session_callbacks(
             w.set_dialog_proxy_type("none".into());
             w.set_dialog_proxy_hostport("".into());
             w.set_dialog_group("".into());
+            w.set_dialog_notes("".into());
             w.set_dialog_kind("ssh".into());
             w.set_dialog_serial_port("".into());
             w.set_dialog_baud("115200".into());
@@ -1402,6 +1405,7 @@ fn wire_session_callbacks(
                 w.set_dialog_proxy_type(proxy_type.into());
                 w.set_dialog_proxy_hostport(proxy_hostport.into());
                 w.set_dialog_group(session.group.clone().into());
+                w.set_dialog_notes(session.notes.clone().into());
                 w.set_dialog_kind(session.kind.as_str().into());
                 w.set_dialog_serial_port(session.serial_port.clone().into());
                 w.set_dialog_baud(session.baud_rate.to_string().into());
@@ -1625,6 +1629,7 @@ fn wire_session_callbacks(
                 proxy: draft.proxy.to_string(),
                 last_used: None,
                 group: draft.group.to_string(),
+                notes: draft.notes.to_string(),
                 kind,
                 serial_port: draft.serial_port.to_string(),
                 baud_rate: if draft.baud_rate <= 0 {

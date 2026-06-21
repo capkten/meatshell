@@ -175,6 +175,9 @@ pub struct Session {
     /// Empty = ungrouped. Sessions are grouped by this in Quick Connect.
     #[serde(default)]
     pub group: String,
+    /// User-defined notes/memo for this session (e.g. "production DB server").
+    #[serde(default)]
+    pub notes: String,
 
     // --- Transport ----------------------------------------------------------
     /// SSH (default), Serial, or Telnet. Absent in old config files → Ssh.
@@ -238,6 +241,7 @@ impl Session {
             proxy: String::new(),
             last_used: None,
             group: String::new(),
+            notes: String::new(),
             kind: SessionKind::Ssh,
             serial_port: String::new(),
             baud_rate: default_baud(),
