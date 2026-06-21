@@ -35,6 +35,18 @@ fn main() -> anyhow::Result<()> {
     // The renderer-skia feature is still compiled in on macOS (see Cargo.toml) so
     // that override is available without a rebuild.
 
+    // Auto-detect remote desktop sessions and fall back to software rendering.
+    // Hardware-accelerated renderers (femtovg/skia) often white-screen over
+    // remote desktop tools (RDP, Sunflower/向日葵, ToDesk, etc.) because they
+    // can't access the GPU's OpenGL/Vulkan context.
+    //
+    // If the user already set SLINT_BACKEND we respect it unconditionally.
+    if std::env::var("SLINT_BACKEND").is_err() {
+        if is_remote_desktop() {
+            std::env::set_var("SLINT_BACKEND", "software");
+        }
+    }
+
     init_tracing();
 
     // ── IME policy ───────────────────────────────────────────────────────────
@@ -55,7 +67,56 @@ fn main() -> anyhow::Result<()> {
     app::run()
 }
 
-/// Set up tracing: stderr (honours RUST_LOG, default info) **plus** a capped
+/// Detect whether the app is running inside a remote desktop session.
+///
+/// Checks Windows RDP via `GetSystemMetrics(SM_REMOTESESSION)` and scans for
+/// common third-party remote desktop agents (Sunflower/向日葵, ToDesk, etc.)
+/// whose OpenGL contexts are unreliable over the network.
+#[cfg(windows)]
+fn is_remote_desktop() -> bool {
+    // 1. Native RDP session (mstsc.exe / Windows Remote Desktop).
+    const SM_REMOTESESSION: i32 = 0x1000;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetSystemMetrics(nIndex: i32) -> i32;
+    }
+    if unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0 {
+        return true;
+    }
+
+    // 2. Third-party remote desktop agents — check if their core processes are
+    //    running.  This covers the most common tools in the Chinese market that
+    //    white-screen with hardware rendering.
+    let remote_agents: &[&str] = &[
+        "SunloginClient",   // 向日葵
+        "SunloginService",  // 向日葵 service
+        "ToDesk",           // ToDesk
+        "ToDesk_Service",
+        "AnyDesk",          // AnyDesk
+        "AnyDesk_Service",
+        "TeamViewer",       // TeamViewer
+    ];
+
+    // sysinfo is already a dependency; use it for a lightweight process scan.
+    use sysinfo::System;
+    let sys = System::new_all();
+    for proc in sys.processes().values() {
+        let name = proc.name().to_string_lossy().to_lowercase();
+        for agent in remote_agents {
+            if name.contains(&agent.to_lowercase()) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(not(windows))]
+fn is_remote_desktop() -> bool {
+    // On Linux/macOS we don't auto-detect; users can set SLINT_BACKEND=software.
+    false
+}
 /// `error.log` file at WARN and above so users can send diagnostics — e.g. a
 /// bastion disconnect reason — without setting RUST_LOG (#86).
 fn init_tracing() {
