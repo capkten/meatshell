@@ -5,6 +5,33 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
+## [0.4.16] - 2026-06-22
+
+### Added / 新增
+
+- **已知主机校验支持系统 known_hosts fallback。** 现在会优先读取项目配置的 known_hosts，
+  如果项目配置中没有对应主机的记录，则 fallback 到系统 `~/.ssh/known_hosts` 文件。
+  自动处理 OpenSSH 格式兼容（默认端口 22 自动补全）。
+  **Known-hosts verification with system known_hosts fallback.** The project now reads
+  the project-level known_hosts first, then falls back to the system `~/.ssh/known_hosts`
+  for hosts not found in the project file. OpenSSH format compatibility is handled
+  automatically (default port 22 is normalized).
+
+### Fixed / 修复
+
+- **主机密钥拒绝后无法重试连接。** 之前用户在主机密钥确认对话框点击"拒绝"后，该决定会被
+  缓存，导致后续连接同一服务器时再也无法弹出确认对话框。现在只缓存接受的决定，拒绝后
+  下次连接会重新弹窗确认。
+  **Cannot retry connection after rejecting host key.** Previously, rejecting a host key
+  cached the decision permanently, preventing the confirmation dialog from appearing again
+  for the same server. Now only accepted decisions are cached; rejecting allows retry on
+  the next connection attempt.
+
+- **资源面板停靠到顶部/底部时 GPU 状态不显示。** 水平布局（面板停靠上/下）缺少 GPU 状态
+  显示组件，现在已补充。
+  **GPU status not shown when resource panel docked top/bottom.** The horizontal layout
+  (panel docked to top/bottom edge) was missing the GPU status display component.
+
 ## [0.4.14] - 2026-06-22
 
 ### Added / 新增
