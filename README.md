@@ -74,7 +74,7 @@ xattr -dr com.apple.quarantine meatshell     # 去掉「未签名应用」的 Ga
 
 ### 计划中
 
-- [ ] 已知主机 (known_hosts) 校验
+- [x] 已知主机 (known_hosts) 校验（支持系统 ~/.ssh/known_hosts fallback）
 - [ ] 会话密码改用 OS 钥匙串存储
 - [ ] 多标签页终端分屏
 
@@ -127,17 +127,6 @@ meatshell/
   反馈方式。
 - 应用事件循环是单线程（Slint 要求），所有跨线程 UI 更新通过
   `slint::invoke_from_event_loop` 回调。
-- 目前 `check_server_key` 接受任意服务端密钥（类似 `StrictHostKeyChecking=no`），
-  生产使用前请接入 known_hosts 校验。
-
-## 赞赏 / 请我喝杯咖啡
-
-觉得作品还不错的话，请我喝杯咖啡吧 ☕
-
-<p align="center">
-  <strong>亮出网络乞丐乞讨专用码</strong><br>
-  <img src="docs/screenshots/sponsor-wechat.png" alt="微信赞赏码" width="260">
-</p>
 
 ## License
 

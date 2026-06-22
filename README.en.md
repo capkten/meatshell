@@ -78,7 +78,7 @@ xattr -dr com.apple.quarantine meatshell     # clear the "unsigned app" Gatekeep
 
 ### Planned
 
-- [ ] Known-hosts (`known_hosts`) verification
+- [x] Known-hosts (`known_hosts`) verification (with system ~/.ssh/known_hosts fallback)
 - [ ] Store session passwords in the OS keychain
 - [ ] Split panes for tabbed terminals
 
@@ -132,9 +132,6 @@ meatshell/
   `cargo check` is the fastest feedback loop.
 - The application event loop is single-threaded (required by Slint); all
   cross-thread UI updates go through `slint::invoke_from_event_loop` callbacks.
-- `check_server_key` currently accepts any server key (like
-  `StrictHostKeyChecking=no`); wire up known-hosts verification before
-  production use.
 
 ## License
 
