@@ -494,6 +494,12 @@ export component Sidebar inherits Rectangle {
                 mem-detail: root.mem-detail; swap-detail: root.swap-detail;
                 show-processes() => { root.show-processes(); }
             }
+            for gpu in root.gpus : StatRow {
+                label: gpu.label;
+                percent: gpu.percent;
+                detail: gpu.detail;
+                bar-color: Theme.danger;
+            }
         }
         Rectangle { width: 1px; background: Theme.border-subtle; }
         NetBlock {
