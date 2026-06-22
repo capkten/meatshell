@@ -12,10 +12,11 @@
 //!     `host:port ssh-ed25519 AAAA...`
 //! i.e. the `host:port` id followed by the key in its OpenSSH one-line form.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use ssh_key::{HashAlg, PublicKey};
 
 /// Result of checking a server key against the store.
@@ -34,11 +35,18 @@ fn id(host: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
-/// Path to the known_hosts file (alongside sessions.json). `None` if the user
-/// config directory can't be determined.
-fn path() -> Option<PathBuf> {
+/// Path to the project known_hosts file (alongside sessions.json). `None` if
+/// the user config directory can't be determined.
+fn project_path() -> Option<PathBuf> {
     let dirs = ProjectDirs::from("dev", "meatshell", "meatshell")?;
     Some(dirs.config_dir().join("known_hosts"))
+}
+
+/// Path to the system known_hosts file (~/.ssh/known_hosts). `None` if the
+/// home directory can't be determined.
+fn system_path() -> Option<PathBuf> {
+    let dirs = BaseDirs::new()?;
+    Some(dirs.home_dir().join(".ssh").join("known_hosts"))
 }
 
 /// The presented key in its canonical OpenSSH one-line form (`type base64`,
@@ -55,11 +63,13 @@ pub fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
 }
 
-/// Parse the file into `(id, openssh_key)` entries. Missing file → empty.
-/// Malformed / comment (`#`) lines are skipped.
-fn load() -> Vec<(String, String)> {
-    let Some(p) = path() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&p) else {
+/// Parse a single known_hosts file into `(id, openssh_key)` entries.
+/// Missing file → empty. Malformed / comment (`#`) lines are skipped.
+///
+/// For system known_hosts (OpenSSH format), entries without a port are
+/// normalized to `host:22` so they match our `host:port` lookup key.
+fn load_file(path: &PathBuf, normalize_port: bool) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     text.lines()
@@ -69,9 +79,33 @@ fn load() -> Vec<(String, String)> {
                 return None;
             }
             let (id, key) = line.split_once(char::is_whitespace)?;
-            Some((id.to_string(), key.trim().to_string()))
+            let id = if normalize_port && !id.contains(':') {
+                format!("{id}:22")
+            } else {
+                id.to_string()
+            };
+            Some((id, key.trim().to_string()))
         })
         .collect()
+}
+
+/// Load entries with fallback: project config first, then system known_hosts
+/// for hosts not found in the project file. This avoids conflicts when the
+/// same host appears in both files with different keys.
+fn load() -> Vec<(String, String)> {
+    // Project file already uses host:port format
+    let mut entries = load_file(&project_path().unwrap_or_default(), false);
+    let project_hosts: HashSet<_> = entries.iter().map(|(id, _)| id.clone()).collect();
+
+    // System known_hosts uses OpenSSH format (no port = 22)
+    if let Some(sys_path) = system_path() {
+        for (id, key) in load_file(&sys_path, true) {
+            if !project_hosts.contains(&id) {
+                entries.push((id, key));
+            }
+        }
+    }
+    entries
 }
 
 /// Check a presented server key against the store.
@@ -95,17 +129,18 @@ pub fn verify(host: &str, port: u16, key: &PublicKey) -> HostKeyStatus {
     }
 }
 
-/// Remember (or replace) the key for `host:port`. Rewrites the file with any
-/// stale entry for the same id removed, then appends the new one.
+/// Remember (or replace) the key for `host:port`. Rewrites the project file
+/// with any stale entry for the same id removed, then appends the new one.
+/// Always writes to the project file, not the system known_hosts.
 pub fn remember(host: &str, port: u16, key: &PublicKey) -> Result<()> {
-    let p = path().context("could not determine config directory")?;
+    let p = project_path().context("could not determine config directory")?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).context("create config dir")?;
     }
     let id = id(host, port);
     let line = openssh_line(key);
     let mut out = String::new();
-    for (entry_id, entry_key) in load() {
+    for (entry_id, entry_key) in load_file(&p, false) {
         if entry_id == id {
             continue; // drop the old key for this host:port
         }

@@ -3147,10 +3147,13 @@ fn resolve_front_hostkey(win: &AppWindow, accept: bool) {
     let has_next = HOSTKEY_QUEUE.with(|q| {
         let mut q = q.borrow_mut();
         if let Some(p) = q.pop_front() {
-            HOSTKEY_DECIDED.with(|d| {
-                d.borrow_mut()
-                    .insert(format!("{}:{}", p.host, p.port), accept);
-            });
+            // Only cache accepted decisions so users can retry after rejecting.
+            if accept {
+                HOSTKEY_DECIDED.with(|d| {
+                    d.borrow_mut()
+                        .insert(format!("{}:{}", p.host, p.port), true);
+                });
+            }
             for r in &p.responders {
                 r.respond(accept);
             }
