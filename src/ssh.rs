@@ -18,8 +18,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::config::{AuthMethod, Session};
-use crate::system::GpuSnapshot;
 use crate::i18n::t;
+use crate::system::GpuSnapshot;
 
 // ---------------------------------------------------------------------------
 // SFTP-related shared types
@@ -236,9 +236,7 @@ pub enum SessionCommand {
 /// enclosing [`SessionEvent`] stays `Clone` (a bare `oneshot::Sender` is not);
 /// the first `respond` consumes the sender, later calls are no-ops.
 #[derive(Clone)]
-pub struct HostKeyResponder(
-    Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>,
-);
+pub struct HostKeyResponder(Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>);
 
 impl HostKeyResponder {
     pub fn new(tx: tokio::sync::oneshot::Sender<bool>) -> Self {
@@ -523,7 +521,9 @@ async fn run_session(
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}:{} ...",
         t("连接中", "Connecting"),
-        session.user, session.host, session.port
+        session.user,
+        session.host,
+        session.port
     )));
 
     let config = Arc::new(client::Config {
@@ -537,7 +537,9 @@ async fn run_session(
     let (user, password) = match resolve_credentials(&session, &events).await {
         Some(c) => c,
         None => {
-            let _ = events.send(SessionEvent::Closed(t("已取消登录", "login cancelled").into()));
+            let _ = events.send(SessionEvent::Closed(
+                t("已取消登录", "login cancelled").into(),
+            ));
             let _ = handle
                 .disconnect(Disconnect::ByApplication, "cancelled", "")
                 .await;
@@ -605,7 +607,9 @@ async fn run_session(
 
     if !authed {
         tracing::warn!("ssh authentication failed for {}@{}", user, session.host);
-        let _ = events.send(SessionEvent::Closed(t("认证失败", "authentication failed").into()));
+        let _ = events.send(SessionEvent::Closed(
+            t("认证失败", "authentication failed").into(),
+        ));
         let _ = handle
             .disconnect(Disconnect::ByApplication, "auth failed", "")
             .await;
@@ -636,7 +640,8 @@ async fn run_session(
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}",
         t("已连接", "Connected"),
-        session.user, session.host
+        session.user,
+        session.host
     )));
 
     // Whether we have already injected the PROMPT_COMMAND setup.
@@ -979,7 +984,9 @@ async fn run_session(
     // The shell pump loop only exits when the channel closes / EOFs (incl. a
     // peer/bastion-initiated disconnect), so record it for #86 diagnostics.
     tracing::warn!("ssh connection closed ({}@{})", session.user, session.host);
-    let _ = events.send(SessionEvent::Closed(t("连接已关闭", "connection closed").into()));
+    let _ = events.send(SessionEvent::Closed(
+        t("连接已关闭", "connection closed").into(),
+    ));
     Ok(())
 }
 
@@ -1205,7 +1212,11 @@ fn parse_df_line(line: &str) -> Option<(String, u64, u64)> {
     let mount = f[5..].join(" ");
     // Saturating: a server can report arbitrary block counts; KiB→bytes must
     // not overflow-panic in debug (#27).
-    Some((mount, avail_kb.saturating_mul(1024), total_kb.saturating_mul(1024)))
+    Some((
+        mount,
+        avail_kb.saturating_mul(1024),
+        total_kb.saturating_mul(1024),
+    ))
 }
 
 /// Extract the leading integer (KiB) from a `/proc/meminfo` value like
@@ -1334,8 +1345,7 @@ pub(crate) async fn resolve_credentials(
     let mut user = session.user.trim().to_string();
     let mut password = session.password.as_str().to_string();
     let need_user = user.is_empty();
-    let need_password =
-        matches!(session.auth, AuthMethod::Password) && password.is_empty();
+    let need_password = matches!(session.auth, AuthMethod::Password) && password.is_empty();
     if !(need_user || need_password) {
         return Some((user, password));
     }
@@ -1478,9 +1488,8 @@ mod monitor_hardening_tests {
     #[test]
     fn cpu_overflow_values_do_not_panic() {
         let big = u64::MAX;
-        let block = format!(
-            "cpu {big} {big} {big} {big} {big}\nMemTotal: 1000 kB\nMemAvailable: 500 kB"
-        );
+        let block =
+            format!("cpu {big} {big} {big} {big} {big}\nMemTotal: 1000 kB\nMemAvailable: 500 kB");
         let mut prev = None;
         let mut prev_net = HashMap::new();
         let mut at = Instant::now();

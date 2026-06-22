@@ -137,8 +137,9 @@ impl SystemSampler {
         let disks = Disks::new_with_refreshed_list();
 
         // Try to initialise the NVIDIA GPU backend. Failure is non-fatal.
-        let gpu: Option<Box<dyn GpuBackend>> =
-            NvidiaBackend::new().ok().map(|b| Box::new(b) as Box<dyn GpuBackend>);
+        let gpu: Option<Box<dyn GpuBackend>> = NvidiaBackend::new()
+            .ok()
+            .map(|b| Box::new(b) as Box<dyn GpuBackend>);
 
         Self {
             sys,
@@ -183,7 +184,10 @@ impl SystemSampler {
         let rx_total: u64 = self.nets.iter().map(|(_, d)| d.total_received()).sum();
         let tx_total: u64 = self.nets.iter().map(|(_, d)| d.total_transmitted()).sum();
         let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_instant).as_secs_f64().max(0.001);
+        let elapsed = now
+            .duration_since(self.last_instant)
+            .as_secs_f64()
+            .max(0.001);
         let rx_delta = rx_total.saturating_sub(self.last_rx_total);
         let tx_delta = tx_total.saturating_sub(self.last_tx_total);
         self.last_rx_total = rx_total;

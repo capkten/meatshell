@@ -88,13 +88,13 @@ fn is_remote_desktop() -> bool {
     //    running.  This covers the most common tools in the Chinese market that
     //    white-screen with hardware rendering.
     let remote_agents: &[&str] = &[
-        "SunloginClient",   // 向日葵
-        "SunloginService",  // 向日葵 service
-        "ToDesk",           // ToDesk
+        "SunloginClient",  // 向日葵
+        "SunloginService", // 向日葵 service
+        "ToDesk",          // ToDesk
         "ToDesk_Service",
-        "AnyDesk",          // AnyDesk
+        "AnyDesk", // AnyDesk
         "AnyDesk_Service",
-        "TeamViewer",       // TeamViewer
+        "TeamViewer", // TeamViewer
     ];
 
     // sysinfo is already a dependency; use it for a lightweight process scan.
@@ -141,9 +141,8 @@ fn init_tracing() {
         f
     }
 
-    let env_filter = quiet_noise(
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-    );
+    let env_filter =
+        quiet_noise(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_filter(env_filter);

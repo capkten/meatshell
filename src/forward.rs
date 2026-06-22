@@ -90,7 +90,10 @@ pub fn spawn_local(
                         let mut stream = ch.into_stream();
                         let _ = copy_bidirectional(&mut inbound, &mut stream).await;
                     }
-                    Err(e) => notice(&ev, format!("-L {host}:{target_port} 连接失败 / open failed: {e}")),
+                    Err(e) => notice(
+                        &ev,
+                        format!("-L {host}:{target_port} 连接失败 / open failed: {e}"),
+                    ),
                 }
             });
         }

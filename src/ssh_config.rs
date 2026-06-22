@@ -220,8 +220,7 @@ Host scheme
     HostName http://x.com
 ";
         let home = Path::new("/home/me");
-        let aliases: Vec<String> =
-            parse_str(cfg, home).into_iter().map(|h| h.alias).collect();
+        let aliases: Vec<String> = parse_str(cfg, home).into_iter().map(|h| h.alias).collect();
         assert!(aliases.contains(&"good".to_string()));
         assert!(aliases.contains(&"ipv6".to_string()));
         assert!(!aliases.contains(&"evil".to_string()));

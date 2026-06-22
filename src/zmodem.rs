@@ -93,7 +93,10 @@ pub async fn receive(
         };
         tracing::debug!("zmodem rx header type={ftype} data={hdr:02x?}");
         match ftype {
-            ZRQINIT => rx.send_hex(ZRINIT, [0, 0, 0, CANFDX | CANOVIO | CANFC32]).await?,
+            ZRQINIT => {
+                rx.send_hex(ZRINIT, [0, 0, 0, CANFDX | CANOVIO | CANFC32])
+                    .await?
+            }
             ZFILE => {
                 // Data subpacket: "name\0size mtime mode ...".
                 let (sub, _end) = rx.read_subpacket(true).await?;
@@ -120,34 +123,48 @@ pub async fn receive(
                 });
                 rx.send_hex(ZRPOS, 0u32.to_le_bytes()).await?;
             }
-            ZDATA => {
-                loop {
-                    let (chunk, end) = rx.read_subpacket(true).await?;
-                    if let Some(c) = cur.as_mut() {
-                        c.file.write_all(&chunk).await.context("write file")?;
-                        c.written += chunk.len() as u64;
-                        emit(events, &c.id, &c.name, c.written, c.size.max(c.written), 0, "");
-                    }
-                    match end {
-                        ZCRCG => continue,
-                        ZCRCQ => {
-                            let pos = cur.as_ref().map(|c| c.written).unwrap_or(0) as u32;
-                            rx.send_hex(ZACK, pos.to_le_bytes()).await?;
-                        }
-                        ZCRCE => break,
-                        ZCRCW => {
-                            let pos = cur.as_ref().map(|c| c.written).unwrap_or(0) as u32;
-                            rx.send_hex(ZACK, pos.to_le_bytes()).await?;
-                            break;
-                        }
-                        _ => break,
-                    }
+            ZDATA => loop {
+                let (chunk, end) = rx.read_subpacket(true).await?;
+                if let Some(c) = cur.as_mut() {
+                    c.file.write_all(&chunk).await.context("write file")?;
+                    c.written += chunk.len() as u64;
+                    emit(
+                        events,
+                        &c.id,
+                        &c.name,
+                        c.written,
+                        c.size.max(c.written),
+                        0,
+                        "",
+                    );
                 }
-            }
+                match end {
+                    ZCRCG => continue,
+                    ZCRCQ => {
+                        let pos = cur.as_ref().map(|c| c.written).unwrap_or(0) as u32;
+                        rx.send_hex(ZACK, pos.to_le_bytes()).await?;
+                    }
+                    ZCRCE => break,
+                    ZCRCW => {
+                        let pos = cur.as_ref().map(|c| c.written).unwrap_or(0) as u32;
+                        rx.send_hex(ZACK, pos.to_le_bytes()).await?;
+                        break;
+                    }
+                    _ => break,
+                }
+            },
             ZEOF => {
                 if let Some(mut c) = cur.take() {
                     c.file.flush().await.context("flush file")?;
-                    emit(events, &c.id, &c.name, c.written, c.size.max(c.written), 1, "");
+                    emit(
+                        events,
+                        &c.id,
+                        &c.name,
+                        c.written,
+                        c.size.max(c.written),
+                        1,
+                        "",
+                    );
                     received += 1;
                 }
                 // ZEOF ends one *file*, not the whole session (#109). Tell the
@@ -157,7 +174,8 @@ pub async fn receive(
                 // capped by a short timeout so a finished single-file transfer
                 // never blocks on the long per-byte read timeout — anything that
                 // isn't a ZFILE drops to the close handshake below.
-                rx.send_hex(ZRINIT, [0, 0, 0, CANFDX | CANOVIO | CANFC32]).await?;
+                rx.send_hex(ZRINIT, [0, 0, 0, CANFDX | CANOVIO | CANFC32])
+                    .await?;
                 match tokio::time::timeout(Duration::from_secs(2), rx.read_header()).await {
                     Ok(Ok(h)) if h.0 == ZFILE => pending = Some(h),
                     _ => break, // ZFIN / unexpected / parse error / timeout → done
@@ -426,7 +444,10 @@ fn download_dir() -> PathBuf {
 
 /// Reduce a sender-supplied name to a safe basename inside the download dir.
 fn sanitize(name: &str) -> String {
-    let base = name.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(name);
+    let base = name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(name);
     let cleaned: String = base
         .chars()
         .filter(|c| !matches!(c, '\0' | '/' | '\\'))
@@ -484,7 +505,7 @@ fn crc16(data: &[u8]) -> u16 {
         crc ^= (b as u16) << 8;
         for _ in 0..8 {
             crc = if crc & 0x8000 != 0 {
-                (crc << 1) ^  0x1021
+                (crc << 1) ^ 0x1021
             } else {
                 crc << 1
             };
