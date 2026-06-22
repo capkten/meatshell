@@ -529,7 +529,7 @@ pub fn run() -> Result<()> {
         let store = store.clone();
         let tabs_model = tabs_model.clone();
         window.on_set_language(move |code| {
-            crate::i18n::set_language(&code.to_string());
+            crate::i18n::set_language(code.as_ref());
             {
                 let mut s = store.borrow_mut();
                 s.set_language(crate::i18n::current_code().to_string());
@@ -1268,6 +1268,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
 // Session callbacks (welcome page + dialog)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn wire_session_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
@@ -1493,7 +1494,7 @@ fn wire_session_callbacks(
         window.on_remove_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove(&id.to_string());
+                s.remove(id.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -1514,7 +1515,7 @@ fn wire_session_callbacks(
         window.on_duplicate_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut copy = orig;
                     copy.id = uuid::Uuid::new_v4().to_string();
                     copy.name = format!("{} (copy)", copy.name);
@@ -1540,7 +1541,7 @@ fn wire_session_callbacks(
         window.on_move_session(move |id: SharedString, group: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut moved = orig;
                     // "default" is the display label for ungrouped → store empty.
                     moved.group = if group.as_str() == "default" {
@@ -1606,7 +1607,7 @@ fn wire_session_callbacks(
                 if orig.is_empty() {
                     s.add_group(name.to_string());
                 } else {
-                    s.rename_group(&orig.to_string(), name.to_string());
+                    s.rename_group(orig.as_ref(), name.to_string());
                 }
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
@@ -1626,7 +1627,7 @@ fn wire_session_callbacks(
         window.on_delete_group(move |name: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove_group(&name.to_string());
+                s.remove_group(name.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -1658,7 +1659,7 @@ fn wire_session_callbacks(
             } else {
                 Secret::new(draft.password.to_string())
             };
-            let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
+            let kind = crate::config::SessionKind::from_str(draft.kind.as_ref());
             // Auto-name: serial → port label; otherwise user@host, or just the
             // host when no username was given (#110).
             let auto_name = match kind {
@@ -1688,7 +1689,7 @@ fn wire_session_callbacks(
                     draft.port as u16
                 },
                 user: draft.user.to_string(),
-                auth: AuthMethod::from_str(&draft.auth.to_string()),
+                auth: AuthMethod::from_str(draft.auth.as_ref()),
                 password,
                 // Store the key path with forward slashes uniformly.
                 private_key_path: draft.private_key_path.to_string().replace('\\', "/"),
@@ -3044,7 +3045,7 @@ struct PendingHostKey {
 thread_local! {
     /// Prompts awaiting a decision; the front one is shown. Lives on the Slint
     /// event-loop thread (all access is from there).
-    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = RefCell::new(VecDeque::new());
+    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = const { RefCell::new(VecDeque::new()) };
     /// host:port → decision, remembered for this run so a duplicate prompt
     /// (second connection to the same host) is answered without a new dialog.
     static HOSTKEY_DECIDED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
@@ -3184,7 +3185,7 @@ struct PendingCred {
 }
 
 thread_local! {
-    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = RefCell::new(VecDeque::new());
+    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = const { RefCell::new(VecDeque::new()) };
     /// session id → the answer given this run (`None` = cancelled), so a second
     /// connection for the same session is answered without re-prompting.
     static CRED_DECIDED: RefCell<HashMap<String, Option<crate::ssh::CredentialReply>>> =
@@ -4261,7 +4262,7 @@ fn wire_key_input(
                 if orig.is_empty() {
                     s.add_quick_group(name.to_string());
                 } else {
-                    s.rename_quick_group(&orig.to_string(), name.to_string());
+                    s.rename_quick_group(orig.as_ref(), name.to_string());
                 }
                 let _ = s.save();
             }
@@ -4278,7 +4279,7 @@ fn wire_key_input(
         window.on_delete_quick_group(move |name: SharedString| {
             {
                 let mut s = store_rc.borrow_mut();
-                s.remove_quick_group(&name.to_string());
+                s.remove_quick_group(name.as_ref());
                 let _ = s.save();
             }
             if let Some(w) = weak.upgrade() {

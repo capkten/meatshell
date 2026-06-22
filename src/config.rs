@@ -465,7 +465,7 @@ impl ConfigStore {
 
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        fs::write(&key_path, &key)
+        fs::write(&key_path, key)
             .with_context(|| format!("failed to write {}", key_path.display()))?;
         #[cfg(unix)]
         {

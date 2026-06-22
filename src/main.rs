@@ -41,10 +41,8 @@ fn main() -> anyhow::Result<()> {
     // can't access the GPU's OpenGL/Vulkan context.
     //
     // If the user already set SLINT_BACKEND we respect it unconditionally.
-    if std::env::var("SLINT_BACKEND").is_err() {
-        if is_remote_desktop() {
-            std::env::set_var("SLINT_BACKEND", "software");
-        }
+    if std::env::var("SLINT_BACKEND").is_err() && is_remote_desktop() {
+        std::env::set_var("SLINT_BACKEND", "software");
     }
 
     init_tracing();
