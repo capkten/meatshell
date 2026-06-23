@@ -5,7 +5,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
-## [0.4.16] - 2026-06-23
+## [0.4.17] - 2026-06-23
 
 ### Added / 新增
 
