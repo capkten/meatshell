@@ -35,6 +35,16 @@ use crate::config::{AuthMethod, Session};
 use crate::i18n::t;
 use crate::ssh::{format_mtime, format_size, RemoteEntry, RemoteTreeNode, SessionEvent};
 
+/// Returns `true` when the file name has a common image extension.
+#[allow(dead_code)]
+pub fn is_image_file(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif" | "svg"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -76,6 +86,9 @@ pub enum SftpCommand {
     TouchFile(String),
     /// Read a remote file's text for the built-in viewer/editor (#70).
     ReadText { remote: String, edit: bool },
+    /// Read a remote file as raw bytes (for image viewing).
+    #[allow(dead_code)]
+    ReadBytes { remote: String, max_bytes: u64 },
     /// Overwrite a remote file with text from the built-in editor (#70).
     WriteText { remote: String, content: String },
     /// Gracefully shut down the SFTP worker.
@@ -136,6 +149,12 @@ impl SftpHandle {
     }
     pub fn read_text(&self, remote: String, edit: bool) {
         let _ = self.commands.send(SftpCommand::ReadText { remote, edit });
+    }
+    #[allow(dead_code)]
+    pub fn read_bytes(&self, remote: String, max_bytes: u64) {
+        let _ = self
+            .commands
+            .send(SftpCommand::ReadBytes { remote, max_bytes });
     }
     pub fn write_text(&self, remote: String, content: String) {
         let _ = self
@@ -998,6 +1017,57 @@ async fn run_sftp(
                     error,
                 });
             }
+            SftpCommand::ReadBytes { remote, max_bytes } => {
+                let name = base_name(&remote);
+                let _ = events.send(SessionEvent::SftpStatus(format!(
+                    "{} {}...",
+                    t("加载", "Loading"),
+                    name
+                )));
+                match read_bytes_guarded(&sftp, &remote, max_bytes).await {
+                    Ok(bytes) => match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let width = rgba.width();
+                            let height = rgba.height();
+                            let _ = events.send(SessionEvent::SftpImageLoaded {
+                                path: remote,
+                                name,
+                                index: 0,
+                                total: 1,
+                                width,
+                                height,
+                                data: rgba.into_raw(),
+                                error: String::new(),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = events.send(SessionEvent::SftpImageLoaded {
+                                path: remote,
+                                name,
+                                index: 0,
+                                total: 1,
+                                width: 0,
+                                height: 0,
+                                data: Vec::new(),
+                                error: format!("{}: {e}", t("解码图片失败", "Image decode failed")),
+                            });
+                        }
+                    },
+                    Err(msg) => {
+                        let _ = events.send(SessionEvent::SftpImageLoaded {
+                            path: remote,
+                            name,
+                            index: 0,
+                            total: 1,
+                            width: 0,
+                            height: 0,
+                            data: Vec::new(),
+                            error: msg,
+                        });
+                    }
+                }
+            }
             SftpCommand::WriteText { remote, content } => {
                 let name = base_name(&remote);
                 match write_text_file(&sftp, &remote, &content).await {
@@ -1070,6 +1140,38 @@ async fn read_text_guarded(
     }
     String::from_utf8(bytes)
         .map_err(|_| t("非 UTF-8 文本,无法打开", "Not UTF-8 text; cannot open").into())
+}
+
+/// Read a remote file as raw bytes, rejecting files that exceed `max_bytes`.
+async fn read_bytes_guarded(
+    sftp: &SftpSession,
+    remote: &str,
+    max_bytes: u64,
+) -> std::result::Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let size = sftp
+        .metadata(remote)
+        .await
+        .ok()
+        .and_then(|m| m.size)
+        .unwrap_or(0);
+    if size > max_bytes {
+        return Err(format!(
+            "{} ({} > {})",
+            t("文件过大", "File too large"),
+            size,
+            max_bytes
+        ));
+    }
+    let mut f = sftp
+        .open(remote)
+        .await
+        .map_err(|e| format!("{}: {e}", t("打开失败", "Open failed")))?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)
+        .await
+        .map_err(|e| format!("{}: {e}", t("读取失败", "Read failed")))?;
+    Ok(bytes)
 }
 
 /// Overwrite a remote file with the given text (CREATE | WRITE | TRUNCATE).

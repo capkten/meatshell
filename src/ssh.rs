@@ -392,6 +392,19 @@ pub enum SessionEvent {
         edit: bool,
         error: String,
     },
+    /// A remote image file loaded for the built-in image viewer.
+    /// On failure `error` is non-empty and `data` is empty.
+    #[allow(dead_code)]
+    SftpImageLoaded {
+        path: String,
+        name: String,
+        index: usize,
+        total: usize,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        error: String,
+    },
 }
 
 /// Handle retained by the UI layer to talk to a running session.

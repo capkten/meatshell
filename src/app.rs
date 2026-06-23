@@ -3173,6 +3173,24 @@ fn apply_session_event_to_window(
                 }
             });
         }
+        SessionEvent::SftpImageLoaded { name, error, .. } => {
+            if !error.is_empty() {
+                apply_session_event_to_window(
+                    win,
+                    tab_id,
+                    SessionEvent::Output(format!(
+                        "\r\n[meatshell] {} {}: {}\r\n",
+                        crate::i18n::t("无法打开图片", "Cannot open image"),
+                        name,
+                        error
+                    )),
+                    bufs,
+                    statuses,
+                    local,
+                    local_net_hist,
+                );
+            }
+        }
     }
 }
 
