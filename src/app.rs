@@ -533,6 +533,11 @@ pub fn run() -> Result<()> {
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
 
     // --- Wire callbacks --------------------------------------------------
+    // Image viewer state: list of image file paths in the current SFTP directory,
+    // shared with the preview/prev/next callbacks and populated on SftpEntries.
+    // Arc<Mutex> because it crosses the event-pump thread boundary.
+    let image_entries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
     wire_session_callbacks(
         &window,
         store.clone(),
@@ -549,6 +554,7 @@ pub fn run() -> Result<()> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
+        image_entries.clone(),
     );
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
@@ -860,6 +866,83 @@ pub fn run() -> Result<()> {
         sftp_last_cwd.clone(),
     );
     wire_sftp_callbacks(&window, sftp_handles.clone(), sftp_last_cwd.clone());
+
+    // SFTP image preview: load the image via read_bytes and open the viewer.
+    {
+        let image_entries_clone = image_entries.clone();
+        let sftp_handles_clone = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_sftp_preview(move |tab_id: SharedString, path: SharedString| {
+            let entries = image_entries_clone.lock().unwrap();
+            let idx = entries.iter().position(|p| p == path.as_str()).unwrap_or(0);
+            let total = entries.len();
+            let max_bytes: u64 = 10 * 1024 * 1024;
+            if let Some(h) = sftp_handles_clone.lock().unwrap().get(tab_id.as_str()) {
+                h.read_bytes(path.to_string(), max_bytes);
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_image_viewer_index(idx as i32);
+                w.set_image_viewer_total(total as i32);
+            }
+        });
+    }
+
+    // Image viewer prev/next/close.
+    {
+        let entries_c = image_entries.clone();
+        let handles_c = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_image_viewer_prev(move || {
+            if let Some(w) = weak.upgrade() {
+                let idx = w.get_image_viewer_index() as usize;
+                if idx > 0 {
+                    let new_idx = idx - 1;
+                    let entries = entries_c.lock().unwrap();
+                    if let Some(path) = entries.get(new_idx) {
+                        let max_bytes: u64 = 10 * 1024 * 1024;
+                        // Use the active tab's SFTP handle.
+                        let active = w.get_active_tab_id();
+                        if let Some(h) = handles_c.lock().unwrap().get(active.as_str()) {
+                            h.read_bytes(path.clone(), max_bytes);
+                        }
+                        w.set_image_viewer_index(new_idx as i32);
+                    }
+                }
+            }
+        });
+    }
+    {
+        let entries_c = image_entries.clone();
+        let handles_c = sftp_handles.clone();
+        let weak = window.as_weak();
+        window.on_image_viewer_next(move || {
+            if let Some(w) = weak.upgrade() {
+                let idx = w.get_image_viewer_index() as usize;
+                let total = w.get_image_viewer_total() as usize;
+                if idx + 1 < total {
+                    let new_idx = idx + 1;
+                    let entries = entries_c.lock().unwrap();
+                    if let Some(path) = entries.get(new_idx) {
+                        let max_bytes: u64 = 10 * 1024 * 1024;
+                        let active = w.get_active_tab_id();
+                        if let Some(h) = handles_c.lock().unwrap().get(active.as_str()) {
+                            h.read_bytes(path.clone(), max_bytes);
+                        }
+                        w.set_image_viewer_index(new_idx as i32);
+                    }
+                }
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_image_viewer_close(move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_image_viewer_open(false);
+            }
+        });
+    }
+
     wire_key_input(
         &window,
         handles.clone(),
@@ -878,6 +961,7 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
+            image_entries: image_entries.clone(),
         },
     );
 
@@ -1315,6 +1399,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    image_entries: Arc<Mutex<Vec<String>>>,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
@@ -1853,6 +1938,7 @@ fn wire_session_callbacks(
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
+        let image_entries = image_entries.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = match store.borrow().get(&id).cloned() {
@@ -1961,6 +2047,7 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
+                image_entries: image_entries.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -1985,6 +2072,8 @@ struct ConnectCtx {
     last_term_size: Arc<Mutex<(u32, u32)>>,
     /// Interface setting: SFTP panel follows the terminal's cd (OSC 7).
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    /// Image file paths in the current SFTP directory, shared with image viewer callbacks.
+    image_entries: Arc<Mutex<Vec<String>>>,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -2041,6 +2130,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let local_pump = ctx.local_snap.clone();
         let net_pump = ctx.local_net_hist.clone();
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
+        let image_entries_pump = ctx.image_entries.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -2090,10 +2180,12 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let st_evt = statuses_pump.clone();
                         let lc_evt = local_pump.clone();
                         let nh_evt = net_pump.clone();
+                        let ie_evt = image_entries_pump.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = weak_evt.upgrade() {
                                 apply_session_event_to_window(
                                     &win, &tid, shell_evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
+                                    &ie_evt,
                                 );
                             }
                         });
@@ -2111,6 +2203,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let statuses_sftp = ctx.tab_statuses.clone();
         let local_sftp = ctx.local_snap.clone();
         let net_sftp = ctx.local_net_hist.clone();
+        let ie_sftp = ctx.image_entries.clone();
         std::thread::spawn(move || {
             let mut sftp_rx = sftp_evt_tx;
             loop {
@@ -2123,10 +2216,11 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let st_s = statuses_sftp.clone();
                         let lc_s = local_sftp.clone();
                         let nh_s = net_sftp.clone();
+                        let ie_s = ie_sftp.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = weak_s.upgrade() {
                                 apply_session_event_to_window(
-                                    &win, &tid, sftp_evt, &bufs_s, &st_s, &lc_s, &nh_s,
+                                    &win, &tid, sftp_evt, &bufs_s, &st_s, &lc_s, &nh_s, &ie_s,
                                 );
                             }
                         });
@@ -2804,6 +2898,7 @@ fn refresh_sidebar(
 
 /// Apply a session event to the live UI models. Must be called on the Slint
 /// event loop thread.
+#[allow(clippy::too_many_arguments)]
 fn apply_session_event_to_window(
     win: &AppWindow,
     tab_id: &str,
@@ -2812,6 +2907,7 @@ fn apply_session_event_to_window(
     statuses: &TabStatuses,
     local: &LocalSnap,
     local_net_hist: &NetHist,
+    image_entries: &Arc<Mutex<Vec<String>>>,
 ) {
     let tabs_rc = win.get_tabs();
     let terminals_rc = win.get_terminals();
@@ -2923,6 +3019,7 @@ fn apply_session_event_to_window(
                 statuses,
                 local,
                 local_net_hist,
+                image_entries,
             );
             update_tab(&|t| t.connected = false);
             update_terminal(&|t| {
@@ -3014,6 +3111,27 @@ fn apply_session_event_to_window(
                 t.sftp_entries = model.clone();
                 t.sftp_loading = false;
             });
+            // Populate the shared image-entries list for the image viewer.
+            let image_paths: Vec<String> = entries
+                .iter()
+                .filter(|e| {
+                    !e.is_dir && {
+                        let lower = e.name.to_lowercase();
+                        lower.ends_with(".png")
+                            || lower.ends_with(".jpg")
+                            || lower.ends_with(".jpeg")
+                            || lower.ends_with(".gif")
+                            || lower.ends_with(".webp")
+                            || lower.ends_with(".bmp")
+                            || lower.ends_with(".ico")
+                            || lower.ends_with(".tiff")
+                            || lower.ends_with(".tif")
+                            || lower.ends_with(".svg")
+                    }
+                })
+                .map(|e| e.full_path.clone())
+                .collect();
+            *image_entries.lock().unwrap() = image_paths;
         }
         SessionEvent::SftpStatus(msg) => {
             update_terminal(&|t| t.sftp_status = msg.clone().into());
@@ -3059,6 +3177,7 @@ fn apply_session_event_to_window(
                     statuses,
                     local,
                     local_net_hist,
+                    image_entries,
                 );
                 update_terminal(&|t| t.sftp_status = error.clone().into());
             }
@@ -3186,23 +3305,29 @@ fn apply_session_event_to_window(
                 }
             });
         }
-        SessionEvent::SftpImageLoaded { name, error, .. } => {
-            if !error.is_empty() {
-                apply_session_event_to_window(
-                    win,
-                    tab_id,
-                    SessionEvent::Output(format!(
-                        "\r\n[meatshell] {} {}: {}\r\n",
-                        crate::i18n::t("无法打开图片", "Cannot open image"),
-                        name,
-                        error
-                    )),
-                    bufs,
-                    statuses,
-                    local,
-                    local_net_hist,
+        SessionEvent::SftpImageLoaded {
+            path: _,
+            name,
+            index,
+            total,
+            width,
+            height,
+            data,
+            error,
+        } => {
+            if error.is_empty() && !data.is_empty() {
+                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                    &data, width, height,
                 );
+                win.set_image_viewer_preview(slint::Image::from_rgba8(buf));
+                win.set_image_viewer_error("".into());
+            } else if !error.is_empty() {
+                win.set_image_viewer_error(error.into());
             }
+            win.set_image_viewer_name(name.into());
+            win.set_image_viewer_index(index as i32);
+            win.set_image_viewer_total(total as i32);
+            win.set_image_viewer_open(true);
         }
     }
 }
