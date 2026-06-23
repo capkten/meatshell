@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
 use ssh_key::{HashAlg, PublicKey};
 
 /// Result of checking a server key against the store.
@@ -35,11 +35,10 @@ fn id(host: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
-/// Path to the project known_hosts file (alongside sessions.json). `None` if
-/// the user config directory can't be determined.
-fn project_path() -> Option<PathBuf> {
-    let dirs = ProjectDirs::from("dev", "meatshell", "meatshell")?;
-    Some(dirs.config_dir().join("known_hosts"))
+/// Path to the known_hosts file (alongside sessions.json, in the portable-first
+/// data dir — #141).
+fn path() -> Option<PathBuf> {
+    Some(crate::config::data_dir().join("known_hosts"))
 }
 
 /// Path to the system known_hosts file (~/.ssh/known_hosts). `None` if the
@@ -94,7 +93,7 @@ fn load_file(path: &PathBuf, normalize_port: bool) -> Vec<(String, String)> {
 /// same host appears in both files with different keys.
 fn load() -> Vec<(String, String)> {
     // Project file already uses host:port format
-    let mut entries = load_file(&project_path().unwrap_or_default(), false);
+    let mut entries = load_file(&path().unwrap_or_default(), false);
     let project_hosts: HashSet<_> = entries.iter().map(|(id, _)| id.clone()).collect();
 
     // System known_hosts uses OpenSSH format (no port = 22)
@@ -133,7 +132,7 @@ pub fn verify(host: &str, port: u16, key: &PublicKey) -> HostKeyStatus {
 /// with any stale entry for the same id removed, then appends the new one.
 /// Always writes to the project file, not the system known_hosts.
 pub fn remember(host: &str, port: u16, key: &PublicKey) -> Result<()> {
-    let p = project_path().context("could not determine config directory")?;
+    let p = path().context("could not determine config directory")?;
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).context("create config dir")?;
     }

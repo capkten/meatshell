@@ -5,36 +5,48 @@ All notable changes are documented here. 本文件记录所有重要变更。
 
 ## [Unreleased]
 
-## [0.4.16] - 2026-06-22
+## [0.4.16] - 2026-06-23
 
 ### Added / 新增
 
-- **已知主机校验支持系统 known_hosts fallback。** 现在会优先读取项目配置的 known_hosts，
-  如果项目配置中没有对应主机的记录，则 fallback 到系统 `~/.ssh/known_hosts` 文件。
-  自动处理 OpenSSH 格式兼容（默认端口 22 自动补全）。
-  **Known-hosts verification with system known_hosts fallback.** The project now reads
-  the project-level known_hosts first, then falls back to the system `~/.ssh/known_hosts`
-  for hosts not found in the project file. OpenSSH format compatibility is handled
-  automatically (default port 22 is normalized).
+- **沉浸式壁纸主题(可换壁纸 + 全局沉浸配色)。** 新增「设置 → 界面 → 壁纸」,提供
+  macOS 风格的缩略图选择器:内置 **3 张**(简约·浅、简约·暗、**幻想3048**——赛博朋克合成波,
+  星空 + 发光星球 + 霓虹网格,均为程序化绘制、无图片资源),也可「选择文件…」用自己的图片。
+  选定后壁纸铺满整个窗口(含终端、侧栏、SFTP,以及独立的进程窗),各面板**磨砂半透**让壁纸
+  透出,同时从壁纸提取主色**自动重着色强调色并微调背景**,深浅由壁纸亮度决定(内置款),
+  自定义照片则交给主题开关手动控制可读性。**下个版本默认即「幻想3048 + 暗色」。**
+  **Immersive wallpaper theming (custom wallpaper + global tinting).** Adds Settings →
+  Interface → Wallpaper with a macOS-style thumbnail picker: **3 built-ins** (Meat Light,
+  Meat Dark, and **Fantasy 3048** — a cyberpunk synthwave scene with a starfield, a glowing
+  planet and a neon grid, all drawn procedurally with no image assets) plus a "Choose
+  file…" option for your own image. The wallpaper fills the whole window (terminal,
+  sidebars, SFTP and the detached process window), panels **frost translucently** to let it
+  show through, the accent is **recoloured from the image's dominant colour** and surfaces
+  are subtly tinted, with light/dark taken from the wallpaper's brightness (built-ins) while
+  custom photos leave light/dark to the theme toggle for readability. **The next release
+  ships with "Fantasy 3048 + dark" as the default.**
 
-### Fixed / 修复
+- **便携模式:配置改存到程序同目录的 `config/`(#141)。** 用户数据(`sessions.json`、
+  加密密钥、`known_hosts`、`error.log`)现在优先存放在**可执行文件旁的 `config/` 文件夹**,
+  整个程序可以随 U 盘携带,也不再往用户目录(`%APPDATA%`)里塞东西。当程序装在只读位置
+  (如 Program Files / `/usr`)时,自动回退到原来的「按用户的系统配置目录」——这也是旧版本
+  的存放位置,所以**老安装原样可用**。首次切到便携目录时,会把旧用户目录里的数据**复制**
+  过去(只复制不删除、不覆盖已存在文件,作为兜底),升级用户不会丢失已保存的会话。
+  **Portable mode: config moves to a `config/` folder next to the app (#141).** User data
+  (`sessions.json`, the encryption key, `known_hosts`, `error.log`) is now stored, by
+  preference, in a **`config/` folder beside the executable**, so the whole app can travel
+  on a USB stick and stops cluttering the user profile (`%APPDATA%`). When the app is
+  installed somewhere read-only (Program Files / `/usr`), it falls back to the per-user OS
+  config dir — the same place older versions used, so **existing installs keep working
+  untouched**. On the first launch that lands on the portable dir, data from the legacy
+  per-user dir is **copied** over (copy-not-move, never overwriting, as a safety net) so
+  upgrading users don't lose saved sessions.
 
-- **主机密钥拒绝后无法重试连接。** 之前用户在主机密钥确认对话框点击"拒绝"后，该决定会被
-  缓存，导致后续连接同一服务器时再也无法弹出确认对话框。现在只缓存接受的决定，拒绝后
-  下次连接会重新弹窗确认。
-  **Cannot retry connection after rejecting host key.** Previously, rejecting a host key
-  cached the decision permanently, preventing the confirmation dialog from appearing again
-  for the same server. Now only accepted decisions are cached; rejecting allows retry on
-  the next connection attempt.
-
-- **资源面板停靠到顶部/底部时 GPU 状态不显示。** 水平布局（面板停靠上/下）缺少 GPU 状态
-  显示组件，现在已补充。
-  **GPU status not shown when resource panel docked top/bottom.** The horizontal layout
-  (panel docked to top/bottom edge) was missing the GPU status display component.
-
-## [0.4.14] - 2026-06-22
-
-### Added / 新增
+- **终端内查找:Ctrl+F 唤出查找栏。** 在会话里按 Ctrl+F 即可弹出顶部查找栏(与右键菜单
+  → 查找一致),输入即时高亮所有匹配,Esc 关闭;已在「设置 → 快捷键」中登记。
+  **Find in terminal: Ctrl+F opens the find bar.** Press Ctrl+F in a session to bring up
+  the find bar (same as right-click → Find); matches highlight as you type and Esc closes
+  it. Now listed under Settings → Shortcuts.
 
 - **面板可拖动吸附停靠(资源面板 + SFTP)。** 资源面板和 SFTP 面板现在都能拖到四条边
   (上/下/左/右):拖动面板手柄时,四条边浮现高亮放置区,松手即吸附到那条边。两个面板都
@@ -49,7 +61,7 @@ All notable changes are documented here. 本文件记录所有重要变更。
   docked edge (fully hiding the panel). **Responsive:** the resource panel lays its
   widgets out in a row when docked horizontally; the SFTP panel hides its directory tree
   when docked vertically (narrow) and progressively drops the **Size → Modified** columns
-  as it narrows (only once the Name would elide to “…”), while a horizontal (wide) dock
+  as it narrows (only once the Name would elide to "…"), while a horizontal (wide) dock
   always shows every column. A dedicated drag grip was added to the SFTP toolbar so the
   panel is grabbable even though its toolbar is full of controls.
 
@@ -59,7 +71,58 @@ All notable changes are documented here. 本文件记录所有重要变更。
   saved on exit and restored on the next launch — so your preferred window size and
   panel arrangement stick.
 
+- **已知主机校验支持系统 known_hosts fallback。** 现在会优先读取项目配置的 known_hosts，
+  如果项目配置中没有对应主机的记录，则 fallback 到系统 `~/.ssh/known_hosts` 文件。
+  自动处理 OpenSSH 格式兼容（默认端口 22 自动补全）。
+  **Known-hosts verification with system known_hosts fallback.** The project now reads
+  the project-level known_hosts first, then falls back to the system `~/.ssh/known_hosts`
+  for hosts not found in the project file. OpenSSH format compatibility is handled
+  automatically (default port 22 is normalized).
+
+### Changed / 优化
+
+- **历史命令的搜索框移到下拉框底部 (#131)。** 命令历史下拉向上展开,搜索框原先在顶部、
+  位置随历史条数上下浮动、不好找;现在固定在下拉框**底部**(紧挨命令输入框),列表在其上方
+  填充并可滚动——位置稳定、一眼可见,和 FinalShell 一致。
+  **History search box moved to the bottom of the dropdown (#131).** The command-history
+  dropdown opens upward; the search box used to sit at the top, drifting up and down with
+  the number of entries and hard to find. It's now pinned to the **bottom** of the
+  dropdown (right above the command input), with the scrollable list filling the space
+  above it — a fixed, immediately visible spot, matching FinalShell.
+
+- **SFTP 折叠按钮与资源面板统一,并保持在右侧。** 两个面板现在共用同一个展开按钮组件;
+  SFTP 的控件本就在右侧,折叠后的展开按钮也随之停在右下/右上,不再突兀地跳到左边。
+  **SFTP collapse button unified with the resource panel, kept on the right.** Both panels
+  now share one expand-button component; since SFTP's controls live on the right, its
+  collapsed expand button stays at the bottom-/top-right instead of jumping to the left.
+
 ### Fixed / 修复
+
+- **含中文的行复制/查找列错位 (#132)。** 终端纯文本按「一字一字符」存储,而中文(CJK)字
+  在网格上占两列;复制时把选区列号当作字符下标,导致丢失的字符数恰好等于选区前面的中文
+  字数(如选「1pctl update password」实际只复制到「e password」)。现引入 unicode-width
+  做「字符↔网格列」换算:复制所见即所得,在宽字形第二格起选也会整字纳入;查找高亮框(同源
+  问题)改按网格列绘制,中文行之后也能精确罩住文字。
+  **Copy & find column drift on lines with CJK glyphs (#132).** The terminal's plain text
+  stores one char per glyph, but a wide (CJK) glyph spans two grid cells; copy treated a
+  selection's column as a char index, dropping as many characters as there were wide glyphs
+  before the selection (selecting "1pctl update password" yielded only "e password"). A
+  char-to-column conversion (via unicode-width) makes copy WYSIWYG — anchoring on the
+  second cell of a wide glyph still grabs the whole glyph — and find highlights (same root
+  cause) now sit on grid columns so they line up after CJK.
+
+- **主机密钥拒绝后无法重试连接。** 之前用户在主机密钥确认对话框点击"拒绝"后，该决定会被
+  缓存，导致后续连接同一服务器时再也无法弹出确认对话框。现在只缓存接受的决定，拒绝后
+  下次连接会重新弹窗确认。
+  **Cannot retry connection after rejecting host key.** Previously, rejecting a host key
+  cached the decision permanently, preventing the confirmation dialog from appearing again
+  for the same server. Now only accepted decisions are cached; rejecting allows retry on
+  the next connection attempt.
+
+- **资源面板停靠到顶部/底部时 GPU 状态不显示。** 水平布局（面板停靠上/下）缺少 GPU 状态
+  显示组件，现在已补充。
+  **GPU status not shown when resource panel docked top/bottom.** The horizontal layout
+  (panel docked to top/bottom edge) was missing the GPU status display component.
 
 - **macOS 欢迎页布局错位。** 欢迎页的标题、副标题、快速连接卡片在 macOS 上被拉开(标题与
   副标题间出现大空隙)。现在 Welcome 显式填满内容区、头部固定在顶部按自然高度排列,卡片填满

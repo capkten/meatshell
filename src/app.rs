@@ -276,15 +276,7 @@ pub fn run() -> Result<()> {
     // "dark" / "light" → use that directly; "system" or unset → ask the OS;
     // OS unknown → fall back to dark.
     {
-        let is_dark = match store.borrow().theme_pref() {
-            "light" => false,
-            "dark" => true,
-            _ => match dark_light::detect() {
-                dark_light::Mode::Light => false,
-                dark_light::Mode::Dark => true,
-                dark_light::Mode::Default => true, // undetectable → dark
-            },
-        };
+        let is_dark = theme_pref_is_dark(&store.borrow());
         window.set_dark_mode(is_dark);
     }
 
@@ -298,6 +290,13 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
+    }
+
+    // Apply the saved immersive wallpaper (overrides dark/light when set; a
+    // missing custom file falls back to the plain theme).
+    {
+        let id = store.borrow().wallpaper().to_string();
+        apply_wallpaper(&window, &store.borrow(), &bufs, &id);
     }
     // Editable inputs (e.g. the SFTP path bar) need a CJK-capable font: the
     // embedded mono font has no Chinese glyphs and native TextInput doesn't
@@ -465,6 +464,51 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // Wallpaper: pick a built-in / none, or open the file dialog for a custom one.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs_wp = bufs.clone();
+        let proc_weak = proc_win.as_weak();
+        window.on_set_wallpaper(move |id: SharedString| {
+            let id = id.to_string();
+            if let Some(w) = weak.upgrade() {
+                apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id);
+                // Keep an already-open process window in sync with the change.
+                if let Some(p) = proc_weak.upgrade() {
+                    sync_proc_theme(&w, &p);
+                }
+            }
+            let mut s = store.borrow_mut();
+            s.set_wallpaper(id);
+            let _ = s.save();
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs_wp = bufs.clone();
+        let proc_weak = proc_win.as_weak();
+        window.on_pick_wallpaper_file(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("选择壁纸 / Choose wallpaper")
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
+                .pick_file();
+            if let Some(path) = picked {
+                let id = path.to_string_lossy().to_string();
+                if let Some(w) = weak.upgrade() {
+                    apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id);
+                    if let Some(p) = proc_weak.upgrade() {
+                        sync_proc_theme(&w, &p);
+                    }
+                }
+                let mut s = store.borrow_mut();
+                s.set_wallpaper(id);
+                let _ = s.save();
+            }
+        });
+    }
+
     let sessions_model: Rc<VecModel<SessionInfo>> = Rc::new(VecModel::default());
     window.set_sessions(ModelRc::from(sessions_model.clone()));
     sync_sessions_to_model(&store.borrow(), &sessions_model);
@@ -562,26 +606,12 @@ pub fn run() -> Result<()> {
         window.on_toggle_theme(move || {
             let Some(w) = weak.upgrade() else { return };
             let next_dark = !w.get_dark_mode();
-            w.set_dark_mode(next_dark);
+            // Flip theme + every terminal buffer + re-render (shared with wallpaper).
+            apply_dark_mode(&w, &bufs_theme, next_dark);
             // Mirror the flip onto the detached process window (its Theme global
             // is a separate instance) so an open process window follows.
             if let Some(p) = proc_weak.upgrade() {
                 sync_proc_theme(&w, &p);
-            }
-            // Propagate new palette to all open terminal buffers.
-            {
-                let mut map = bufs_theme.lock().unwrap();
-                for buf in map.values_mut() {
-                    buf.is_dark = next_dark;
-                }
-            }
-            // Re-render every visible terminal so colours update immediately.
-            let tab_ids: Vec<String> = {
-                let map = bufs_theme.lock().unwrap();
-                map.keys().cloned().collect()
-            };
-            for tid in tab_ids {
-                rebuild_tab_display(&w, &bufs_theme, &tid);
             }
             let pref = if next_dark { "dark" } else { "light" };
             let mut s = store.borrow_mut();
@@ -2202,6 +2232,12 @@ fn sync_proc_theme(main: &AppWindow, proc: &ProcWindow) {
     proc.set_dark_mode(main.get_dark_mode());
     proc.set_ui_scale(main.get_ui_scale());
     proc.set_ui_font_family(main.get_ui_font_family());
+    // Mirror the immersive wallpaper so the detached window shares the frosted
+    // backdrop instead of a flat panel.
+    proc.set_wallpaper_img(main.get_wallpaper_img());
+    proc.set_wallpaper_active(main.get_wallpaper_active());
+    proc.set_wp_accent(main.get_wp_accent());
+    proc.set_wp_tint(main.get_wp_tint());
 }
 
 /// Persist the current panel docking layout (both panels' edge + size) and the
@@ -2439,8 +2475,53 @@ fn history_view_model(store: &ConfigStore, query: &str) -> ModelRc<SharedString>
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
+/// Cumulative grid columns for a rendered line. The plain text we keep stores
+/// ONE char per glyph, but a wide (CJK) glyph occupies TWO grid cells, so a char
+/// index is *not* a grid column. `prefix[i]` is the starting grid column of
+/// char `i`; `prefix[chars.len()]` is the line's total cell width. Zero-width
+/// chars (combining marks) share their base char's column (#132).
+fn cell_prefix(chars: &[char]) -> Vec<usize> {
+    use unicode_width::UnicodeWidthChar;
+    let mut prefix = Vec::with_capacity(chars.len() + 1);
+    let mut acc = 0usize;
+    for &ch in chars {
+        prefix.push(acc);
+        acc += ch.width().unwrap_or(0);
+    }
+    prefix.push(acc);
+    prefix
+}
+
+/// First char index whose cell span contains grid column `target` — i.e. the
+/// char a selection STARTING at that column should begin on. Clamps to the end
+/// of the line when `target` is past the content (#132).
+fn char_at_cell_start(prefix: &[usize], target: usize) -> usize {
+    let n = prefix.len().saturating_sub(1); // chars.len()
+    for i in 0..n {
+        if prefix[i] <= target && target < prefix[i + 1] {
+            return i;
+        }
+    }
+    n
+}
+
+/// Exclusive char index just past grid column `target` — i.e. the slice end for
+/// a selection ENDING (inclusive) at that column. Trailing zero-width marks on
+/// the last glyph are kept because their start column is not strictly greater
+/// than `target` (#132).
+fn char_after_cell_end(prefix: &[usize], target: usize) -> usize {
+    let n = prefix.len().saturating_sub(1); // chars.len()
+    for i in 0..n {
+        if prefix[i] > target {
+            return i;
+        }
+    }
+    n
+}
+
 /// Find every (case-insensitive) occurrence of `query` across the currently
-/// displayed rows and return highlight rectangles (char index == grid column).
+/// displayed rows and return highlight rectangles in GRID-COLUMN space (wide
+/// CJK glyphs count as two columns, so highlights line up over the text #132).
 fn compute_find_matches(rows: &[String], query: &str) -> Vec<TermMatch> {
     let mut out: Vec<TermMatch> = Vec::new();
     if query.is_empty() {
@@ -2451,14 +2532,18 @@ fn compute_find_matches(rows: &[String], query: &str) -> Vec<TermMatch> {
         return out;
     }
     for (r, line) in rows.iter().enumerate() {
-        let lower: Vec<char> = line.chars().map(|c| c.to_ascii_lowercase()).collect();
+        let chars: Vec<char> = line.chars().collect();
+        let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+        let prefix = cell_prefix(&chars);
         let mut i = 0usize;
         while i + q.len() <= lower.len() {
             if lower[i..i + q.len()] == q[..] {
+                let col = prefix[i] as i32;
+                let len = (prefix[i + q.len()] - prefix[i]) as i32;
                 out.push(TermMatch {
                     row: r as i32,
-                    col: i as i32,
-                    len: q.len() as i32,
+                    col,
+                    len,
                 });
                 i += q.len();
             } else {
@@ -2501,6 +2586,80 @@ fn rebuild_tab_display(win: &AppWindow, bufs: &TermBuffers, tab_id: &str) {
         row.scroll_max = smax;
         row.scroll_offset = soff;
     });
+}
+
+/// Resolve the user's saved theme preference to a dark/light bool (mirrors the
+/// startup logic): "light"/"dark" win; otherwise ask the OS, defaulting to dark.
+fn theme_pref_is_dark(store: &ConfigStore) -> bool {
+    match store.theme_pref() {
+        "light" => false,
+        "dark" => true,
+        _ => match dark_light::detect() {
+            dark_light::Mode::Light => false,
+            dark_light::Mode::Dark => true,
+            dark_light::Mode::Default => true, // undetectable → dark
+        },
+    }
+}
+
+/// Flip the whole app between light and dark. Setting `Theme.dark` alone only
+/// recolours the Slint chrome — each terminal bakes its ANSI/default colours
+/// from a per-buffer `is_dark` flag at render time, so we must also update every
+/// buffer and re-render it. Both the theme toggle and wallpaper switching route
+/// through here (the proc-window mirror stays with the toggle).
+fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool) {
+    window.set_dark_mode(dark);
+    {
+        let mut map = bufs.lock().unwrap();
+        for buf in map.values_mut() {
+            buf.is_dark = dark;
+        }
+    }
+    let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
+    for tid in tab_ids {
+        rebuild_tab_display(window, bufs, &tid);
+    }
+}
+
+/// Apply a wallpaper id to the window: load the image + derived palette, push the
+/// immersive Theme overrides (accent / tint / image) and set `dark` from the
+/// image luminance. An empty or undecodable id turns immersive mode off and
+/// restores the user's saved light/dark theme.
+fn apply_wallpaper(window: &AppWindow, store: &ConfigStore, bufs: &TermBuffers, id: &str) {
+    match crate::wallpaper::load(id) {
+        Some(wp) => {
+            let (ar, ag, ab) = wp.palette.accent;
+            let (tr, tg, tb) = wp.palette.tint;
+            window.set_wallpaper_img(wp.image);
+            window.set_wp_accent(slint::Color::from_rgb_u8(ar, ag, ab));
+            window.set_wp_tint(slint::Color::from_rgb_u8(tr, tg, tb));
+            // Only the built-ins (designed as a light/dark pair) auto-set the
+            // theme. A custom photo keeps the user's light/dark choice so the
+            // theme toggle still governs text contrast — a light/white wallpaper
+            // reads best in light mode (crisp dark text) rather than being forced
+            // dark and greying the text out (#wallpaper).
+            if crate::wallpaper::is_builtin(id) {
+                apply_dark_mode(window, bufs, wp.palette.is_dark);
+            }
+            window.set_wallpaper_active(true);
+            window.set_current_wallpaper(id.into());
+            let name = if crate::wallpaper::is_builtin(id) {
+                String::new()
+            } else {
+                std::path::Path::new(id)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            };
+            window.set_custom_wallpaper_name(name.into());
+        }
+        None => {
+            window.set_wallpaper_active(false);
+            window.set_current_wallpaper("".into());
+            window.set_custom_wallpaper_name("".into());
+            apply_dark_mode(window, bufs, theme_pref_is_dark(store));
+        }
+    }
 }
 
 /// Resolve which interface drives the top sparkline: the user's selection if it
@@ -5642,6 +5801,10 @@ impl TermBuffer {
                 ""
             };
             let chars: Vec<char> = line.chars().collect();
+            // `c0`/`c1` are GRID COLUMNS (inclusive). The plain text keeps one
+            // char per glyph, so wide (CJK) glyphs make char index != column;
+            // map columns → char indices via the cell prefix so the copied text
+            // doesn't drift by the number of wide glyphs before it (#132).
             let (c0, c1) = if r == lo_r && r == hi_r {
                 (lo_c.min(hi_c), lo_c.max(hi_c))
             } else if r == lo_r {
@@ -5651,10 +5814,11 @@ impl TermBuffer {
             } else {
                 (0, u16::MAX)
             };
-            let c0 = (c0 as usize).min(chars.len());
-            let c1 = ((c1 as usize).saturating_add(1)).min(chars.len());
-            let seg: String = if c0 < c1 {
-                chars[c0..c1].iter().collect()
+            let prefix = cell_prefix(&chars);
+            let start = char_at_cell_start(&prefix, c0 as usize);
+            let end = char_after_cell_end(&prefix, c1 as usize);
+            let seg: String = if start < end {
+                chars[start..end].iter().collect()
             } else {
                 String::new()
             };
@@ -6364,5 +6528,47 @@ mod selection_tests {
         live.sel_anchor = Some((0, 2));
         live.sel_focus = Some((2, 4));
         assert!(live.selection_rects_visible(20).is_empty());
+    }
+
+    #[test]
+    fn extract_handles_wide_cjk_columns() {
+        // Regression for #132: copying after CJK glyphs drifted right by the
+        // number of wide chars before the selection (e.g. selecting "1pctl"
+        // yielded "ctl…"). The history line lays out on the grid as:
+        //   提(0-1) 示(2-3) :(4) space(5) 1(6) p(7) c(8) t(9) l(10)
+        let mut buf = make_buf(5, 20, &["提示: 1pctl"], &["x"], 0);
+
+        // The "1pctl" run sits at grid cols 6..=10.
+        buf.sel_anchor = Some((0, 6));
+        buf.sel_focus = Some((0, 10));
+        assert_eq!(buf.extract_selection_text(), "1pctl");
+
+        // Selecting from the second CJK glyph through the end.
+        buf.sel_anchor = Some((0, 2));
+        buf.sel_focus = Some((0, 10));
+        assert_eq!(buf.extract_selection_text(), "示: 1pctl");
+
+        // Anchoring on the *second* cell of a wide glyph still grabs the whole
+        // glyph — you can't half-select a CJK char.
+        buf.sel_anchor = Some((0, 3));
+        buf.sel_focus = Some((0, 10));
+        assert_eq!(buf.extract_selection_text(), "示: 1pctl");
+    }
+
+    #[test]
+    fn find_matches_report_grid_columns_past_cjk() {
+        // Highlight rects must sit at the GRID column, not the char index, so
+        // they line up over the text after CJK glyphs (#132).
+        let rows = vec!["提示: 1pctl".to_string()];
+        let m = compute_find_matches(&rows, "1pctl");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].col, 6, "grid column 6, not char index 4");
+        assert_eq!(m[0].len, 5);
+
+        // A CJK query spans two grid cells per glyph.
+        let m2 = compute_find_matches(&rows, "提示");
+        assert_eq!(m2.len(), 1);
+        assert_eq!(m2[0].col, 0);
+        assert_eq!(m2[0].len, 4, "two wide glyphs span four grid cells");
     }
 }
