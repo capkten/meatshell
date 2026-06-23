@@ -168,6 +168,7 @@ export component TerminalView inherits Rectangle {
     callback sftp-edit(string);
     callback sftp-open-external(string);
     callback sftp-edit-external(string);
+    callback sftp-preview(string);
     // Context-menu extensions (#69), forwarded up to the app shell.
     callback sftp-rename-request(string, string);
     callback sftp-chmod-request(string, string, int);
@@ -1378,6 +1379,7 @@ export component TerminalView inherits Rectangle {
             edit(path)          => { root.sftp-edit(path); }
             open-external(path) => { root.sftp-open-external(path); }
             edit-external(path) => { root.sftp-edit-external(path); }
+            preview(path)       => { root.sftp-preview(path); }
             rename-request(path, name) => { root.sftp-rename-request(path, name); }
             chmod-request(path, name, mode) => { root.sftp-chmod-request(path, name, mode); }
             copy-path(path)     => { root.sftp-copy-path(path); }

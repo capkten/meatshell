@@ -1,0 +1,155 @@
+import { Theme } from "theme.slint";
+
+export component ImageViewer {
+    in property <string> file-name;
+    in property <int> index;
+    in property <int> total;
+    in property <image> preview-image;
+    in property <float> scale: 1.0;
+    in property <string> error-msg;
+
+    callback close();
+    callback prev();
+    callback next();
+
+    width: 100%;
+    height: 100%;
+
+    // Dark semi-transparent overlay
+    Rectangle {
+        background: #000000cc;
+        width: 100%;
+        height: 100%;
+    }
+
+    iv-focus := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.close();
+                return accept;
+            }
+            if (e.text == Key.LeftArrow) {
+                root.prev();
+                return accept;
+            }
+            if (e.text == Key.RightArrow) {
+                root.next();
+                return accept;
+            }
+            return reject;
+        }
+
+        // Title bar
+        Rectangle {
+            y: 0;
+            height: 40px;
+            background: #00000066;
+
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 8px;
+                alignment: space-between;
+
+                Text {
+                    text: root.file-name
+                        + (root.total > 0 ? "  " + root.index + "/" + root.total : "")
+                        + (root.scale > 0 ? "  " + Math.round(root.scale * 100) + "%" : "");
+                    color: #e6e8ee;
+                    font-size: Theme.fs-md;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    background: close-ta.has-hover ? #ffffff22 : transparent;
+                    border-radius: Theme.radius-sm;
+                    close-ta := TouchArea {
+                        clicked => { root.close(); }
+                    }
+                    Text {
+                        text: "\u{e5cd}";
+                        font-family: "Material Icons";
+                        color: #e6e8ee;
+                        font-size: 18px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Error message
+        if root.error-msg != "" : Rectangle {
+            width: 100%;
+            height: 100%;
+            Text {
+                text: root.error-msg;
+                color: #e6e8ee;
+                font-size: Theme.fs-lg;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Image display
+        if root.error-msg == "" : Image {
+            x: 60px;
+            y: 40px;
+            width: root.width - 120px;
+            height: root.height - 40px;
+            source: root.preview-image;
+            image-fit: contain;
+        }
+
+        // Left navigation touch area
+        Rectangle {
+            x: 0;
+            y: 40px;
+            width: 60px;
+            height: root.height - 40px;
+            background: left-ta.has-hover ? #ffffff11 : transparent;
+
+            left-ta := TouchArea {
+                clicked => { root.prev(); }
+            }
+
+            Text {
+                text: "\u{e5cb}";
+                font-family: "Material Icons";
+                color: #e6e8ee88;
+                font-size: 32px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                visible: left-ta.has-hover;
+            }
+        }
+
+        // Right navigation touch area
+        Rectangle {
+            x: root.width - 60px;
+            y: 40px;
+            width: 60px;
+            height: root.height - 40px;
+            background: right-ta.has-hover ? #ffffff11 : transparent;
+
+            right-ta := TouchArea {
+                clicked => { root.next(); }
+            }
+
+            Text {
+                text: "\u{e5cc}";
+                font-family: "Material Icons";
+                color: #e6e8ee88;
+                font-size: 32px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                visible: right-ta.has-hover;
+            }
+        }
+    }
+}

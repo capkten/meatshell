@@ -25,6 +25,7 @@ import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint
 import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { InterfacePanel } from "interface_panel.slint";
+import { ImageViewer } from "image_viewer.slint";
 // Re-export so `slint::include_modules!` generates the ProcWindow Rust type.
 export { ProcWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
@@ -450,6 +451,17 @@ export component AppWindow inherits Window {
     property <length> ed-grab-x;
     property <length> ed-grab-y;
 
+    // --- Image viewer --------------------------------------------------------
+    in-out property <bool> image-viewer-open: false;
+    in-out property <string> image-viewer-name;
+    in-out property <int> image-viewer-index;
+    in-out property <int> image-viewer-total;
+    in-out property <image> image-viewer-preview;
+    in-out property <string> image-viewer-error;
+    callback image-viewer-close();
+    callback image-viewer-prev();
+    callback image-viewer-next();
+
     // --- Session list ------------------------------------------------------
     in property <[SessionInfo]> sessions;
 
@@ -540,6 +552,7 @@ export component AppWindow inherits Window {
     callback sftp-edit(string /* tab-id */, string /* path */);
     callback sftp-open-external(string /* tab-id */, string /* path */);
     callback sftp-edit-external(string /* tab-id */, string /* path */);
+    callback sftp-preview(string /* tab-id */, string /* path */);
     // SFTP context-menu extensions (#69): rename / chmod / mkdir / touch share
     // one single-input prompt dialog; copy-path goes straight to the clipboard.
     in-out property <bool> sftp-prompt-open: false;
@@ -912,6 +925,7 @@ export component AppWindow inherits Window {
                     }
                     sftp-view(path) => { root.sftp-view(term.id, path); }
                     sftp-edit(path) => { root.sftp-edit(term.id, path); }
+                    sftp-preview(path) => { root.sftp-preview(term.id, path); }
                     sftp-open-external(path) => { root.sftp-open-external(term.id, path); }
                     sftp-edit-external(path) => { root.sftp-edit-external(term.id, path); }
                     // #69 context-menu extensions → shared prompt dialog.
@@ -1334,6 +1348,18 @@ export component AppWindow inherits Window {
             // Focus the text the moment the editor opens.
             init => { edit-input.focus(); }
         }
+    }
+
+    // --- Image viewer overlay -----------------------------------------------
+    if root.image-viewer-open : ImageViewer {
+        file-name: root.image-viewer-name;
+        index: root.image-viewer-index;
+        total: root.image-viewer-total;
+        preview-image: root.image-viewer-preview;
+        error-msg: root.image-viewer-error;
+        close() => { root.image-viewer-close(); }
+        prev() => { root.image-viewer-prev(); }
+        next() => { root.image-viewer-next(); }
     }
 
     // --- Download manager popup -------------------------------------------

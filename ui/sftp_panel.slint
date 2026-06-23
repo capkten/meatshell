@@ -80,6 +80,7 @@ export component SftpPanel inherits Rectangle {
     property <string> menu-target;          // "" = whitespace
     property <string> menu-target-name;
     property <bool>   menu-target-is-dir;
+    property <bool>   menu-target-is-image;  // set by Rust from file extension
     property <int>    menu-target-mode;     // permission bits for the chmod dialog
 
     // --- Callbacks ---------------------------------------------------------
@@ -95,6 +96,7 @@ export component SftpPanel inherits Rectangle {
     callback delete-selected();     // delete all checked entries (#100)
     callback view(string);          // open read-only in the built-in viewer
     callback edit(string);          // open writable in the built-in editor
+    callback preview(string);       // open image in the image viewer
     callback open-external(string);     // open with the OS default app (#81)
     callback edit-external(string);     // open externally + watch/re-upload (#81)
     // Context-menu extensions (#69). The *-request callbacks open dialogs in
@@ -602,6 +604,11 @@ export component SftpPanel inherits Rectangle {
                                     label: @tr("Download");
                                     enabled: root.menu-target != "";
                                     clicked => { root.download(root.menu-target); }
+                                }
+                                if root.menu-target-is-image : SftpMenuItem {
+                                    label: @tr("Preview");
+                                    enabled: root.menu-target != "" && !root.menu-target-is-dir;
+                                    clicked => { root.preview(root.menu-target); }
                                 }
                                 SftpMenuItem {
                                     label: @tr("View");
