@@ -3,7 +3,17 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（English first, 中文在后）.
 
-## [Unreleased]
+## [0.4.18] - 2026-06-23
+
+### Added / 新增
+
+- **内置图片查看器。** SFTP 文件面板右键菜单新增"预览"选项（仅图片文件显示），支持
+  PNG/JPEG/WebP/BMP 等格式。查看器支持左右箭头键/点击翻页、鼠标滚轮缩放、拖拽平移、
+  双击重置、Esc 关闭。最大预览文件大小默认 100MB，可在配置中调整。
+  **Built-in image viewer.** The SFTP file panel's context menu gains a "Preview" option
+  (shown only for image files), supporting PNG/JPEG/WebP/BMP formats. The viewer supports
+  arrow key/click navigation, mouse wheel zoom, drag-to-pan, double-click reset, and Esc
+  to close. Max preview file size defaults to 100MB, configurable in settings.
 
 ## [0.4.17] - 2026-06-23
 
