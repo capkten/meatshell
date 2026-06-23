@@ -2985,6 +2985,19 @@ fn apply_session_event_to_window(
                     name: e.name.clone().into(),
                     full_path: e.full_path.clone().into(),
                     is_dir: e.is_dir,
+                    is_image: {
+                        let lower = e.name.to_lowercase();
+                        lower.ends_with(".png")
+                            || lower.ends_with(".jpg")
+                            || lower.ends_with(".jpeg")
+                            || lower.ends_with(".gif")
+                            || lower.ends_with(".webp")
+                            || lower.ends_with(".bmp")
+                            || lower.ends_with(".ico")
+                            || lower.ends_with(".tiff")
+                            || lower.ends_with(".tif")
+                            || lower.ends_with(".svg")
+                    },
                     size: if e.is_dir {
                         "".into()
                     } else {
