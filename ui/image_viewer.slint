@@ -5,12 +5,6 @@ export component ImageViewer {
     in property <int> index;
     in property <int> total;
     in property <image> preview-image;
-    in-out property <float> scale: 1.0;
-    in-out property <length> pan-x: 0;
-    in-out property <length> pan-y: 0;
-    property <bool> panning: false;
-    property <length> pan-start-x;
-    property <length> pan-start-y;
     in property <string> error-msg;
 
     callback close();
@@ -20,16 +14,53 @@ export component ImageViewer {
     width: 100%;
     height: 100%;
 
-    // Dark semi-transparent overlay
+    // Internal zoom/pan state
+    property <float> scale: 1.0;
+    property <length> offset-x: 0;
+    property <length> offset-y: 0;
+    property <bool> is-panning: false;
+    property <length> pan-start-x;
+    property <length> pan-start-y;
+    property <length> pan-start-offset-x;
+    property <length> pan-start-offset-y;
+
+    // Constants
+    property <length> header-h: 44px;
+    property <length> nav-btn-w: 50px;
+    property <length> nav-btn-h: 80px;
+    property <float> min-scale: 0.1;
+    property <float> max-scale: 10.0;
+    property <float> zoom-step: 1.15;
+
+    // Viewport dimensions (image area)
+    property <length> vp-w: root.width;
+    property <length> vp-h: root.height - root.header-h;
+
+    // Reset to fit-to-window
+    function reset-view() {
+        root.scale = 1.0;
+        root.offset-x = 0;
+        root.offset-y = 0;
+    }
+
+    // Clamp offset so image doesn't go completely off-screen
+    function clamp-offset() {
+        // Allow some overshoot but keep at least part of image visible
+        root.offset-x = Math.max(-(root.vp-w * 0.5), Math.min(root.offset-x, root.vp-w * 0.5));
+        root.offset-y = Math.max(-(root.vp-h * 0.5), Math.min(root.offset-y, root.vp-h * 0.5));
+    }
+
+    // Dark overlay background
     Rectangle {
-        background: #000000cc;
+        background: #000000dd;
         width: 100%;
         height: 100%;
     }
 
-    iv-focus := FocusScope {
+    FocusScope {
         width: 100%;
         height: 100%;
+
         key-pressed(e) => {
             if (e.text == Key.Escape) {
                 root.close();
@@ -43,120 +74,331 @@ export component ImageViewer {
                 root.next();
                 return accept;
             }
+            if (e.text == Key.Space) {
+                root.reset-view();
+                return accept;
+            }
             return reject;
         }
 
-        // Title bar
+        // ── Header / Title bar ──────────────────────────────────────────
         Rectangle {
             y: 0;
-            height: 40px;
-            background: #00000066;
+            height: root.header-h;
+            background: #00000088;
 
             HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 8px;
+                padding-left: 16px;
+                padding-right: 12px;
                 alignment: space-between;
 
-                Text {
-                    text: root.file-name
-                        + (root.total > 0 ? "  " + root.index + "/" + root.total : "")
-                        + (root.scale > 0 ? "  " + Math.round(root.scale * 100) + "%" : "");
-                    color: #e6e8ee;
-                    font-size: Theme.fs-md;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                }
+                // File name + index
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: start;
 
-                Rectangle {
-                    width: 28px;
-                    height: 28px;
-                    background: close-ta.has-hover ? #ffffff22 : transparent;
-                    border-radius: Theme.radius-sm;
-                    close-ta := TouchArea {
-                        clicked => { root.close(); }
-                    }
                     Text {
-                        text: "\u{e5cd}";
-                        font-family: "Material Icons";
+                        text: root.file-name;
                         color: #e6e8ee;
-                        font-size: 18px;
-                        horizontal-alignment: center;
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    if root.total > 1 : Text {
+                        text: root.index + 1 + " / " + root.total;
+                        color: #a0a4b0;
+                        font-size: 13px;
                         vertical-alignment: center;
                     }
                 }
-            }
-        }
 
-        // Error message
-        if root.error-msg != "" : Rectangle {
-            width: 100%;
-            height: 100%;
-            Text {
-                text: root.error-msg;
-                color: #e6e8ee;
-                font-size: Theme.fs-lg;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
+                // Zoom controls
+                HorizontalLayout {
+                    spacing: 4px;
+                    alignment: end;
 
-        // Image display with zoom/pan
-        if root.error-msg == "" : TouchArea {
-            x: 0;
-            y: 40px;
-            width: root.width;
-            height: root.height - 40px;
-
-            scroll-event(event) => {
-                if (event.delta-y < 0) {
-                    root.scale = Math.min(root.scale * 1.1, 10.0);
-                } else {
-                    root.scale = Math.max(root.scale / 1.1, 0.1);
-                }
-                accept
-            }
-
-            pointer-event(event) => {
-                if (event.kind == PointerEventKind.down && root.scale > 1.0) {
-                    root.panning = true;
-                    root.pan-start-x = self.mouse-x;
-                    root.pan-start-y = self.mouse-y;
-                } else if (event.kind == PointerEventKind.up) {
-                    if (!root.panning) {
-                        // Click without drag: navigate left/right
-                        if (self.mouse-x < root.width / 2) {
-                            root.prev();
-                        } else {
-                            root.next();
+                    // Zoom out
+                    Rectangle {
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 6px;
+                        background: zoom-out-ta.has-hover ? #ffffff22 : transparent;
+                        zoom-out-ta := TouchArea {
+                            clicked => {
+                                root.scale = Math.max(root.scale / root.zoom-step, root.min-scale);
+                            }
+                        }
+                        Text {
+                            text: "−";
+                            color: #e6e8ee;
+                            font-size: 18px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
                         }
                     }
-                    root.panning = false;
+
+                    // Zoom percentage
+                    Rectangle {
+                        width: 60px;
+                        height: 32px;
+                        background: #ffffff11;
+                        border-radius: 6px;
+                        TouchArea {
+                            clicked => { root.reset-view(); }
+                        }
+                        Text {
+                            text: Math.round(root.scale * 100) + "%";
+                            color: #e6e8ee;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Zoom in
+                    Rectangle {
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 6px;
+                        background: zoom-in-ta.has-hover ? #ffffff22 : transparent;
+                        zoom-in-ta := TouchArea {
+                            clicked => {
+                                root.scale = Math.min(root.scale * root.zoom-step, root.max-scale);
+                            }
+                        }
+                        Text {
+                            text: "+";
+                            color: #e6e8ee;
+                            font-size: 18px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // Spacer
+                    Rectangle { width: 8px; }
+
+                    // Close button
+                    Rectangle {
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 6px;
+                        background: close-ta.has-hover ? #ff4444aa : transparent;
+                        close-ta := TouchArea {
+                            clicked => { root.close(); }
+                        }
+                        Text {
+                            text: "\u{e5cd}";
+                            font-family: "Material Icons";
+                            color: #e6e8ee;
+                            font-size: 20px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
                 }
             }
+        }
 
-            moved => {
-                if (root.panning) {
-                    root.pan-x += self.mouse-x - root.pan-start-x;
-                    root.pan-y += self.mouse-y - root.pan-start-y;
-                    root.pan-start-x = self.mouse-x;
-                    root.pan-start-y = self.mouse-y;
+        // ── Error message ───────────────────────────────────────────────
+        if root.error-msg != "" : Rectangle {
+            x: 0;
+            y: root.header-h;
+            width: 100%;
+            height: root.vp-h;
+
+            Rectangle {
+                width: 300px;
+                height: 120px;
+                background: #ff000022;
+                border-radius: 12px;
+                border-width: 1px;
+                border-color: #ff000044;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 8px;
+                    padding: 16px;
+
+                    Text {
+                        text: "\u{e001}";
+                        font-family: "Material Icons";
+                        color: #ff6666;
+                        font-size: 32px;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: root.error-msg;
+                        color: #e6e8ee;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
                 }
             }
+        }
 
-            double-clicked => {
-                root.scale = 1.0;
-                root.pan-x = 0;
-                root.pan-y = 0;
-            }
+        // ── Image display area ──────────────────────────────────────────
+        if root.error-msg == "" : Rectangle {
+            x: 0;
+            y: root.header-h;
+            width: root.vp-w;
+            height: root.vp-h;
+            clip: true;
 
+            // The image, centered then offset by pan
             Image {
                 source: root.preview-image;
                 image-fit: contain;
-                width: (root.width - 120px) * root.scale;
-                height: (root.height - 40px) * root.scale;
-                x: 60px + root.pan-x;
-                y: root.pan-y;
+                // Center the image, then apply zoom and pan offset
+                width: root.vp-w * root.scale;
+                height: root.vp-h * root.scale;
+                x: (root.vp-w - self.width) / 2 + root.offset-x;
+                y: (root.vp-h - self.height) / 2 + root.offset-y;
+            }
+
+            // Interaction layer (must be on top of the image)
+            TouchArea {
+                width: 100%;
+                height: 100%;
+
+                scroll-event(event) => {
+                    // Zoom centered on mouse position
+                    if (event.delta-y < 0) {
+                        // Zoom in: adjust offset so point under mouse stays fixed
+                        root.offset-x = (self.mouse-x - root.vp-w / 2) - ((self.mouse-x - root.vp-w / 2) - root.offset-x) * (root.scale * root.zoom-step / root.scale);
+                        root.offset-y = (self.mouse-y - root.vp-h / 2) - ((self.mouse-y - root.vp-h / 2) - root.offset-y) * (root.scale * root.zoom-step / root.scale);
+                        root.scale = Math.min(root.scale * root.zoom-step, root.max-scale);
+                    } else {
+                        // Zoom out
+                        root.offset-x = (self.mouse-x - root.vp-w / 2) - ((self.mouse-x - root.vp-w / 2) - root.offset-x) * (root.scale / root.zoom-step / root.scale);
+                        root.offset-y = (self.mouse-y - root.vp-h / 2) - ((self.mouse-y - root.vp-h / 2) - root.offset-y) * (root.scale / root.zoom-step / root.scale);
+                        root.scale = Math.max(root.scale / root.zoom-step, root.min-scale);
+                    }
+                    root.clamp-offset();
+                    accept
+                }
+
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down) {
+                        root.is-panning = true;
+                        root.pan-start-x = self.mouse-x;
+                        root.pan-start-y = self.mouse-y;
+                        root.pan-start-offset-x = root.offset-x;
+                        root.pan-start-offset-y = root.offset-y;
+                    } else if (event.kind == PointerEventKind.up) {
+                        if (!root.is-panning) {
+                            // Click without drag: navigate
+                            if (self.mouse-x < root.width / 2) {
+                                root.prev();
+                            } else {
+                                root.next();
+                            }
+                        } else {
+                            // Check if it was actually a click (small movement)
+                            if (Math.abs(self.mouse-x - root.pan-start-x) < 5px && Math.abs(self.mouse-y - root.pan-start-y) < 5px) {
+                                if (self.mouse-x < root.width / 2) {
+                                    root.prev();
+                                } else {
+                                    root.next();
+                                }
+                            }
+                        }
+                        root.is-panning = false;
+                    }
+                }
+
+                moved => {
+                    if (root.is-panning) {
+                        root.offset-x = root.pan-start-offset-x + (self.mouse-x - root.pan-start-x);
+                        root.offset-y = root.pan-start-offset-y + (self.mouse-y - root.pan-start-y);
+                        root.clamp-offset();
+                    }
+                }
+
+                double-clicked => {
+                    if (root.scale > 1.1 || root.scale < 0.9) {
+                        root.reset-view();
+                    } else {
+                        // Zoom to 2x centered on click
+                        root.offset-x = (self.mouse-x - root.vp-w / 2) - ((self.mouse-x - root.vp-w / 2) - root.offset-x) * 2.0;
+                        root.offset-y = (self.mouse-y - root.vp-h / 2) - ((self.mouse-y - root.vp-h / 2) - root.offset-y) * 2.0;
+                        root.scale = 2.0;
+                        root.clamp-offset();
+                    }
+                }
+            }
+        }
+
+        // ── Left navigation button ──────────────────────────────────────
+        if root.index > 0 : Rectangle {
+            x: 12px;
+            y: root.header-h + (root.vp-h - root.nav-btn-h) / 2;
+            width: root.nav-btn-w;
+            height: root.nav-btn-h;
+            border-radius: 12px;
+            background: left-ta.has-hover ? #ffffff33 : #00000044;
+            border-width: 1px;
+            border-color: #ffffff22;
+
+            left-ta := TouchArea {
+                clicked => { root.prev(); }
+            }
+
+            Text {
+                text: "\u{e5cb}";
+                font-family: "Material Icons";
+                color: #e6e8ee;
+                font-size: 28px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                opacity: left-ta.has-hover ? 1.0 : 0.7;
+            }
+        }
+
+        // ── Right navigation button ─────────────────────────────────────
+        if root.index < root.total - 1 : Rectangle {
+            x: root.width - root.nav-btn-w - 12px;
+            y: root.header-h + (root.vp-h - root.nav-btn-h) / 2;
+            width: root.nav-btn-w;
+            height: root.nav-btn-h;
+            border-radius: 12px;
+            background: right-ta.has-hover ? #ffffff33 : #00000044;
+            border-width: 1px;
+            border-color: #ffffff22;
+
+            right-ta := TouchArea {
+                clicked => { root.next(); }
+            }
+
+            Text {
+                text: "\u{e5cc}";
+                font-family: "Material Icons";
+                color: #e6e8ee;
+                font-size: 28px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                opacity: right-ta.has-hover ? 1.0 : 0.7;
+            }
+        }
+
+        // ── Bottom hint bar ─────────────────────────────────────────────
+        Rectangle {
+            x: 0;
+            y: root.height - 36px;
+            width: 100%;
+            height: 36px;
+            background: #00000066;
+
+            Text {
+                text: "滚轮缩放 · 拖拽平移 · 双击切换 · 方向键翻页 · 空格重置 · Esc 关闭";
+                color: #808490;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
             }
         }
     }
