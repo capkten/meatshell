@@ -267,6 +267,9 @@ fn default_sftp_height() -> f32 {
 fn default_flow() -> String {
     "none".to_string()
 }
+fn default_image_preview_max_bytes() -> u64 {
+    100 * 1024 * 1024
+}
 
 /// How a session authenticates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -490,6 +493,9 @@ pub struct ConfigFile {
     /// sessions (same path, falling back to each panel's current dir).
     #[serde(default)]
     pub sync_upload: bool,
+    /// Maximum file size (in bytes) for image preview via SFTP. Default 100 MiB.
+    #[serde(default = "default_image_preview_max_bytes")]
+    pub image_preview_max_bytes: u64,
 }
 
 /// Portable export file (issue #46): sessions with everything in plaintext
@@ -978,6 +984,16 @@ impl ConfigStore {
 
     pub fn set_sync_upload(&mut self, v: bool) {
         self.cache.sync_upload = v;
+    }
+
+    /// Maximum file size (in bytes) for image preview via SFTP. Default 100 MiB.
+    pub fn image_preview_max_bytes(&self) -> u64 {
+        self.cache.image_preview_max_bytes
+    }
+
+    #[allow(dead_code)]
+    pub fn set_image_preview_max_bytes(&mut self, bytes: u64) {
+        self.cache.image_preview_max_bytes = bytes;
     }
 
     /// Whether each download prompts for a save location (default false) (#87).

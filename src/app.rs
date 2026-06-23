@@ -871,12 +871,13 @@ pub fn run() -> Result<()> {
     {
         let image_entries_clone = image_entries.clone();
         let sftp_handles_clone = sftp_handles.clone();
+        let store_clone = store.clone();
         let weak = window.as_weak();
         window.on_sftp_preview(move |tab_id: SharedString, path: SharedString| {
             let entries = image_entries_clone.lock().unwrap();
             let idx = entries.iter().position(|p| p == path.as_str()).unwrap_or(0);
             let total = entries.len();
-            let max_bytes: u64 = 10 * 1024 * 1024;
+            let max_bytes = store_clone.borrow().image_preview_max_bytes();
             if let Some(h) = sftp_handles_clone.lock().unwrap().get(tab_id.as_str()) {
                 h.read_bytes(path.to_string(), max_bytes);
             }
@@ -891,6 +892,7 @@ pub fn run() -> Result<()> {
     {
         let entries_c = image_entries.clone();
         let handles_c = sftp_handles.clone();
+        let store_c = store.clone();
         let weak = window.as_weak();
         window.on_image_viewer_prev(move || {
             if let Some(w) = weak.upgrade() {
@@ -899,7 +901,7 @@ pub fn run() -> Result<()> {
                     let new_idx = idx - 1;
                     let entries = entries_c.lock().unwrap();
                     if let Some(path) = entries.get(new_idx) {
-                        let max_bytes: u64 = 10 * 1024 * 1024;
+                        let max_bytes = store_c.borrow().image_preview_max_bytes();
                         // Use the active tab's SFTP handle.
                         let active = w.get_active_tab_id();
                         if let Some(h) = handles_c.lock().unwrap().get(active.as_str()) {
@@ -914,6 +916,7 @@ pub fn run() -> Result<()> {
     {
         let entries_c = image_entries.clone();
         let handles_c = sftp_handles.clone();
+        let store_c = store.clone();
         let weak = window.as_weak();
         window.on_image_viewer_next(move || {
             if let Some(w) = weak.upgrade() {
@@ -923,7 +926,7 @@ pub fn run() -> Result<()> {
                     let new_idx = idx + 1;
                     let entries = entries_c.lock().unwrap();
                     if let Some(path) = entries.get(new_idx) {
-                        let max_bytes: u64 = 10 * 1024 * 1024;
+                        let max_bytes = store_c.borrow().image_preview_max_bytes();
                         let active = w.get_active_tab_id();
                         if let Some(h) = handles_c.lock().unwrap().get(active.as_str()) {
                             h.read_bytes(path.clone(), max_bytes);

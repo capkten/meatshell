@@ -5,7 +5,12 @@ export component ImageViewer {
     in property <int> index;
     in property <int> total;
     in property <image> preview-image;
-    in property <float> scale: 1.0;
+    in-out property <float> scale: 1.0;
+    in-out property <length> pan-x: 0;
+    in-out property <length> pan-y: 0;
+    property <bool> panning: false;
+    property <length> pan-start-x;
+    property <length> pan-start-y;
     in property <string> error-msg;
 
     callback close();
@@ -96,59 +101,62 @@ export component ImageViewer {
             }
         }
 
-        // Image display
-        if root.error-msg == "" : Image {
-            x: 60px;
-            y: 40px;
-            width: root.width - 120px;
-            height: root.height - 40px;
-            source: root.preview-image;
-            image-fit: contain;
-        }
-
-        // Left navigation touch area
-        Rectangle {
+        // Image display with zoom/pan
+        if root.error-msg == "" : TouchArea {
             x: 0;
             y: 40px;
-            width: 60px;
+            width: root.width;
             height: root.height - 40px;
-            background: left-ta.has-hover ? #ffffff11 : transparent;
 
-            left-ta := TouchArea {
-                clicked => { root.prev(); }
+            scroll-event(event) => {
+                if (event.delta-y < 0) {
+                    root.scale = Math.min(root.scale * 1.1, 10.0);
+                } else {
+                    root.scale = Math.max(root.scale / 1.1, 0.1);
+                }
+                accept
             }
 
-            Text {
-                text: "\u{e5cb}";
-                font-family: "Material Icons";
-                color: #e6e8ee88;
-                font-size: 32px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                visible: left-ta.has-hover;
-            }
-        }
-
-        // Right navigation touch area
-        Rectangle {
-            x: root.width - 60px;
-            y: 40px;
-            width: 60px;
-            height: root.height - 40px;
-            background: right-ta.has-hover ? #ffffff11 : transparent;
-
-            right-ta := TouchArea {
-                clicked => { root.next(); }
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && root.scale > 1.0) {
+                    root.panning = true;
+                    root.pan-start-x = self.mouse-x;
+                    root.pan-start-y = self.mouse-y;
+                } else if (event.kind == PointerEventKind.up) {
+                    if (!root.panning) {
+                        // Click without drag: navigate left/right
+                        if (self.mouse-x < root.width / 2) {
+                            root.prev();
+                        } else {
+                            root.next();
+                        }
+                    }
+                    root.panning = false;
+                }
             }
 
-            Text {
-                text: "\u{e5cc}";
-                font-family: "Material Icons";
-                color: #e6e8ee88;
-                font-size: 32px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                visible: right-ta.has-hover;
+            moved => {
+                if (root.panning) {
+                    root.pan-x += self.mouse-x - root.pan-start-x;
+                    root.pan-y += self.mouse-y - root.pan-start-y;
+                    root.pan-start-x = self.mouse-x;
+                    root.pan-start-y = self.mouse-y;
+                }
+            }
+
+            double-clicked => {
+                root.scale = 1.0;
+                root.pan-x = 0;
+                root.pan-y = 0;
+            }
+
+            Image {
+                source: root.preview-image;
+                image-fit: contain;
+                width: (root.width - 120px) * root.scale;
+                height: (root.height - 40px) * root.scale;
+                x: 60px + root.pan-x;
+                y: root.pan-y;
             }
         }
     }
