@@ -205,7 +205,9 @@ fn grid_line(t: f32, halfwidth: f32) -> f32 {
 
 /// Cheap deterministic per-pixel hash in [0, 1) for scattering stars.
 fn hash2(x: u32, y: u32) -> f32 {
-    let mut h = x.wrapping_mul(374761393).wrapping_add(y.wrapping_mul(668265263));
+    let mut h = x
+        .wrapping_mul(374761393)
+        .wrapping_add(y.wrapping_mul(668265263));
     h = (h ^ (h >> 13)).wrapping_mul(1274126177);
     ((h ^ (h >> 16)) & 0x00ff_ffff) as f32 / 16777216.0
 }
@@ -278,7 +280,11 @@ fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
         return (0.0, 0.0, l); // achromatic
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if max == r {
         (g - b) / d + if g < b { 6.0 } else { 0.0 }
     } else if max == g {
@@ -294,7 +300,11 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
         let v = (l * 255.0).round() as u8;
         return (v, v, v);
     }
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let r = hue_to_rgb(p, q, h + 1.0 / 3.0);
     let g = hue_to_rgb(p, q, h);

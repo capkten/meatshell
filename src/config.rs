@@ -59,8 +59,7 @@ pub fn data_dir() -> PathBuf {
 /// Pre-0.4.15 location: the per-user OS config dir
 /// (`%APPDATA%/meatshell`, `~/.config/meatshell`, …).
 fn legacy_data_dir() -> Option<PathBuf> {
-    ProjectDirs::from("dev", "meatshell", "meatshell")
-        .map(|d| d.config_dir().to_path_buf())
+    ProjectDirs::from("dev", "meatshell", "meatshell").map(|d| d.config_dir().to_path_buf())
 }
 
 /// Portable location: a `config/` folder beside the executable.
@@ -128,8 +127,7 @@ fn migrate_legacy(legacy: &Path, portable: &Path) {
                     #[cfg(unix)]
                     if name == "secret.key" {
                         use std::os::unix::fs::PermissionsExt;
-                        let _ =
-                            fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+                        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
                     }
                     tracing::info!(
                         "migrated {name} to portable config dir {}",

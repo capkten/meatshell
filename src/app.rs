@@ -2511,8 +2511,8 @@ fn char_at_cell_start(prefix: &[usize], target: usize) -> usize {
 /// than `target` (#132).
 fn char_after_cell_end(prefix: &[usize], target: usize) -> usize {
     let n = prefix.len().saturating_sub(1); // chars.len()
-    for i in 0..n {
-        if prefix[i] > target {
+    for (i, &col) in prefix.iter().enumerate().take(n) {
+        if col > target {
             return i;
         }
     }
