@@ -4375,7 +4375,7 @@ struct PendingMfa {
 }
 
 thread_local! {
-    static MFA_QUEUE: RefCell<VecDeque<PendingMfa>> = RefCell::new(VecDeque::new());
+    static MFA_QUEUE: RefCell<VecDeque<PendingMfa>> = const { RefCell::new(VecDeque::new()) };
 }
 
 /// Queue an MFA prompt: a concurrent connection for the same session (the shell
@@ -4582,6 +4582,7 @@ fn refresh_panes(
 /// "left"/"right"/"up"/"down"/"center"; `None` when the point is outside every
 /// pane. The 30% edge bands trigger a split; the middle drops into the pane's
 /// tab group.
+#[allow(clippy::type_complexity)]
 fn drag_target(
     layout: &crate::panes::Layout,
     content: (f32, f32),
@@ -4624,6 +4625,7 @@ fn drag_target(
 // Tab callbacks
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn wire_tab_callbacks(
     window: &AppWindow,
     tabs_model: Rc<VecModel<TabInfo>>,
