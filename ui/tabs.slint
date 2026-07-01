@@ -14,21 +14,82 @@ component SingleTab inherits Rectangle {
     in property <bool> active;
     callback selected();
     callback closed();
+    // Drag-to-reorder (v0.5): emitted while dragging when the tab should hop one
+    // slot left (-1) or right (+1). The model reorders and the tab follows.
+    callback reorder(int /* dir */);
+    // Right-click (v0.5): request a context menu at the given absolute position.
+    callback context-requested(length /* abs-x */, length /* abs-y */);
+    // Drag-to-split (v0.5): report the absolute cursor while dragging, and the
+    // drop point on release. The parent maps these to pane drop-zones.
+    callback drag-moved(length /* abs-x */, length /* abs-y */);
+    callback drag-dropped(length /* abs-x */, length /* abs-y */);
+
+    // Where inside the tab the drag began, and whether a drag (vs a click) is in
+    // progress. `dragging` suppresses the select-on-release.
+    property <length> grab-offset;
+    property <bool> pressing;
+    out property <bool> dragging;
 
     height: 30px;
     min-width: 100px;          // 缩短：原 120px，短名称（如 "pve"）时更紧凑
     max-width: 160px;          // 新增：防止长名称把 tab 撑得过宽
     horizontal-stretch: 0;    // 新增：不参与 TabBar 的等分拉伸，保持自然宽度
     border-radius: Theme.radius-sm;
-    background: active ? Theme.bg-panel
-        : (touch.has-hover ? Theme.bg-hover : transparent);
+    background: dragging ? Theme.bg-active
+        : (active ? Theme.bg-panel
+        : (touch.has-hover ? Theme.bg-hover : transparent));
     animate background { duration: 120ms; }
 
     // Declared FIRST so the HorizontalLayout's children (close button) are at
     // a higher z-order and receive their own click events.
     touch := TouchArea {
         mouse-cursor: pointer;
-        clicked => { root.selected(); }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.grab-offset = self.mouse-x;
+                root.pressing = true;
+                root.dragging = false;
+            } else if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                root.context-requested(
+                    self.absolute-position.x + self.mouse-x,
+                    self.absolute-position.y + self.mouse-y);
+            } else if (e.kind == PointerEventKind.up) {
+                if (root.pressing && !root.dragging) {
+                    root.selected();
+                } else if (root.pressing && root.dragging) {
+                    root.drag-dropped(self.absolute-position.x + self.mouse-x,
+                                      self.absolute-position.y + self.mouse-y);
+                }
+                root.pressing = false;
+                root.dragging = false;
+            }
+        }
+        moved => {
+            if (root.pressing) {
+                // A drag begins once the cursor drifts horizontally OR leaves the
+                // tab vertically (so a straight-down drag to split also counts).
+                if (abs(self.mouse-x - root.grab-offset) > 5px
+                        || self.mouse-y < -6px || self.mouse-y > root.height + 6px) {
+                    root.dragging = true;
+                }
+                // Tell the parent where the cursor is, for drop-to-split zones.
+                root.drag-moved(self.absolute-position.x + self.mouse-x,
+                                self.absolute-position.y + self.mouse-y);
+                // Reorder within the strip only while the cursor stays on the strip
+                // row; once it drops into a pane body we hand off to drag-to-split.
+                // One slot = the tab's own width + the 2px strip spacing; re-anchor
+                // grab-offset after each hop so the drift resets (no oscillation).
+                if (self.mouse-y > -10px && self.mouse-y < root.height + 10px) {
+                    if (self.mouse-x - root.grab-offset > (root.width + 2px) / 2) {
+                        root.reorder(1);
+                        root.grab-offset = self.mouse-x - (root.width + 2px);
+                    } else if (self.mouse-x - root.grab-offset < -(root.width + 2px) / 2) {
+                        root.reorder(-1);
+                        root.grab-offset = self.mouse-x + (root.width + 2px);
+                    }
+                }
+            }
+        }
     }
 
     HorizontalLayout {
@@ -65,6 +126,32 @@ component SingleTab inherits Rectangle {
     }
 }
 
+// --- Tab context-menu item -------------------------------------------------
+component TabMenuItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    background: enabled && ta.has-hover ? Theme.bg-hover : transparent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: label;
+            color: enabled ? Theme.text-primary : Theme.text-muted;
+            font-size: Theme.fs-sm;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // --- TabBar ----------------------------------------------------------------
 export component TabBar inherits Rectangle {
     in property <[TabInfo]> tabs;
@@ -75,6 +162,21 @@ export component TabBar inherits Rectangle {
     callback tab-selected(string);
     callback tab-closed(string);
     callback new-tab();
+    // Drag-to-reorder: move the tab at `from` one slot in `dir` (#v0.5).
+    callback tab-reorder(int /* from */, int /* dir */);
+    // Split this pane, peeling `tab-id` into a new pane on `dir` (#v0.5).
+    callback tab-split(string /* tab-id */, string /* dir */);
+    // Open another connection to the same session as `tab-id` (#v0.5).
+    callback tab-duplicate(string /* tab-id */);
+    // Drag-to-split (#v0.5): cursor moved / dropped while dragging `tab-id`, in
+    // absolute (window) coordinates.
+    callback tab-drag-move(string /* tab-id */, length /* abs-x */, length /* abs-y */);
+    callback tab-drag-drop(string /* tab-id */, length /* abs-x */, length /* abs-y */);
+
+    // Right-click context-menu state.
+    property <length> menu-x;
+    property <length> menu-y;
+    property <string> menu-target;
 
     height: 36px;
     background: Theme.bg-panel-alt;
@@ -104,6 +206,15 @@ export component TabBar inherits Rectangle {
                     active: tab.id == root.active-id;
                     selected => { root.tab-selected(tab.id); }
                     closed => { root.tab-closed(tab.id); }
+                    reorder(dir) => { root.tab-reorder(i, dir); }
+                    context-requested(ax, ay) => {
+                        root.menu-target = tab.id;
+                        root.menu-x = ax - root.absolute-position.x;
+                        root.menu-y = ay - root.absolute-position.y;
+                        tab-menu.show();
+                    }
+                    drag-moved(ax, ay) => { root.tab-drag-move(tab.id, ax, ay); }
+                    drag-dropped(ax, ay) => { root.tab-drag-drop(tab.id, ax, ay); }
                 }
                 IconButton {
                     glyph: "+";
@@ -140,6 +251,49 @@ export component TabBar inherits Rectangle {
             glyph: "›"; size: 24px;
             clicked => {
                 flick.viewport-x = max(flick.width - flick.viewport-width, flick.viewport-x - 120px);
+            }
+        }
+    }
+
+    // Right-click context menu (v0.5): split this pane by peeling the clicked tab
+    // into a new pane. Splitting needs ≥2 tabs so the source pane survives.
+    tab-menu := PopupWindow {
+        x: root.menu-x;
+        y: root.menu-y;
+        width: 140px;
+        height: 5 * 29px + 12px;
+        Rectangle {
+            background: Theme.bg-panel;
+            border-radius: Theme.radius-sm;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000060;
+            VerticalLayout {
+                padding: 4px;
+                spacing: 1px;
+                TabMenuItem {
+                    label: @tr("Duplicate connection");
+                    enabled: root.menu-target != "welcome";
+                    clicked => { root.tab-duplicate(root.menu-target); }
+                }
+                Rectangle { height: 1px; background: Theme.border-subtle; }
+                TabMenuItem {
+                    label: @tr("Split right");
+                    enabled: root.tabs.length > 1;
+                    clicked => { root.tab-split(root.menu-target, "right"); }
+                }
+                TabMenuItem {
+                    label: @tr("Split down");
+                    enabled: root.tabs.length > 1;
+                    clicked => { root.tab-split(root.menu-target, "down"); }
+                }
+                Rectangle { height: 1px; background: Theme.border-subtle; }
+                TabMenuItem {
+                    label: @tr("Close tab");
+                    enabled: root.menu-target != "welcome";
+                    clicked => { root.tab-closed(root.menu-target); }
+                }
             }
         }
     }

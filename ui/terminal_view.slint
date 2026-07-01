@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { SftpPanel, SftpEntry, SftpTreeNode } from "sftp_panel.slint";
-import { DockExpandButton } from "widgets.slint";
+import { DockExpandButton, ToolStrip } from "widgets.slint";
 
 // Embed the terminal fonts here too so the cell-probe Text below measures
 // with the CORRECT font (the built-in Meatshell Mono), not a system fallback.
@@ -103,12 +103,17 @@ export component TerminalView inherits Rectangle {
     in property <bool>    sftp-loading: false;
     in property <[SftpTreeNode]> sftp-tree-nodes: [];
 
-    in-out property <length> sftp-panel-height: 220px;
-    in-out property <length> sftp-panel-width: 380px;     // extent when docked left/right
-    // Shared with the AppWindow (like sftp-panel-height) so a startup default can
-    // collapse the panel and the state stays consistent across tabs (#78).
-    in-out property <length> sftp-saved-height: 220px;   // height to restore on un-collapse
-    in-out property <bool>   sftp-collapsed: false;       // SFTP panel minimised (toolbar only)
+    // Per-session now (#v0.5): the AppWindow stores these in each TerminalState
+    // and writes back via the set-* callbacks, so each tab/pane keeps its own SFTP
+    // size + collapse state (resizing/collapsing one no longer affects the others).
+    in property <length> sftp-panel-height: 220px;
+    in property <length> sftp-panel-width: 380px;     // extent when docked left/right
+    in property <length> sftp-saved-height: 220px;    // height to restore on un-collapse
+    in property <bool>   sftp-collapsed: false;       // SFTP panel minimised (toolbar only)
+    callback set-sftp-panel-height(length);
+    callback set-sftp-panel-width(length);
+    callback set-sftp-saved-height(length);
+    callback set-sftp-collapsed(bool);
 
     // --- SFTP docking (within the terminal area) ---------------------------
     // Which edge of the terminal area the SFTP panel sits on: left|right|top|bottom.
@@ -136,6 +141,9 @@ export component TerminalView inherits Rectangle {
     property <bool> quick-open: false;         // quick-command popup visibility
     property <bool> history-open: false;       // history dropdown visibility
     property <int> history-cursor: -1;         // ↑/↓ recall index (-1 = live input)
+    // Keyboard-driven selection in the open history dropdown (#140): ↑/↓ move it,
+    // Enter runs history-view[history-selected].
+    property <int> history-selected: 0;
     callback run-command(string /* cmd */, bool /* to-all */);
     callback manage-quick-commands();          // open the add/edit/delete dialog
     callback toggle-quick-group(string /* group */);  // collapse/expand a group (#55)
@@ -180,6 +188,11 @@ export component TerminalView inherits Rectangle {
     callback clear-terminal();              // wipe this session's screen buffer
     callback find-query-changed(string);    // recompute search highlights
     callback terminal-scroll(int);          // scroll history by N lines (+ = up)
+    // Wheel inside an alt-screen app (tmux/less/vim): forward to the program so it
+    // scrolls, instead of doing nothing (#170). dir = +1 up / -1 down; col/row =
+    // mouse cell. Rust sends a mouse-wheel event if the app tracks the mouse, else
+    // arrow keys (alternate-scroll).
+    callback terminal-wheel(int /* dir */, int /* col */, int /* row */);
     callback terminal-scroll-to(int);       // jump to an absolute scrollback offset (#103)
     callback select-start(int, int);        // begin drag-selection at (row, col)
     callback select-update(int, int);       // extend drag-selection to (row, col)
@@ -276,7 +289,7 @@ export component TerminalView inherits Rectangle {
     // Reset the history filter whenever the dropdown opens; the search box itself
     // is recreated empty because the `if` subtree is destroyed on close (#101).
     changed history-open => {
-        if (root.history-open) { root.search-history(""); }
+        if (root.history-open) { root.search-history(""); root.history-selected = 0; }
     }
     changed visible => {
         if (self.visible) {
@@ -321,14 +334,13 @@ export component TerminalView inherits Rectangle {
         // the resource-panel dock area in app.slint (#dock).
         dock-region := Rectangle {
         vertical-stretch: 1;
-        // Collapsed → the panel fully disappears (like the resource panel); a
-        // floating expand button on the docked edge brings it back (#dock).
-        property <length> sf-w: root.sftp-collapsed ? 0px : root.sftp-panel-width;
-        property <length> sf-h: root.sftp-collapsed ? 0px : root.sftp-panel-height;
+        // Collapsed → shrink to the 36px ToolStrip icon bar at the docked edge
+        // (M5), click its icon to re-expand. The 4px splitter is gone collapsed.
+        property <length> sf-w: root.sftp-collapsed ? 36px : root.sftp-panel-width;
+        property <length> sf-h: root.sftp-collapsed ? 36px : root.sftp-panel-height;
         property <length> sp:   root.sftp-collapsed ? 0px : 4px;
-        // Bottom dock + collapsed → reserve a blank 22px gap at the bottom so the
-        // corner expand button (DockExpandButton) never overlaps the command bar.
-        property <length> bottom-strip-h: (root.sftp-dock == "bottom" && root.sftp-collapsed) ? 22px : 0px;
+        // The collapsed bar (sf-h) already reserves the bottom strip now.
+        property <length> bottom-strip-h: 0px;
 
         central := Rectangle {
             x: root.sftp-dock == "left" ? parent.sf-w + parent.sp : 0px;
@@ -354,7 +366,9 @@ export component TerminalView inherits Rectangle {
             init => { ime-input.focus(); }
 
             Timer {
-                running: ime-input.has-focus;
+                // Stop blinking (and thus repainting) when the window isn't
+                // focused — an idle background terminal should cost ~0 CPU (#127).
+                running: ime-input.has-focus && Theme.window-focused;
                 interval: 530ms;
                 triggered => { key-capture.cursor-blink = !key-capture.cursor-blink; }
             }
@@ -465,12 +479,17 @@ export component TerminalView inherits Rectangle {
                                 }
                             }
                             scroll-event(ev) => {
-                                // Wheel scrolls the scrollback history (~3 lines
-                                // per notch).  Positive delta-y = scroll up = older.
-                                // In alt-screen mode (vim/nano/btop) the program
-                                // handles scroll itself — suppress our history scroll
-                                // so the full-screen UI isn't pushed out of view.
-                                if (!root.is-alt-screen) {
+                                // Positive delta-y = wheel up.
+                                if (root.is-alt-screen) {
+                                    // Alt-screen app (tmux/less/vim): forward the wheel
+                                    // so the program scrolls instead of nothing (#170).
+                                    root.terminal-wheel(
+                                        ev.delta-y > 0 ? 1 : -1,
+                                        floor(self.mouse-x / root.cell-w),
+                                        floor(self.mouse-y / root.cell-h));
+                                } else {
+                                    // Normal screen: scroll our own scrollback history
+                                    // (~3 lines per notch).
                                     root.terminal-scroll(ev.delta-y > 0 ? 3 : -3);
                                 }
                                 accept
@@ -533,7 +552,11 @@ export component TerminalView inherits Rectangle {
                             width: root.cell-w;
                             height: root.cell-h;
                             background: Theme.term-fg;
-                            visible: ime-input.has-focus && key-capture.cursor-blink;
+                            // Blink while focused; show solid (no repaint) when the
+                            // window is unfocused so the cursor neither vanishes nor
+                            // keeps the window repainting (#127).
+                            visible: ime-input.has-focus
+                                && (key-capture.cursor-blink || !Theme.window-focused);
                         }
 
                         // --- Right-click context menu ---------------------
@@ -618,21 +641,32 @@ export component TerminalView inherits Rectangle {
                 }
 
                 key-pressed(event) => {
-                    // ── Ctrl+F: open the find bar (mirrors right-click → Find) ──
+                    // ⚠ macOS modifier naming is SWAPPED by Slint (see the winit
+                    // backend's muda.rs): `event.modifiers.control` is the **Cmd (⌘)**
+                    // key and `event.modifiers.meta` is the **physical Ctrl** key.
+                    // So `control` already gives ⌘ shortcuts on macOS for free, and
+                    // the physical Ctrl (meta on macOS) is what must reach the shell
+                    // so ^C/^X work in nano/vim (#158).
+                    // ── Find: ⌘F / Ctrl+F (mirrors right-click → Find) ──
                     if (event.modifiers.control && !event.modifiers.shift
                             && (event.text == "f" || event.text == "F"
                                 || event.text == "\u{0006}")) {
                         root.find-active = true;
                         accept
-                    // ── Ctrl+Shift+C: copy terminal buffer ───────────────────
+                    // ── Jump to command-history search: ⌘⇧R / Ctrl+Shift+R (#140) ──
                     } else if (event.modifiers.control && event.modifiers.shift
+                            && (event.text == "r" || event.text == "R"
+                                || event.text == "\u{0012}")) {
+                        root.history-open = true;
+                        accept
+                    // ── Copy: ⌘C (macOS, no Shift) / Ctrl+Shift+C ──
+                    } else if (event.modifiers.control
+                            && (Theme.is-mac ? !event.modifiers.shift : event.modifiers.shift)
                             && (event.text == "c" || event.text == "C"
                                 || event.text == "\u{0003}")) {
                         root.copy-terminal-text();
                         accept
-                    // ── Ctrl+V or Ctrl+Shift+V: paste from clipboard ─────────
-                    // We accept Ctrl+V (with or without Shift) so the familiar
-                    // Windows paste shortcut works in addition to Ctrl+Shift+V.
+                    // ── Paste: ⌘V / Ctrl+V (Ctrl+Shift+V also accepted) ──
                     } else if (event.modifiers.control
                             && (event.text == "v" || event.text == "V"
                                 || event.text == "\u{0016}")) {
@@ -641,12 +675,22 @@ export component TerminalView inherits Rectangle {
                         // Restore focus explicitly so the cursor keeps blinking.
                         ime-input.focus();
                         accept
-                    // ── All other keys (printable, Ctrl+X, arrows, …) ────────
-                    // Return `accept` for everything: `reject` bubbles without
-                    // inserting the char into TextInput, so `edited` never fires
-                    // for regular keystrokes — the character would be lost.
+                    // ── Paste: Shift+Insert (the X11 / xterm paste convention) (#144) ──
+                    } else if (event.modifiers.shift && event.text == Key.Insert) {
+                        root.paste-from-clipboard();
+                        ime-input.focus();
+                        accept
+                    // ── macOS: swallow any other ⌘ combo (control == Cmd here) so it
+                    // isn't typed into the shell as a literal character. ──
+                    } else if (Theme.is-mac && event.modifiers.control) {
+                        accept
+                    // ── All other keys (printable, Ctrl+X, arrows, …) → the shell.
+                    // The control flag is the *physical* Ctrl key: `meta` on macOS,
+                    // `control` elsewhere, so ^X/^C reach the PTY everywhere (#158).
+                    // Return `accept` for everything: `reject` would drop the char.
                     } else {
-                        root.send-key(event.text, event.modifiers.control,
+                        root.send-key(event.text,
+                                      Theme.is-mac ? event.modifiers.meta : event.modifiers.control,
                                       event.modifiers.alt, event.modifiers.shift);
                         accept
                     }
@@ -832,7 +876,20 @@ export component TerminalView inherits Rectangle {
                             root.history-cursor = -1;
                         }
                         key-pressed(e) => {
-                            if (e.text == Key.UpArrow) {
+                            // ⌘R / Ctrl+R opens the searchable history dropdown and
+                            // focuses its search box — full keyboard history recall
+                            // (#140). Esc closes it / returns to terminal. (The
+                            // Ctrl+A/E/K/U line-editing below stays on Ctrl — those
+                            // are the standard readline bindings on macOS too.)
+                            if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control)
+                                    && (e.text == "r" || e.text == "R" || e.text == "\u{0012}")) {
+                                root.history-open = true;
+                                accept
+                            } else if (e.text == Key.Escape) {
+                                if (root.history-open) { root.history-open = false; }
+                                else { ime-input.focus(); }   // back to the terminal
+                                accept
+                            } else if (e.text == Key.UpArrow) {
                                 // Model is oldest→newest (#113): first ↑ jumps to
                                 // the newest (last), further ↑ steps toward older.
                                 if (root.command-history.length > 0) {
@@ -856,20 +913,20 @@ export component TerminalView inherits Rectangle {
                                 accept
                             // --- readline line-editing keys (#103) ---
                             // Ctrl+A → start of line.
-                            } else if (e.modifiers.control && (e.text == "a" || e.text == "A" || e.text == "\u{0001}")) {
+                            } else if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control) && (e.text =="a" || e.text == "A" || e.text == "\u{0001}")) {
                                 self.set-selection-offsets(0, 0);
                                 accept
                             // Ctrl+E → end of line.
-                            } else if (e.modifiers.control && (e.text == "e" || e.text == "E" || e.text == "\u{0005}")) {
+                            } else if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control) && (e.text =="e" || e.text == "E" || e.text == "\u{0005}")) {
                                 self.set-selection-offsets(1000000, 1000000);
                                 accept
                             // Ctrl+K → kill from cursor to end (deletes + clipboard).
-                            } else if (e.modifiers.control && (e.text == "k" || e.text == "K" || e.text == "\u{000B}")) {
+                            } else if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control) && (e.text =="k" || e.text == "K" || e.text == "\u{000B}")) {
                                 self.set-selection-offsets(self.cursor-position_byte-offset, 1000000);
                                 self.cut();
                                 accept
                             // Ctrl+U → kill from start to cursor.
-                            } else if (e.modifiers.control && (e.text == "u" || e.text == "U" || e.text == "\u{0015}")) {
+                            } else if ((Theme.is-mac ? e.modifiers.meta : e.modifiers.control) && (e.text =="u" || e.text == "U" || e.text == "\u{0015}")) {
                                 self.set-selection-offsets(0, self.cursor-position_byte-offset);
                                 self.cut();
                                 accept
@@ -1162,10 +1219,11 @@ export component TerminalView inherits Rectangle {
                             horizontal-alignment: center;
                             height: 32px; vertical-alignment: center;
                         }
-                        for h in root.history-view : Rectangle {
+                        for h[idx] in root.history-view : Rectangle {
                             height: 28px;
                             border-radius: Theme.radius-sm;
-                            background: h-item-ta.has-hover ? Theme.bg-hover : transparent;
+                            background: idx == root.history-selected ? Theme.bg-active
+                                      : (h-item-ta.has-hover ? Theme.bg-hover : transparent);
                             // Row body click recalls the command into the input box.
                             h-item-ta := TouchArea {
                                 mouse-cursor: pointer;
@@ -1255,7 +1313,42 @@ export component TerminalView inherits Rectangle {
                                     font-family: Theme.ui-font-family;
                                     font-size: Theme.fs-sm;
                                     single-line: true;
-                                    edited => { root.search-history(self.text); }
+                                    // Auto-focus so Ctrl+R lands you typing (#140).
+                                    init => { self.focus(); }
+                                    edited => { root.search-history(self.text); root.history-selected = 0; }
+                                    // ↑/↓ move the selection, Enter runs it, Esc
+                                    // closes and returns focus to the terminal (#140).
+                                    key-pressed(e) => {
+                                        if (e.text == Key.Escape) {
+                                            root.history-open = false;
+                                            ime-input.focus();
+                                            accept
+                                        } else if (e.text == Key.UpArrow) {
+                                            if (root.history-view.length > 0) {
+                                                root.history-selected = root.history-selected <= 0
+                                                    ? root.history-view.length - 1
+                                                    : root.history-selected - 1;
+                                            }
+                                            accept
+                                        } else if (e.text == Key.DownArrow) {
+                                            if (root.history-view.length > 0) {
+                                                root.history-selected = root.history-selected >= root.history-view.length - 1
+                                                    ? 0
+                                                    : root.history-selected + 1;
+                                            }
+                                            accept
+                                        } else if (e.text == Key.Return) {
+                                            if (root.history-view.length > 0
+                                                    && root.history-selected < root.history-view.length) {
+                                                root.run-command(root.history-view[root.history-selected], root.send-to-all);
+                                                root.history-open = false;
+                                                ime-input.focus();
+                                            }
+                                            accept
+                                        } else {
+                                            reject   // let typing filter the list
+                                        }
+                                    }
                                 }
                                 if hist-search.text == "" : Text {
                                     text: @tr("Search history");
@@ -1295,7 +1388,7 @@ export component TerminalView inherits Rectangle {
                 pointer-event(ev) => {
                     if (ev.kind == PointerEventKind.down) {
                         root.sftp-dragging = true;
-                        root.sftp-collapsed = false;
+                        root.set-sftp-collapsed(false);
                     } else if (ev.kind == PointerEventKind.up) {
                         root.sftp-dragging = false;
                     }
@@ -1310,17 +1403,17 @@ export component TerminalView inherits Rectangle {
                         if (root.sftp-horizontal) {
                             // Floor of 150px — by then Size+Modified columns have
                             // dropped and only Name remains; no narrower (#dock).
-                            root.sftp-panel-width = clamp(
+                            root.set-sftp-panel-width(clamp(
                                 root.sftp-dock == "right"
                                     ? dock-region.width - ((self.absolute-position.x + self.mouse-x) - dock-region.absolute-position.x)
                                     : (self.absolute-position.x + self.mouse-x) - dock-region.absolute-position.x,
-                                150px, max(160px, dock-region.width - 200px));
+                                150px, max(160px, dock-region.width - 200px)));
                         } else {
-                            root.sftp-panel-height = clamp(
+                            root.set-sftp-panel-height(clamp(
                                 root.sftp-dock == "bottom"
                                     ? dock-region.height - ((self.absolute-position.y + self.mouse-y) - dock-region.absolute-position.y)
                                     : (self.absolute-position.y + self.mouse-y) - dock-region.absolute-position.y,
-                                60px, max(80px, dock-region.height - 80px));
+                                60px, max(80px, dock-region.height - 80px)));
                         }
                     }
                 }
@@ -1356,14 +1449,13 @@ export component TerminalView inherits Rectangle {
             selected-count: root.sftp-selected-count;
             toggle-collapsed => {
                 if (root.sftp-collapsed) {
-                    // Restore to the saved height.
-                    root.sftp-panel-height = root.sftp-saved-height;
-                    root.sftp-collapsed = false;
+                    // Re-expand; the panel height was preserved while collapsed.
+                    root.set-sftp-collapsed(false);
                 } else {
-                    // Minimise: remember the height, shrink to the toolbar (30px).
-                    root.sftp-saved-height = root.sftp-panel-height;
-                    root.sftp-panel-height = 30px;
-                    root.sftp-collapsed = true;
+                    // Minimise: just collapse. sf-h becomes the 36px bar; the
+                    // panel height is preserved (no 30px poke that would pollute
+                    // the global default seeded into new sessions) (M5).
+                    root.set-sftp-collapsed(true);
                 }
             }
             navigate(path)      => { root.sftp-navigate(path); }
@@ -1413,16 +1505,16 @@ export component TerminalView inherits Rectangle {
             }
         }
 
-        // Collapsed → small per-edge expand button (shared with the resource
-        // panel). Bottom sits in the reserved 22px gap (bottom-strip-h) so it
-        // never overlaps the command bar (#dock).
-        if root.sftp-collapsed : DockExpandButton {
+        // Collapsed → a ToolStrip icon bar at the docked edge (M5), filling the
+        // 36px slot the panel shrank to; click the icon to re-expand.
+        if root.sftp-collapsed : ToolStrip {
+            x: root.sftp-dock == "right"  ? parent.width - parent.sf-w : 0px;
+            y: root.sftp-dock == "bottom" ? parent.height - parent.sf-h : 0px;
+            width:  root.sftp-horizontal ? parent.sf-w : parent.width;
+            height: root.sftp-horizontal ? parent.height : parent.sf-h;
             dock-edge: root.sftp-dock;
-            hug-right: true;   // SFTP controls live on the right, keep the button there
-            expand => {
-                root.sftp-panel-height = root.sftp-saved-height;
-                root.sftp-collapsed = false;
-            }
+            glyph: "\u{E2C7}";   // folder — SFTP
+            expand => { root.set-sftp-collapsed(false); }
         }
         }
     }

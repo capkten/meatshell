@@ -49,7 +49,15 @@ struct TermBuffer {
     /// absolute-positioned full-screen output collapses into a scrolling mess.
     /// Kept here so a sequence split across read chunks is still translated.
     csi_state: CsiState,
+    /// Capped copy of the (post-HVP-rewrite) byte stream fed to vt100, so a window
+    /// resize can replay it at the new width and reflow already-printed output to
+    /// match — the way FinalShell rewraps on resize (#169). Only the most recent
+    /// `RAW_CAP` bytes are kept; scrollback older than that won't reflow.
+    raw: std::collections::VecDeque<u8>,
 }
+
+/// How much of the byte stream we retain per tab for resize-reflow (#169).
+const RAW_CAP: usize = 2 * 1024 * 1024;
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
@@ -155,7 +163,108 @@ fn set_window_icon(window: &AppWindow) {
         .with_winit_window(|ww| ww.set_window_icon(Some(icon)));
 }
 
+/// On Windows 11, give the frameless window the native rounded corners (#166) and
+/// drop shadow (#162) it otherwise loses by drawing its own title bar. Harmless
+/// on Windows 10 (the corner attribute is ignored) and a no-op elsewhere.
+#[cfg(windows)]
+fn apply_window_chrome(window: &slint::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    window.with_winit_window(|ww| {
+        let Ok(handle) = ww.window_handle() else { return };
+        let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+        let hwnd = h.hwnd.get();
+
+        #[repr(C)]
+        struct Margins {
+            left: i32,
+            right: i32,
+            top: i32,
+            bottom: i32,
+        }
+        #[link(name = "dwmapi")]
+        extern "system" {
+            fn DwmSetWindowAttribute(
+                hwnd: isize,
+                attr: u32,
+                pv: *const core::ffi::c_void,
+                cb: u32,
+            ) -> i32;
+            fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const Margins) -> i32;
+        }
+        // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2 (Windows 11+).
+        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+        const DWMWCP_ROUND: u32 = 2;
+        unsafe {
+            let pref: u32 = DWMWCP_ROUND;
+            let corner_hr = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&pref as *const u32).cast(),
+                4,
+            );
+            // A borderless (WS_POPUP) window has no system shadow; extending the
+            // DWM frame by a hair brings it back. The margin renders as glass, but
+            // our opaque background paints over it — only the shadow shows.
+            let m = Margins {
+                left: 1,
+                right: 1,
+                top: 1,
+                bottom: 1,
+            };
+            let shadow_hr = DwmExtendFrameIntoClientArea(hwnd, &m);
+            tracing::debug!(
+                "window chrome applied: hwnd={hwnd:#x} corner_hr={corner_hr:#x} shadow_hr={shadow_hr:#x}"
+            );
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn apply_window_chrome(_window: &slint::Window) {}
+
+/// macOS-only: install a custom winit backend that makes the native title bar
+/// transparent and lets the window content render *under* it (fullSizeContentView).
+/// The title bar then picks up the app's dark theme / wallpaper (`Theme.window-base`)
+/// instead of showing a bright native bar in dark mode (#162 follow-up — immersive
+/// title bar). The traffic-light buttons are left in place; the UI insets its top by
+/// `titlebar-inset` so tabs don't hide behind them.
+///
+/// Must run before any window is created. We build the backend explicitly, which
+/// would otherwise bypass the `SLINT_BACKEND` renderer override that exists as the
+/// macOS femtovg/Skia escape hatch (#108/#129) — so we re-honour it by hand.
+#[cfg(target_os = "macos")]
+fn setup_macos_platform() {
+    use i_slint_backend_winit::winit::platform::macos::WindowAttributesExtMacOS;
+
+    let mut builder = i_slint_backend_winit::Backend::builder();
+    // Preserve the SLINT_BACKEND escape hatch: e.g. "winit-skia" → renderer "skia".
+    if let Ok(v) = std::env::var("SLINT_BACKEND") {
+        if let Some(r) = v.strip_prefix("winit-").filter(|r| !r.is_empty()) {
+            builder = builder.with_renderer_name(r.to_string());
+        }
+    }
+    builder = builder.with_window_attributes_hook(|attrs| {
+        attrs
+            .with_titlebar_transparent(true)
+            .with_fullsize_content_view(true)
+            .with_title_hidden(true)
+    });
+    match builder.build() {
+        Ok(backend) => {
+            if slint::platform::set_platform(Box::new(backend)).is_err() {
+                tracing::warn!("winit backend already set; immersive macOS titlebar disabled");
+            }
+        }
+        Err(e) => tracing::warn!("winit backend build failed ({e}); immersive macOS titlebar disabled"),
+    }
+}
+
 pub fn run() -> Result<()> {
+    // Immersive native title bar on macOS (must precede the first window).
+    #[cfg(target_os = "macos")]
+    setup_macos_platform();
+
+
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
     let store = Rc::new(RefCell::new(
@@ -247,6 +356,21 @@ pub fn run() -> Result<()> {
                 w.window().with_winit_window(|ww| {
                     let _ = ww.drag_resize_window(ResizeDirection::SouthEast);
                 });
+                // Drop Slint's pointer grab after the WM takes over, deferred to the
+                // next event-loop turn (see #159 in the main window's on_win_resize).
+                if cfg!(target_os = "linux") {
+                    let weak2 = weak.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                        if let Some(w) = weak2.upgrade() {
+                            let win = w.window();
+                            win.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                                position: slint::LogicalPosition::new(0.0, 0.0),
+                                button: slint::platform::PointerEventButton::Left,
+                            });
+                            win.dispatch_event(slint::platform::WindowEvent::PointerExited);
+                        }
+                    });
+                }
             }
         });
     }
@@ -279,6 +403,9 @@ pub fn run() -> Result<()> {
         let is_dark = theme_pref_is_dark(&store.borrow());
         window.set_dark_mode(is_dark);
     }
+    // On macOS, app shortcuts use Cmd (⌘) so physical Ctrl stays free for the
+    // shell (#158); on Windows/Linux they stay Ctrl-based.
+    window.set_is_mac(cfg!(target_os = "macos"));
 
     // Apply the saved terminal font (Interface settings). An empty family keeps
     // the built-in default; the size always applies (defaults to 13).
@@ -290,6 +417,7 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
+        window.set_panel_font(s.panel_font() as f32 / 100.0); // settings-panel font scale
     }
 
     // Apply the saved immersive wallpaper (overrides dark/light when set; a
@@ -368,6 +496,10 @@ pub fn run() -> Result<()> {
         window.set_sftp_panel_width(s.sftp_panel_width());
         window.set_sftp_panel_height(s.sftp_panel_height());
         window.set_sftp_dock(s.sftp_dock().into());
+        window.set_welcome_as_sidebar(s.welcome_as_sidebar());
+        window.set_welcome_sidebar_width(s.welcome_sidebar_width());
+        window.set_welcome_collapsed(s.welcome_collapsed());
+        window.set_wallpaper_overlay(s.wallpaper_overlay());
         if collapse_sidebar {
             window.set_sidebar_collapsed(true);
         }
@@ -394,6 +526,30 @@ pub fn run() -> Result<()> {
         window.on_persist_sidebar_width(move |w| {
             let mut s = store.borrow_mut();
             s.set_sidebar_width(w);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_persist_welcome_sidebar_width(move |w| {
+            let mut s = store.borrow_mut();
+            s.set_welcome_sidebar_width(w);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_set_welcome_collapsed(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_welcome_collapsed(v);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_persist_wallpaper_overlay(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_wallpaper_overlay(v);
             let _ = s.save();
         });
     }
@@ -463,6 +619,21 @@ pub fn run() -> Result<()> {
             }
         });
     }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_panel_font(move |percent: i32| {
+            let clamped = (percent.max(0) as u32).clamp(80, 160);
+            {
+                let mut s = store.borrow_mut();
+                s.set_panel_font(clamped);
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_panel_font(clamped as f32 / 100.0);
+            }
+        });
+    }
 
     // Wallpaper: pick a built-in / none, or open the file dialog for a custom one.
     {
@@ -526,6 +697,129 @@ pub fn run() -> Result<()> {
     let terminals_model: Rc<VecModel<TerminalState>> = Rc::new(VecModel::default());
     window.set_terminals(ModelRc::from(terminals_model.clone()));
 
+    // Split-pane layout tree (v0.5). Starts as a single pane owning the welcome
+    // tab; tab opens/closes/moves mutate it and re-flatten into the `panes`
+    // model. `content_size` is the pane-area px size reported from Slint.
+    // In welcome-as-sidebar mode the session list lives in a left panel, so the
+    // layout starts empty (no "welcome" tab); otherwise it owns the welcome tab.
+    let welcome_sidebar = store.borrow().welcome_as_sidebar();
+    let layout: Rc<RefCell<crate::panes::Layout>> = Rc::new(RefCell::new(if welcome_sidebar {
+        crate::panes::Layout::new(Vec::new(), String::new())
+    } else {
+        crate::panes::Layout::new(vec!["welcome".into()], "welcome".into())
+    }));
+    let content_size: Rc<std::cell::Cell<(f32, f32)>> =
+        Rc::new(std::cell::Cell::new((1200.0, 800.0)));
+    // Persistent pane / splitter models. refresh_panes updates these IN PLACE so
+    // the rendered `for pane` / `for sp` elements are reused (terminals survive,
+    // and the splitter keeps its pointer-grab during a drag).
+    let panes_model: Rc<VecModel<PaneInfo>> = Rc::new(VecModel::default());
+    window.set_panes(ModelRc::from(panes_model.clone()));
+    let splitters_model: Rc<VecModel<SplitterInfo>> = Rc::new(VecModel::default());
+    window.set_splitters(ModelRc::from(splitters_model.clone()));
+    refresh_panes(
+        &window,
+        &layout.borrow(),
+        content_size.get(),
+        &tabs_model,
+        &panes_model,
+        &splitters_model,
+    );
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_content_resized(move |w: f32, h: f32| {
+            content_size.set((w, h));
+            if let Some(win) = weak.upgrade() {
+                refresh_panes(
+                    &win,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+    // Toggle welcome-as-sidebar at runtime: persist, then move the welcome tab in
+    // or out of the split-tree (sidebar mode = no welcome tab) and re-flatten.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_set_welcome_as_sidebar(move |v| {
+            {
+                let mut s = store.borrow_mut();
+                s.set_welcome_as_sidebar(v);
+                let _ = s.save();
+            }
+            {
+                let mut lay = layout.borrow_mut();
+                if v {
+                    lay.remove_tab("welcome");
+                } else if lay.leaf_of_tab("welcome").is_none() {
+                    lay.add_tab("welcome".into());
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+    // Per-session SFTP state: collapse + sizes live in each tab's TerminalState so
+    // split panes / other tabs each keep their own (resizing/collapsing one no
+    // longer bleeds onto the rest) (#v0.5).
+    {
+        let terminals_model = terminals_model.clone();
+        window.on_set_pane_sftp_collapsed(move |tab_id: SharedString, v: bool| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_collapsed = v);
+        });
+    }
+    {
+        let terminals_model = terminals_model.clone();
+        let weak = window.as_weak();
+        window.on_set_pane_sftp_height(move |tab_id: SharedString, v: f32| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_panel_height = v);
+            // Mirror to the global default so it persists (saved on close) and
+            // seeds new sessions; other open tabs use their own field, unaffected.
+            if let Some(w) = weak.upgrade() {
+                w.set_sftp_panel_height(v);
+            }
+        });
+    }
+    {
+        let terminals_model = terminals_model.clone();
+        let weak = window.as_weak();
+        window.on_set_pane_sftp_width(move |tab_id: SharedString, v: f32| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_panel_width = v);
+            if let Some(w) = weak.upgrade() {
+                w.set_sftp_panel_width(v);
+            }
+        });
+    }
+    {
+        let terminals_model = terminals_model.clone();
+        window.on_set_pane_sftp_saved_height(move |tab_id: SharedString, v: f32| {
+            update_terminal_row(&terminals_model, &tab_id, |r| r.sftp_saved_height = v);
+        });
+    }
+
     // Per-tab connection status + remote resources, the latest local sample,
     // and the local machine's network history (bottom sparkline).
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
@@ -544,6 +838,10 @@ pub fn run() -> Result<()> {
         sessions_model.clone(),
         tabs_model.clone(),
         terminals_model.clone(),
+        layout.clone(),
+        content_size.clone(),
+        panes_model.clone(),
+        splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
         runtime.clone(),
@@ -665,6 +963,25 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // MFA / keyboard-interactive prompt (#86-MFA): the user enters the
+    // verification code (or cancels); the answer unblocks the SSH/SFTP auth.
+    {
+        let weak = window.as_weak();
+        window.on_mfa_submit(move || {
+            if let Some(w) = weak.upgrade() {
+                resolve_front_mfa(&w, true);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_mfa_cancel(move || {
+            if let Some(w) = weak.upgrade() {
+                resolve_front_mfa(&w, false);
+            }
+        });
+    }
+
     // NIC selector: remember the user's choice for the active tab and refresh.
     {
         let weak = window.as_weak();
@@ -736,6 +1053,16 @@ pub fn run() -> Result<()> {
     // "Download" on the banner opens the latest-release page in the browser.
     window.on_open_update_url(move || {
         let url = "https://github.com/capkten/meatshell/releases/latest";
+        #[cfg(windows)]
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
+        #[cfg(target_os = "macos")]
+        let _ = std::process::Command::new("open").arg(url).spawn();
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    });
+    // The open-source link in the About dialog opens the project page.
+    window.on_open_repo(move || {
+        let url = "https://github.com/jeff141/meatshell";
         #[cfg(windows)]
         let _ = std::process::Command::new("explorer").arg(url).spawn();
         #[cfg(target_os = "macos")]
@@ -860,6 +1187,10 @@ pub fn run() -> Result<()> {
         &window,
         tabs_model.clone(),
         terminals_model.clone(),
+        layout.clone(),
+        content_size.clone(),
+        panes_model.clone(),
+        splitters_model.clone(),
         handles.clone(),
         bufs.clone(),
         sftp_handles.clone(),
@@ -968,6 +1299,20 @@ pub fn run() -> Result<()> {
         },
     );
 
+    // --- Window activity, for idle-CPU throttling (#127) ----------------
+    // Idle terminals shouldn't burn CPU: pause the sampler when the window is
+    // minimized / occluded, throttle it when it's merely unfocused, and stop the
+    // cursor blink whenever the window isn't focused (mirrors what Tabby / Windows
+    // Terminal do). The winit event handler below updates this; the blink reads
+    // Theme.window-focused.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum WinActivity {
+        Active,     // focused & visible → full rate
+        Background, // visible but unfocused → throttled
+        Hidden,     // minimized / occluded → paused
+    }
+    let activity = Rc::new(std::cell::Cell::new(WinActivity::Active));
+
     // --- System sampler (1 Hz) ------------------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
     let weak = window.as_weak();
@@ -975,11 +1320,25 @@ pub fn run() -> Result<()> {
     let tick_statuses = tab_statuses.clone();
     let tick_local = local_snap.clone();
     let tick_net = local_net_hist.clone();
+    let tick_activity = activity.clone();
+    let mut bg_tick = 0u32;
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
         SystemSampler::recommended_interval(),
         move || {
+            // Skip the (non-trivial) sysinfo refresh + sidebar repaint when no one
+            // is looking, and back off to ~5 s when the window is in the background.
+            match tick_activity.get() {
+                WinActivity::Hidden => return,
+                WinActivity::Background => {
+                    bg_tick = bg_tick.wrapping_add(1);
+                    if bg_tick % 5 != 0 {
+                        return;
+                    }
+                }
+                WinActivity::Active => {}
+            }
             let snap = {
                 let mut s = tick_sampler.lock().expect("sampler poisoned");
                 s.sample()
@@ -1012,14 +1371,55 @@ pub fn run() -> Result<()> {
         let sh = sftp_handles.clone();
         let close_handles = handles.clone();
         let ev_store = store.clone();
+        let ev_activity = activity.clone();
+        // Track the inputs that make up WinActivity; recompute on each change.
+        let mut focused = true;
+        let mut minimized = false;
+        let mut occluded = false;
+        // Apply the Win11 rounded-corner + shadow chrome once, on the first event
+        // (the HWND reliably exists by then, unlike a pre-run timer) (#162/#166).
+        let mut chrome_done = false;
         window.window().on_winit_window_event(move |_w, event| {
+            if !chrome_done {
+                chrome_done = true;
+                if let Some(win) = weak.upgrade() {
+                    apply_window_chrome(win.window());
+                }
+            }
+            // Recompute window activity, push it to the shared cell, and update
+            // Theme.window-focused (gates the cursor blink) (#127).
+            let apply_activity = |focused: bool, minimized: bool, occluded: bool| {
+                let act = if minimized || occluded {
+                    WinActivity::Hidden
+                } else if focused {
+                    WinActivity::Active
+                } else {
+                    WinActivity::Background
+                };
+                ev_activity.set(act);
+                if let Some(win) = weak.upgrade() {
+                    win.set_window_focused(act == WinActivity::Active);
+                }
+            };
             match event {
                 WEvent::DroppedFile(path) => {
                     if let Some(win) = weak.upgrade() {
                         handle_file_drop(&win, &sh, path.to_string_lossy().to_string());
                     }
                 }
-                WEvent::Resized(_) => {
+                WEvent::Focused(f) => {
+                    focused = *f;
+                    apply_activity(focused, minimized, occluded);
+                }
+                WEvent::Occluded(o) => {
+                    occluded = *o;
+                    apply_activity(focused, minimized, occluded);
+                }
+                WEvent::Resized(size) => {
+                    // A 0-sized resize is how Windows reports a minimize; track it
+                    // so we pause the sampler while minimized (#127).
+                    minimized = size.width == 0 || size.height == 0;
+                    apply_activity(focused, minimized, occluded);
                     // Keep the maximize/restore icon (and resize-edge gating) in
                     // sync when the OS changes the window state (#119).
                     if let Some(win) = weak.upgrade() {
@@ -1131,6 +1531,31 @@ pub fn run() -> Result<()> {
                 w.window().with_winit_window(|ww| {
                     let _ = ww.drag_resize_window(d);
                 });
+                // On Linux the window manager / Wayland compositor takes over the
+                // resize and consumes the button-release that ends it (winit ungrabs
+                // + hands off via _NET_WM_MOVERESIZE / xdg_toplevel.resize), so Slint
+                // never sees the release and keeps its pointer grab on the resize
+                // handle — afterwards the cursor stays a resize-arrow and a click
+                // *anywhere* re-starts a resize (#159). Synthesize a release + exit
+                // so Slint drops the grab. It must be DEFERRED: Slint establishes the
+                // press grab while processing this very pointer event, so a release
+                // dispatched synchronously here is too early. A 0 ms single-shot runs
+                // on the next event-loop turn, once the grab is in place. Windows/
+                // macOS deliver the release natively; the runtime cfg! gate keeps
+                // this compiling (and a no-op) there.
+                if cfg!(target_os = "linux") {
+                    let weak2 = weak.clone();
+                    slint::Timer::single_shot(std::time::Duration::from_millis(0), move || {
+                        if let Some(w) = weak2.upgrade() {
+                            let win = w.window();
+                            win.dispatch_event(slint::platform::WindowEvent::PointerReleased {
+                                position: slint::LogicalPosition::new(0.0, 0.0),
+                                button: slint::platform::PointerEventButton::Left,
+                            });
+                            win.dispatch_event(slint::platform::WindowEvent::PointerExited);
+                        }
+                    });
+                }
             }
         });
     }
@@ -1294,6 +1719,77 @@ fn handle_file_drop(_win: &AppWindow, _sftp_handles: &SftpHandles, _path: String
 // Model helpers
 // ---------------------------------------------------------------------------
 
+/// Parse the batch-import textarea (#150). Each non-empty, non-`#` line is
+/// `host|port|user|password|name`; trailing fields are optional (port → 22,
+/// user → root, password → none, name → user@host). A leading header row such as
+/// `host|port|username|password|name` is skipped. Dedup happens at the call site.
+fn parse_batch_import(text: &str) -> Vec<Session> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // splitn(5) so the last field (name) may itself contain '|'.
+        let parts: Vec<&str> = line.splitn(5, '|').map(str::trim).collect();
+        let host = parts.first().copied().unwrap_or("");
+        // Skip blank hosts and a header row like "host|port|username|...".
+        if host.is_empty() || host.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        let port = parts
+            .get(1)
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|&p| p > 0)
+            .unwrap_or(22);
+        let user = parts.get(2).copied().filter(|s| !s.is_empty()).unwrap_or("root");
+        let password = parts.get(3).copied().unwrap_or("");
+        let name = parts
+            .get(4)
+            .copied()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{user}@{host}"));
+        let mut sess = Session {
+            name,
+            host: host.to_string(),
+            port,
+            user: user.to_string(),
+            auth: AuthMethod::Password,
+            ..Session::new_empty()
+        };
+        if !password.is_empty() {
+            sess.password = Secret::new(password.to_string());
+        }
+        out.push(sess);
+    }
+    out
+}
+
+/// Distinct named groups (explicit folders ∪ the groups sessions are filed under),
+/// de-duplicated and sorted alphabetically — feeds the new/edit dialog's group
+/// dropdown (#179). Ungrouped ("") is excluded; the dialog leaves the field blank
+/// for that case.
+fn session_groups_model(store: &ConfigStore) -> ModelRc<SharedString> {
+    let sessions = store.sessions();
+    let mut named: Vec<String> = store
+        .groups()
+        .iter()
+        .cloned()
+        .chain(
+            sessions
+                .iter()
+                .filter(|s| !s.group.is_empty())
+                .map(|s| s.group.clone()),
+        )
+        .collect();
+    named.sort_by_key(|g| g.to_lowercase());
+    named.dedup();
+    ModelRc::from(Rc::new(VecModel::from(
+        named.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+    )))
+}
+
 fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
     // Group sessions by their `group` (named groups alphabetically, ungrouped
     // last), then by name within each group, and tag the first row of every
@@ -1392,6 +1888,10 @@ fn wire_session_callbacks(
     sessions_model: Rc<VecModel<SessionInfo>>,
     tabs_model: Rc<VecModel<TabInfo>>,
     terminals_model: Rc<VecModel<TerminalState>>,
+    layout: Rc<RefCell<crate::panes::Layout>>,
+    content_size: Rc<std::cell::Cell<(f32, f32)>>,
+    panes_model: Rc<VecModel<PaneInfo>>,
+    splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     runtime: Arc<Runtime>,
@@ -1413,9 +1913,11 @@ fn wire_session_callbacks(
     // New session -> open dialog with blank draft.
     let weak = window.as_weak();
     let ef_new = edit_forwards.clone();
+    let store_ng = store.clone();
     window.on_new_session_clicked(move || {
         if let Some(w) = weak.upgrade() {
             ef_new.borrow_mut().clear();
+            w.set_session_groups(session_groups_model(&store_ng.borrow()));
             w.set_dialog_forwards(forward_model(&[]));
             let empty = Session::new_empty();
             w.set_dialog_id(empty.id.into());
@@ -1439,6 +1941,7 @@ fn wire_session_callbacks(
             w.set_dialog_stop_bits("1".into());
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
+            w.set_dialog_disable_shell_integration(false);
             w.set_dialog_editing(false);
             w.set_dialog_open(true);
         }
@@ -1531,6 +2034,47 @@ fn wire_session_callbacks(
         });
     }
 
+    // Batch-import connections from pasted text (#150). One per line:
+    // `host|port|user|password|name` (trailing fields optional).
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let sessions_model = sessions_model.clone();
+        window.on_batch_import_confirm(move |text: SharedString| {
+            let parsed = parse_batch_import(text.as_str());
+            let total = parsed.len();
+            let mut added = 0usize;
+            {
+                let mut s = store.borrow_mut();
+                for sess in parsed {
+                    // Skip a host/user/port we already have.
+                    let dup = s.sessions().iter().any(|x| {
+                        x.host == sess.host && x.user == sess.user && x.port == sess.port
+                    });
+                    if dup {
+                        continue;
+                    }
+                    s.upsert(sess);
+                    added += 1;
+                }
+                if added > 0 {
+                    let _ = s.save();
+                }
+            }
+            sync_sessions_to_model(&store.borrow(), &sessions_model);
+            if let Some(w) = weak.upgrade() {
+                let hint = if total == 0 {
+                    t("没有可导入的连接", "nothing to import").to_string()
+                } else if added > 0 {
+                    format!("{} {}/{}", t("已导入", "imported"), added, total)
+                } else {
+                    t("没有新连接可导入(已存在)", "no new connections (all exist)").to_string()
+                };
+                w.set_ssh_import_hint(hint.into());
+            }
+        });
+    }
+
     // Import sessions from a portable JSON file (issue #46).
     {
         let weak = window.as_weak();
@@ -1575,6 +2119,7 @@ fn wire_session_callbacks(
             };
             *ef_edit.borrow_mut() = session.forwards.clone();
             if let Some(w) = weak.upgrade() {
+                w.set_session_groups(session_groups_model(&store));
                 w.set_dialog_forwards(forward_model(&session.forwards));
                 w.set_dialog_id(session.id.clone().into());
                 w.set_dialog_name(session.name.clone().into());
@@ -1598,6 +2143,7 @@ fn wire_session_callbacks(
                 w.set_dialog_stop_bits(session.stop_bits.to_string().into());
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
+                w.set_dialog_disable_shell_integration(session.disable_shell_integration);
                 w.set_dialog_editing(true);
                 w.set_dialog_open(true);
             }
@@ -1827,6 +2373,7 @@ fn wire_session_callbacks(
                 parity: draft.parity.to_string(),
                 flow_control: draft.flow_control.to_string(),
                 forwards: edit_forwards.borrow().clone(),
+                disable_shell_integration: draft.disable_shell_integration,
             };
             {
                 let mut s = store.borrow_mut();
@@ -1931,6 +2478,8 @@ fn wire_session_callbacks(
         let store = store.clone();
         let tabs_model = tabs_model.clone();
         let terminals_model = terminals_model.clone();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
         let runtime = runtime.clone();
@@ -1982,6 +2531,19 @@ fn wire_session_callbacks(
                 kind: "terminal".into(),
                 connected: false,
             });
+            // Each session keeps its own SFTP collapse state + sizes, seeded from
+            // the global defaults (the "collapse SFTP by default" pref and the
+            // persisted panel sizes) so they no longer bleed across panes (#v0.5).
+            let (sftp_collapsed_default, sftp_h_default, sftp_w_default) = weak
+                .upgrade()
+                .map(|w| {
+                    (
+                        w.get_collapse_sftp_default(),
+                        w.get_sftp_panel_height(),
+                        w.get_sftp_panel_width(),
+                    )
+                })
+                .unwrap_or((false, 220.0, 380.0));
             terminals_model.push(TerminalState {
                 id: tab_id.clone().into(),
                 status: t("连接中...", "Connecting...").into(),
@@ -2010,6 +2572,10 @@ fn wire_session_callbacks(
                     VecModel::<SftpTreeNode>::default(),
                 )),
                 sftp_selected_count: 0,
+                sftp_collapsed: sftp_collapsed_default,
+                sftp_panel_height: sftp_h_default,
+                sftp_panel_width: sftp_w_default,
+                sftp_saved_height: sftp_h_default,
             });
             // Create vt100 parser for this tab (default 24×80; resized on first
             // terminal-resize callback). 5000-line scrollback is stored for
@@ -2028,12 +2594,23 @@ fn wire_session_callbacks(
                     view_offset: 0,
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
+                    raw: std::collections::VecDeque::new(),
                 },
             );
             // No followed-cwd yet: the first OSC 7 always triggers a follow.
             sftp_last_cwd.lock().unwrap().remove(&tab_id);
+            // Add the new tab to the focused pane and re-flatten (this also sets
+            // active-tab-id to the new tab via refresh_panes).
+            layout.borrow_mut().add_tab(tab_id.clone());
             if let Some(w) = weak.upgrade() {
-                w.set_active_tab_id(tab_id.clone().into());
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
             }
 
             // Spawn the shell (+ SFTP) workers and their event-pump threads.
@@ -2053,6 +2630,36 @@ fn wire_session_callbacks(
                 image_entries: image_entries.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
+        });
+    }
+
+    // Duplicate a tab's connection (#v0.5): open a fresh tab to the same saved
+    // session, landing in the same pane as the source tab.
+    {
+        let weak = window.as_weak();
+        let tab_statuses = tab_statuses.clone();
+        let layout = layout.clone();
+        window.on_tab_duplicate(move |tab_id: SharedString| {
+            let tab_id = tab_id.to_string();
+            let session_id = tab_statuses
+                .lock()
+                .unwrap()
+                .get(&tab_id)
+                .map(|s| s.session_id.clone())
+                .unwrap_or_default();
+            if session_id.is_empty() {
+                return;
+            }
+            // Land the new tab in the same pane as the source. Read the pane id
+            // into a local first so the immutable borrow is dropped before the
+            // borrow_mut (else RefCell panics on the overlapping borrow).
+            let pane = layout.borrow().leaf_of_tab(&tab_id);
+            if let Some(pane) = pane {
+                layout.borrow_mut().focused = pane;
+            }
+            if let Some(w) = weak.upgrade() {
+                w.invoke_connect_session(session_id.into());
+            }
         });
     }
 }
@@ -2137,16 +2744,40 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
+            // Reusable scratch so a fast firehose doesn't reallocate every batch.
+            let mut drained: Vec<SessionEvent> = Vec::new();
             loop {
+                // Block for the first event, then sweep up everything else that's
+                // already queued. A burst — e.g. `tail -f` on a busy log (#171) —
+                // then collapses into ONE invoke_from_event_loop and (after merging
+                // adjacent Output below) ONE vt100 ingest + render, instead of one
+                // UI task per chunk flooding the event loop and freezing the app.
                 match shell_rx.blocking_recv() {
                     None => break,
-                    Some(shell_evt) => {
-                        if let SessionEvent::CwdChanged(ref cwd) = shell_evt {
+                    Some(first) => drained.push(first),
+                }
+                // Cap the sweep so an unending stream still yields to the renderer
+                // between batches (keeps the UI live rather than starved).
+                const DRAIN_CAP: usize = 2048;
+                while drained.len() < DRAIN_CAP {
+                    match shell_rx.try_recv() {
+                        Ok(evt) => drained.push(evt),
+                        Err(_) => break,
+                    }
+                }
+
+                // Run CwdChanged side-effects here (off the UI thread), drop the
+                // swallowed ones, and concatenate runs of Output into a single chunk
+                // so the UI parses + renders the whole burst once.
+                let mut ui_batch: Vec<SessionEvent> = Vec::with_capacity(drained.len());
+                for evt in drained.drain(..) {
+                    match evt {
+                        SessionEvent::CwdChanged(cwd) => {
                             // Shared map (not a thread-local) so manual SFTP
-                            // navigation can clear the entry — then the very
-                            // next OSC 7, same directory or not, snaps the
-                            // panel back to the shell's cwd. Unchanged repeats
-                            // (every prompt re-emits OSC 7) are ignored (#59).
+                            // navigation can clear the entry — then the very next
+                            // OSC 7, same directory or not, snaps the panel back to
+                            // the shell's cwd. Unchanged repeats (every prompt
+                            // re-emits OSC 7) are ignored (#59).
                             let changed = match sftp_last_cwd_pump.lock() {
                                 Ok(mut m) => {
                                     m.insert(tab_id_pump.clone(), cwd.clone()).as_deref()
@@ -2154,9 +2785,9 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                                 }
                                 Err(_) => false,
                             };
-                            // Swallow the event entirely when follow-cd is off:
-                            // forwarding it would set sftp_loading without any
-                            // ListDir to clear it (the #59 stuck-"loading" trap).
+                            // Swallow when follow-cd is off: forwarding it would set
+                            // sftp_loading without any ListDir to clear it (the #59
+                            // stuck-"loading" trap).
                             if !changed
                                 || !follow_cd_pump.load(std::sync::atomic::Ordering::Relaxed)
                             {
@@ -2165,35 +2796,53 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                             if let Some(prev) = cwd_debounce.take() {
                                 prev.abort();
                             }
-                            let cwd = cwd.clone();
+                            let cwd_spawn = cwd.clone();
                             let sftp_h = sftp_handles_pump.clone();
                             let tid = tab_id_pump.clone();
                             cwd_debounce = Some(rt_pump.spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 if let Ok(handles) = sftp_h.lock() {
                                     if let Some(h) = handles.get(&tid) {
-                                        h.list_dir(cwd);
+                                        h.list_dir(cwd_spawn);
                                     }
                                 }
                             }));
+                            ui_batch.push(SessionEvent::CwdChanged(cwd));
                         }
-                        let weak_evt = weak_inner.clone();
-                        let tid = tab_id_pump.clone();
-                        let bufs_evt = bufs_thread.clone();
-                        let st_evt = statuses_pump.clone();
-                        let lc_evt = local_pump.clone();
-                        let nh_evt = net_pump.clone();
-                        let ie_evt = image_entries_pump.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(win) = weak_evt.upgrade() {
-                                apply_session_event_to_window(
-                                    &win, &tid, shell_evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
-                                    &ie_evt,
-                                );
+                        SessionEvent::Output(chunk) => {
+                            // Merge with the immediately preceding Output so the
+                            // whole run is one vt100 ingest + one render. Only
+                            // *adjacent* chunks merge, so byte order (and any
+                            // interleaved event) is preserved exactly.
+                            if let Some(SessionEvent::Output(prev)) = ui_batch.last_mut() {
+                                prev.push_str(&chunk);
+                            } else {
+                                ui_batch.push(SessionEvent::Output(chunk));
                             }
-                        });
+                        }
+                        other => ui_batch.push(other),
                     }
                 }
+                if ui_batch.is_empty() {
+                    continue;
+                }
+
+                let weak_evt = weak_inner.clone();
+                let tid = tab_id_pump.clone();
+                let bufs_evt = bufs_thread.clone();
+                let st_evt = statuses_pump.clone();
+                let lc_evt = local_pump.clone();
+                let nh_evt = net_pump.clone();
+                let ie_evt = image_entries_pump.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(win) = weak_evt.upgrade() {
+                        for evt in ui_batch {
+                            apply_session_event_to_window(
+                                &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt, &ie_evt,
+                            );
+                        }
+                    }
+                });
             }
         });
     }
@@ -2651,6 +3300,44 @@ fn compute_find_matches(rows: &[String], query: &str) -> Vec<TermMatch> {
     out
 }
 
+/// Apply a settled terminal size to the PTY + vt100 grid. Factored out of the
+/// resize callback so that callback can debounce — a layout reflow can briefly
+/// report a near-zero width, collapsing term-cols to its 10-col floor; applying
+/// that to the remote PTY reflows vt100 and garbles running output like a
+/// `git clone` progress meter (#163). Debouncing means only the settled size
+/// ever reaches the server.
+fn apply_terminal_resize(
+    handles: &Rc<RefCell<HashMap<String, SessionHandle>>>,
+    bufs: &TermBuffers,
+    last_term_size: &Arc<Mutex<(u32, u32)>>,
+    tab_id: &str,
+    cols: u32,
+    rows: u32,
+) {
+    *last_term_size.lock().unwrap() = (cols, rows);
+    if let Some(handle) = handles.borrow().get(tab_id) {
+        handle.resize(cols, rows);
+    }
+    if let Some(buf) = bufs.lock().unwrap().get_mut(tab_id) {
+        let (old_rows, old_cols) = buf.parser.screen().size();
+        let (new_rows, new_cols) = (rows as u16, cols as u16);
+        if (new_rows, new_cols) != (old_rows, old_cols) {
+            if buf.parser.screen().alternate_screen() {
+                // Alt-screen (tmux/vim/btop): the remote redraws the whole screen
+                // on SIGWINCH, so just resize the grid and let that redraw fill it.
+                buf.parser.set_size(new_rows, new_cols);
+            } else {
+                // Reflow already-printed output to the new width by replaying the
+                // byte stream — vt100's set_size only truncates/pads (#169).
+                buf.reflow(new_rows, new_cols);
+            }
+            // The pre/post-resize screens differ; drop the scroll-detection
+            // snapshot so the next output isn't mis-read as a scroll.
+            buf.prev.clear();
+        }
+    }
+}
+
 /// Recompute spans + cursor + find/selection highlights for one tab from its
 /// current vt100 screen (respecting scrollback) and push them to the model.
 /// Used by scroll + selection callbacks (Output has its own equivalent inline).
@@ -2942,6 +3629,28 @@ fn apply_session_event_to_window(
                     mutator(&mut row);
                     tabs.set_row_data(i, row);
                     break;
+                }
+            }
+        }
+        // The per-pane tab strips (v0.5 split panes) render snapshots copied from
+        // `tabs_model`, so they don't track this change on their own — propagate
+        // it into each pane's tab sub-model too (e.g. so the connected dot turns
+        // green without needing a tab switch).
+        let panes = win.get_panes();
+        if let Some(pm) = panes.as_any().downcast_ref::<VecModel<PaneInfo>>() {
+            for pi in 0..pm.row_count() {
+                let Some(pane) = pm.row_data(pi) else { continue };
+                let Some(tm) = pane.tabs.as_any().downcast_ref::<VecModel<TabInfo>>() else {
+                    continue;
+                };
+                for ti in 0..tm.row_count() {
+                    if let Some(mut row) = tm.row_data(ti) {
+                        if row.id.as_str() == tab_id {
+                            mutator(&mut row);
+                            tm.set_row_data(ti, row);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -3293,6 +4002,15 @@ fn apply_session_event_to_window(
                 responder,
             );
         }
+        SessionEvent::MfaPrompt {
+            session_id,
+            host,
+            prompt,
+            echo,
+            responder,
+        } => {
+            enqueue_mfa_prompt(win, session_id, host, prompt, echo, responder);
+        }
         SessionEvent::CommandRan(cmd) => {
             // A command typed directly in the terminal, captured via the shell
             // hook (#113). Record it in the same command-box history, reusing the
@@ -3466,11 +4184,16 @@ fn resolve_front_hostkey(win: &AppWindow, accept: bool) {
     let has_next = HOSTKEY_QUEUE.with(|q| {
         let mut q = q.borrow_mut();
         if let Some(p) = q.pop_front() {
-            // Only cache accepted decisions so users can retry after rejecting.
+            // Only remember an *accept* for this run (so a slightly-later SFTP
+            // prompt for the same host is answered without a second dialog). We
+            // must NOT cache a reject: a single dismissal — e.g. an accidental
+            // backdrop click instead of "Trust & connect" — used to poison the
+            // host for the whole session, auto-rejecting every later connect with
+            // "Unknown server key" until the app was restarted (#152). A reject now
+            // only fails the current attempt; the next connect prompts again.
             if accept {
                 HOSTKEY_DECIDED.with(|d| {
-                    d.borrow_mut()
-                        .insert(format!("{}:{}", p.host, p.port), true);
+                    d.borrow_mut().insert(format!("{}:{}", p.host, p.port), true);
                 });
             }
             for r in &p.responders {
@@ -3625,6 +4348,267 @@ fn persist_credentials(
 }
 
 // ---------------------------------------------------------------------------
+// MFA / keyboard-interactive prompt (#86-MFA)
+// ---------------------------------------------------------------------------
+
+/// One queued MFA challenge. Concurrent connections for the same session (the
+/// shell and its SFTP channel) that hit the same prompt collapse into a single
+/// dialog whose answer fans out to every waiting `responder`.
+struct PendingMfa {
+    session_id: String,
+    host: String,
+    prompt: String,
+    echo: bool,
+    responders: Vec<crate::ssh::MfaResponder>,
+}
+
+thread_local! {
+    static MFA_QUEUE: RefCell<VecDeque<PendingMfa>> = RefCell::new(VecDeque::new());
+}
+
+/// Queue an MFA prompt: a concurrent connection for the same session (the shell
+/// and its SFTP channel both hitting the prompt at once) merges into the open
+/// dialog so the code is only typed once; otherwise enqueue (and show it now if
+/// nothing else is up). We deliberately do NOT cache answers across attempts —
+/// a wrong code must re-prompt on reconnect, not be silently replayed.
+fn enqueue_mfa_prompt(
+    win: &AppWindow,
+    session_id: String,
+    host: String,
+    prompt: String,
+    echo: bool,
+    responder: crate::ssh::MfaResponder,
+) {
+    let show_now = MFA_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        if let Some(p) = q.iter_mut().find(|p| p.session_id == session_id) {
+            p.responders.push(responder);
+            return false;
+        }
+        let was_empty = q.is_empty();
+        q.push_back(PendingMfa {
+            session_id,
+            host,
+            prompt,
+            echo,
+            responders: vec![responder],
+        });
+        was_empty
+    });
+    if show_now {
+        show_front_mfa(win);
+    }
+}
+
+/// Populate the MFA dialog from the front prompt and open it.
+fn show_front_mfa(win: &AppWindow) {
+    MFA_QUEUE.with(|q| {
+        if let Some(p) = q.borrow().front() {
+            win.set_mfa_host(p.host.clone().into());
+            win.set_mfa_prompt(p.prompt.clone().into());
+            win.set_mfa_echo(p.echo);
+            win.set_mfa_answer("".into());
+            win.set_mfa_prompt_open(true);
+        }
+    });
+}
+
+/// Apply the user's answer to the front MFA prompt (or cancel), then show the
+/// next prompt or close.
+fn resolve_front_mfa(win: &AppWindow, accept: bool) {
+    let answer: Option<String> = if accept {
+        Some(win.get_mfa_answer().to_string())
+    } else {
+        None
+    };
+    let has_next = MFA_QUEUE.with(|q| {
+        let mut q = q.borrow_mut();
+        if let Some(p) = q.pop_front() {
+            for r in &p.responders {
+                r.respond(answer.clone());
+            }
+        }
+        !q.is_empty()
+    });
+    // Don't leave the typed code lingering in the UI property.
+    win.set_mfa_answer("".into());
+    if has_next {
+        show_front_mfa(win);
+    } else {
+        win.set_mfa_prompt_open(false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split panes (v0.5)
+// ---------------------------------------------------------------------------
+
+/// Re-flatten the split-tree `layout` for the current content-area size and push
+/// the result into the AppWindow's `panes` / `splitters` models. Also keeps the
+/// single global `active-tab-id` pointing at the focused pane's active tab — the
+/// sidebar and key routing still read that one id.
+/// True when two tab sub-models hold the same ids in the same order.
+fn tabs_eq(a: &ModelRc<TabInfo>, b: &ModelRc<TabInfo>) -> bool {
+    if a.row_count() != b.row_count() {
+        return false;
+    }
+    (0..a.row_count()).all(|i| match (a.row_data(i), b.row_data(i)) {
+        (Some(x), Some(y)) => x.id == y.id,
+        _ => false,
+    })
+}
+
+/// Find the terminal row with `tab_id`, apply `mutator`, and write it back.
+fn update_terminal_row(
+    model: &VecModel<TerminalState>,
+    tab_id: &str,
+    mutator: impl FnOnce(&mut TerminalState),
+) {
+    for i in 0..model.row_count() {
+        if let Some(mut row) = model.row_data(i) {
+            if row.id.as_str() == tab_id {
+                mutator(&mut row);
+                model.set_row_data(i, row);
+                return;
+            }
+        }
+    }
+}
+
+fn refresh_panes(
+    window: &AppWindow,
+    layout: &crate::panes::Layout,
+    content: (f32, f32),
+    tabs_model: &VecModel<TabInfo>,
+    panes_model: &VecModel<PaneInfo>,
+    splitters_model: &VecModel<SplitterInfo>,
+) {
+    let (cw, ch) = (content.0.max(1.0), content.1.max(1.0));
+    let (panes, splits) = layout.flatten(0.0, 0.0, cw, ch);
+
+    let pane_infos: Vec<PaneInfo> = panes
+        .iter()
+        .map(|p| {
+            // Map this pane's tab ids to their TabInfo rows (skipping any not yet
+            // in the model).
+            let tabs: Vec<TabInfo> = p
+                .tabs
+                .iter()
+                .filter_map(|tid| {
+                    (0..tabs_model.row_count()).find_map(|i| {
+                        let row = tabs_model.row_data(i)?;
+                        (row.id.as_str() == tid.as_str()).then_some(row)
+                    })
+                })
+                .collect();
+            // Only the pane touching the top-right corner keeps room for the
+            // floating toolbar icons (#122).
+            let top_right = p.x + p.w >= cw - 0.5 && p.y <= 0.5;
+            PaneInfo {
+                id: p.id as i32,
+                x: p.x,
+                y: p.y,
+                w: p.w,
+                h: p.h,
+                active_id: p.active.clone().into(),
+                focused: p.focused,
+                reserve_right: if top_right { 140.0 } else { 0.0 },
+                tabs: ModelRc::from(Rc::new(VecModel::from(tabs))),
+            }
+        })
+        .collect();
+
+    // Update the models IN PLACE rather than replacing them, so the `for pane` /
+    // `for sp` elements are reused: this keeps terminals from being recreated on
+    // every refresh AND preserves the splitter's pointer-grab during a drag (a
+    // fresh model would destroy the element mid-drag and drop the grab). When the
+    // structure changes (split/close → different row count) a full rebuild is fine
+    // since no drag is in flight.
+    if panes_model.row_count() == pane_infos.len() {
+        for (i, mut r) in pane_infos.into_iter().enumerate() {
+            if let Some(old) = panes_model.row_data(i) {
+                // Reuse the existing tab sub-model when the tabs are unchanged so a
+                // geometry-only refresh doesn't churn the tab strips.
+                if old.id == r.id && tabs_eq(&old.tabs, &r.tabs) {
+                    r.tabs = old.tabs;
+                }
+            }
+            panes_model.set_row_data(i, r);
+        }
+    } else {
+        panes_model.set_vec(pane_infos);
+    }
+
+    let split_infos: Vec<SplitterInfo> = splits
+        .iter()
+        .map(|s| SplitterInfo {
+            split_id: s.split_id as i32,
+            x: s.x,
+            y: s.y,
+            w: s.w,
+            h: s.h,
+            vertical: s.vertical,
+        })
+        .collect();
+    if splitters_model.row_count() == split_infos.len() {
+        for (i, r) in split_infos.into_iter().enumerate() {
+            splitters_model.set_row_data(i, r);
+        }
+    } else {
+        splitters_model.set_vec(split_infos);
+    }
+
+    if let Some(fp) = panes.iter().find(|p| p.focused) {
+        if window.get_active_tab_id().as_str() != fp.active.as_str() {
+            window.set_active_tab_id(fp.active.clone().into());
+        }
+    }
+}
+
+/// Hit-test a drag point (pane-area coords) to a target pane + edge zone, plus
+/// the highlight rect the dropped tab's new pane would occupy. Zone is one of
+/// "left"/"right"/"up"/"down"/"center"; `None` when the point is outside every
+/// pane. The 30% edge bands trigger a split; the middle drops into the pane's
+/// tab group.
+fn drag_target(
+    layout: &crate::panes::Layout,
+    content: (f32, f32),
+    x: f32,
+    y: f32,
+) -> Option<(u64, &'static str, (f32, f32, f32, f32))> {
+    const STRIP: f32 = 36.0;
+    const EDGE: f32 = 0.30;
+    let (cw, ch) = (content.0.max(1.0), content.1.max(1.0));
+    let (panes, _) = layout.flatten(0.0, 0.0, cw, ch);
+    let p = panes
+        .iter()
+        .find(|p| x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h)?;
+    // Still on the tab strip — that's reorder territory, no split/move highlight.
+    let body_top = p.y + STRIP;
+    if y < body_top {
+        return None;
+    }
+    let bw = p.w.max(1.0);
+    let bh = (p.h - STRIP).max(1.0);
+    let rx = (x - p.x) / bw;
+    let ry = (y - body_top) / bh;
+    let (dl, dr, dt, db) = (rx, 1.0 - rx, ry, 1.0 - ry);
+    let m = dl.min(dr).min(dt).min(db);
+    let (zone, rect) = if m > EDGE {
+        ("center", (p.x, p.y, p.w, p.h))
+    } else if m == dl {
+        ("left", (p.x, p.y, p.w * 0.5, p.h))
+    } else if m == dr {
+        ("right", (p.x + p.w * 0.5, p.y, p.w * 0.5, p.h))
+    } else if m == dt {
+        ("up", (p.x, p.y, p.w, p.h * 0.5))
+    } else {
+        ("down", (p.x, p.y + p.h * 0.5, p.w, p.h * 0.5))
+    };
+    Some((p.id, zone, rect))
+}
+
+// ---------------------------------------------------------------------------
 // Tab callbacks
 // ---------------------------------------------------------------------------
 
@@ -3632,28 +4616,103 @@ fn wire_tab_callbacks(
     window: &AppWindow,
     tabs_model: Rc<VecModel<TabInfo>>,
     terminals_model: Rc<VecModel<TerminalState>>,
+    layout: Rc<RefCell<crate::panes::Layout>>,
+    content_size: Rc<std::cell::Cell<(f32, f32)>>,
+    panes_model: Rc<VecModel<PaneInfo>>,
+    splitters_model: Rc<VecModel<SplitterInfo>>,
     handles: Rc<RefCell<HashMap<String, SessionHandle>>>,
     bufs: TermBuffers,
     sftp_handles: SftpHandles,
     sftp_last_cwd: SftpLastCwd,
 ) {
-    // Selecting a tab is already applied inside the Slint callback; we just
-    // need to keep the C++/Rust state in sync if needed.
+    // Select a tab inside a pane: make it that pane's active tab and focus the
+    // pane. refresh_panes propagates active-tab-id (→ sidebar refresh).
     {
-        window.on_tab_selected(move |_id: SharedString| {
-            // No-op: AppWindow.active-tab-id is updated inline in the .slint.
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_tab_selected(move |pane_id: i32, id: SharedString| {
+            let id = id.to_string();
+            {
+                let mut lay = layout.borrow_mut();
+                lay.focused = pane_id as u64;
+                if let Some(l) = lay.leaf_mut(pane_id as u64) {
+                    if l.tabs.iter().any(|t| t == &id) {
+                        l.active = id;
+                    }
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
         });
     }
 
+    // Drag-to-reorder within a pane's strip: move the tab at `from` one slot in
+    // `dir`. Only the pane's own tab order changes; content shows by active id.
     {
         let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_tab_reorder(move |pane_id: i32, from: i32, dir: i32| {
+            {
+                let mut lay = layout.borrow_mut();
+                if let Some(l) = lay.leaf_mut(pane_id as u64) {
+                    let n = l.tabs.len() as i32;
+                    if n <= 1 {
+                        return;
+                    }
+                    let from = from.clamp(0, n - 1);
+                    let to = (from + dir).clamp(0, n - 1);
+                    if from == to {
+                        return;
+                    }
+                    let item = l.tabs.remove(from as usize);
+                    l.tabs.insert(to as usize, item);
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Close a tab: tear down its session / buffers, drop it from the models, then
+    // remove it from the split tree (which re-homes the pane's active tab and
+    // collapses the pane if it becomes empty).
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
         let tabs_model = tabs_model.clone();
         let terminals_model = terminals_model.clone();
         let handles = handles.clone();
         let bufs = bufs.clone();
         let sftp_handles = sftp_handles.clone();
         let sftp_last_cwd = sftp_last_cwd.clone();
-        window.on_tab_closed(move |id: SharedString| {
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_tab_closed(move |_pane_id: i32, id: SharedString| {
             let id = id.to_string();
             if id == "welcome" {
                 return;
@@ -3697,20 +4756,239 @@ fn wire_tab_callbacks(
                 terminals_model.remove(i);
             }
 
-            // If we closed the active tab, fall back to the welcome page.
+            layout.borrow_mut().remove_tab(&id);
             if let Some(w) = weak.upgrade() {
-                if w.get_active_tab_id().as_str() == id {
-                    w.set_active_tab_id("welcome".into());
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // "+" in a pane's strip: focus the welcome page (there is a single welcome
+    // tab; move focus to whichever pane owns it and make it active).
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_new_tab(move |pane_id: i32| {
+            // In welcome-as-sidebar mode there is no welcome tab — the session list
+            // lives in the left panel, so "+" has nothing to open.
+            if weak.upgrade().map(|w| w.get_welcome_as_sidebar()).unwrap_or(false) {
+                return;
+            }
+            {
+                let mut lay = layout.borrow_mut();
+                if let Some(owner) = lay.leaf_of_tab("welcome") {
+                    lay.focused = owner;
+                    if let Some(l) = lay.leaf_mut(owner) {
+                        l.active = "welcome".into();
+                    }
+                } else {
+                    lay.focused = pane_id as u64;
+                    lay.add_tab("welcome".into());
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Click anywhere in a pane → focus it (drives which terminal the sidebar and
+    // key routing follow). A single pane is always focused, so this is a no-op
+    // until splits exist.
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_focus(move |pane_id: i32| {
+            {
+                let mut lay = layout.borrow_mut();
+                if lay.leaf(pane_id as u64).is_some() {
+                    lay.focused = pane_id as u64;
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Drag a splitter to re-balance the two panes it divides. `pos` is the new
+    // boundary position in content coordinates along the split's axis; we look
+    // the split's axis window up from a fresh flatten and convert it to a ratio.
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_splitter_drag(move |split_id: i32, pos: f32, _vertical: bool| {
+            {
+                let mut lay = layout.borrow_mut();
+                let (cw, ch) = content_size.get();
+                let extent = {
+                    let (_, splits) = lay.flatten(0.0, 0.0, cw.max(1.0), ch.max(1.0));
+                    splits
+                        .iter()
+                        .find(|s| s.split_id == split_id as u64)
+                        .map(|s| (s.axis_start, s.axis_len))
+                };
+                if let Some((start, len)) = extent {
+                    lay.set_ratio(split_id as u64, start, len, pos);
+                }
+            }
+            if let Some(w) = weak.upgrade() {
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+            }
+        });
+    }
+
+    // Split a pane: peel `tab-id` out of pane `pane-id` into a new pane on the
+    // given side ("left"/"right"/"up"/"down"). Needs >1 tab so the source pane
+    // doesn't empty and immediately collapse back.
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_pane_split(
+            move |pane_id: i32, tab_id: SharedString, dir: SharedString| {
+                let tab_id = tab_id.to_string();
+                {
+                    let mut lay = layout.borrow_mut();
+                    let can = lay
+                        .leaf(pane_id as u64)
+                        .map(|l| l.tabs.len() > 1 && l.tabs.iter().any(|t| t == &tab_id))
+                        .unwrap_or(false);
+                    if !can {
+                        return;
+                    }
+                    let (d, before) = match dir.as_str() {
+                        "left" => (crate::panes::Dir::Horizontal, true),
+                        "right" => (crate::panes::Dir::Horizontal, false),
+                        "up" => (crate::panes::Dir::Vertical, true),
+                        _ => (crate::panes::Dir::Vertical, false), // "down"
+                    };
+                    lay.split(pane_id as u64, d, &tab_id, before);
+                }
+                if let Some(w) = weak.upgrade() {
+                    refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
+                }
+            },
+        );
+    }
+
+    // Drag-to-split: while a tab is dragged over the pane area, highlight the
+    // drop zone the cursor is in (an edge band → split, the middle → move).
+    {
+        let weak = window.as_weak();
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        window.on_tab_drag_move(move |_tab_id: SharedString, x: f32, y: f32| {
+            if let Some(w) = weak.upgrade() {
+                match drag_target(&layout.borrow(), content_size.get(), x, y) {
+                    Some((_, _, (hx, hy, hw, hh))) => {
+                        w.set_drag_active(true);
+                        w.set_drag_hl_x(hx);
+                        w.set_drag_hl_y(hy);
+                        w.set_drag_hl_w(hw);
+                        w.set_drag_hl_h(hh);
+                    }
+                    None => w.set_drag_active(false),
                 }
             }
         });
     }
 
+    // Drop: split the target pane toward the dropped-on edge (peeling the tab
+    // into the new pane), or drop into another pane's tab group from the middle.
     {
         let weak = window.as_weak();
-        window.on_new_tab_clicked(move || {
+        let layout = layout.clone();
+        let content_size = content_size.clone();
+        let tabs_model = tabs_model.clone();
+        let panes_model = panes_model.clone();
+        let splitters_model = splitters_model.clone();
+        window.on_tab_drag_drop(move |tab_id: SharedString, x: f32, y: f32| {
+            let tab_id = tab_id.to_string();
+            let target = drag_target(&layout.borrow(), content_size.get(), x, y);
+            if let Some((pane, zone, _)) = target {
+                let mut lay = layout.borrow_mut();
+                let src = lay.leaf_of_tab(&tab_id);
+                match zone {
+                    "left" => {
+                        lay.split(pane, crate::panes::Dir::Horizontal, &tab_id, true);
+                    }
+                    "right" => {
+                        lay.split(pane, crate::panes::Dir::Horizontal, &tab_id, false);
+                    }
+                    "up" => {
+                        lay.split(pane, crate::panes::Dir::Vertical, &tab_id, true);
+                    }
+                    "down" => {
+                        lay.split(pane, crate::panes::Dir::Vertical, &tab_id, false);
+                    }
+                    _ => {
+                        if src != Some(pane) {
+                            lay.move_tab(&tab_id, pane);
+                        }
+                    }
+                }
+            }
             if let Some(w) = weak.upgrade() {
-                w.set_active_tab_id("welcome".into());
+                w.set_drag_active(false);
+                refresh_panes(
+                    &w,
+                    &layout.borrow(),
+                    content_size.get(),
+                    &tabs_model,
+                    &panes_model,
+                    &splitters_model,
+                );
             }
         });
     }
@@ -4662,6 +5940,7 @@ fn wire_key_input(
                             b.view_offset = 0;
                             b.sel_anchor = None;
                             b.sel_focus = None;
+                            b.raw.clear();
                         }
                     }
                     if let Some(st) =
@@ -4912,60 +6191,61 @@ fn wire_key_input(
     {
         let handles = handles.clone();
         let bufs_resize = bufs.clone(); // keep bufs alive for the copy handler below
-                                        // The Slint side now measures the real Consolas cell size (via a hidden
-                                        // probe Text) and passes whole column/row counts directly, so there is
-                                        // no pixel→cell guesswork here.  This keeps full-screen programs like
-                                        // nano from over-counting rows and clipping their bottom shortcut bar.
+        let weak_resize = window.as_weak();
+        // The Slint side now measures the real Consolas cell size (via a hidden
+        // probe Text) and passes whole column/row counts directly, so there is
+        // no pixel→cell guesswork here.  This keeps full-screen programs like
+        // nano from over-counting rows and clipping their bottom shortcut bar.
+        // Debounce PTY resizes (#163): a layout reflow (a tab becoming visible,
+        // the SFTP panel docking, a window drag) can momentarily report a
+        // near-zero width, which collapses term-cols to its 10-col floor.
+        // Applying that to the remote PTY immediately resizes the server to 10
+        // columns and reflows vt100 — garbling running output (e.g. a `git clone`
+        // progress meter wraps at 10 chars). Coalesce rapid changes and apply
+        // only the size that's still set after a short quiet period, so a
+        // transient bad value never reaches the server.
+        let pending_size: Rc<RefCell<HashMap<String, (u32, u32)>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let resize_debounce = Rc::new(slint::Timer::default());
         window.on_terminal_resize(move |tab_id: SharedString, cols_f: f32, rows_f: f32| {
+            // A hidden terminal (inactive tab, or a split sibling not currently
+            // shown) reports 0 width/height. Ignore those: flooring 0 to the 10-col
+            // minimum and applying it would shrink that tab's PTY *and* poison
+            // `last_term_size`, so the next connection (e.g. "Duplicate connection")
+            // would start at 10 cols and wrap its first output to ~10 chars (#v0.5).
+            // Only genuine, visible sizes drive a resize.
+            if cols_f < 1.0 || rows_f < 1.0 {
+                return;
+            }
             let cols = (cols_f as u32).max(10);
             let rows = (rows_f as u32).max(5);
-            tracing::debug!("terminal_resize tab={} cols={} rows={}", tab_id, cols, rows);
-            // Keep the shared size up-to-date so future connections start
-            // with the correct PTY dimensions.
-            *last_term_size.lock().unwrap() = (cols, rows);
-            if let Some(handle) = handles.borrow().get(tab_id.as_str()) {
-                handle.resize(cols, rows);
-            }
-            if let Some(buf) = bufs_resize.lock().unwrap().get_mut(tab_id.as_str()) {
-                let (old_rows, old_cols) = buf.parser.screen().size();
-                let new_rows = rows as u16;
-                // Shrinking the grid (e.g. dragging the SFTP panel up) makes
-                // vt100's set_size truncate rows from the BOTTOM — silently
-                // dropping the most recent output + prompt (#18).  To keep the
-                // bottom (recent) rows we scroll the screen up first, but only
-                // by as much as is needed to keep the CURSOR on-screen: the rows
-                // *below* the cursor are unused blank space and can be truncated
-                // for free.  Scrolling by the full delta instead would push real
-                // content off the top into scrollback whenever the screen wasn't
-                // full — e.g. a fresh shell with a few prompt lines — leaving a
-                // blank grid with the cursor stranded at the top, and rapid
-                // up/down dragging would repeat that until the prompt was gone.
-                // Skipped on the alternate screen (vim/btop own their buffer).
-                if new_rows < old_rows && !buf.parser.screen().alternate_screen() {
-                    let (cursor_row, _) = buf.parser.screen().cursor_position();
-                    // Rows that must scroll off the top to keep the cursor in view.
-                    let scroll = (cursor_row + 1).saturating_sub(new_rows);
-                    if scroll > 0 {
-                        let saved: Vec<Line> = {
-                            let s = buf.parser.screen();
-                            (0..scroll).map(|r| build_row(s, r, old_cols)).collect()
-                        };
-                        for line in saved {
-                            buf.history.push(line);
+            pending_size
+                .borrow_mut()
+                .insert(tab_id.to_string(), (cols, rows));
+            let pending = pending_size.clone();
+            let handles = handles.clone();
+            let bufs = bufs_resize.clone();
+            let last = last_term_size.clone();
+            let weak = weak_resize.clone();
+            // (Re)arm the single-shot timer; rapid changes keep resetting it so
+            // only the final, settled size is applied.
+            resize_debounce.start(
+                slint::TimerMode::SingleShot,
+                std::time::Duration::from_millis(150),
+                move || {
+                    let settled: Vec<(String, (u32, u32))> =
+                        pending.borrow_mut().drain().collect();
+                    for (tab, (cols, rows)) in settled {
+                        tracing::debug!("terminal_resize tab={} cols={} rows={}", tab, cols, rows);
+                        apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
+                        // Re-render so the reflowed (or resized) grid shows at once
+                        // instead of waiting for the next remote output (#169).
+                        if let Some(win) = weak.upgrade() {
+                            rebuild_tab_display(&win, &bufs, &tab);
                         }
-                        if buf.history.len() > MAX_HISTORY {
-                            let drop = buf.history.len() - MAX_HISTORY;
-                            buf.history.drain(0..drop);
-                        }
-                        buf.parser.process(format!("\x1b[{scroll}S").as_bytes());
                     }
-                }
-                buf.parser.set_size(new_rows, cols as u16);
-                // The pre/post-resize screens differ in size+content; drop the
-                // scroll-detection snapshot so the next output isn't mis-read as
-                // a scroll (which would double-capture lines).
-                buf.prev.clear();
-            }
+                },
+            );
         });
     }
 
@@ -5043,6 +6323,7 @@ fn wire_key_input(
                 buf.sel_anchor = None;
                 buf.sel_focus = None;
                 buf.displayed_text = Vec::new();
+                buf.raw.clear();
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
@@ -5104,6 +6385,54 @@ fn wire_key_input(
             }
             if let Some(win) = weak.upgrade() {
                 rebuild_tab_display(&win, &bufs_scroll, &tid);
+            }
+        });
+    }
+
+    // Wheel inside an alt-screen program (tmux / less / vim): forward it to the PTY
+    // so the program scrolls, instead of doing nothing (#170 — FinalShell /
+    // MobaXterm behave this way). If the app is tracking the mouse (e.g. tmux with
+    // `mouse on`), send a real wheel mouse-event in the encoding it asked for;
+    // otherwise fall back to arrow keys (xterm "alternate scroll"), which scrolls
+    // less / man / vim.
+    {
+        let bufs_wheel = bufs.clone();
+        let handles_wheel = handles.clone();
+        window.on_terminal_wheel(move |tab_id: SharedString, dir: i32, col: i32, row: i32| {
+            let tid = tab_id.to_string();
+            let bytes = {
+                let map = bufs_wheel.lock().unwrap();
+                let Some(buf) = map.get(&tid) else { return };
+                let screen = buf.parser.screen();
+                if screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None {
+                    // 1-based cell under the cursor, clamped to the screen.
+                    let (rows, cols) = screen.size();
+                    let c = (col.clamp(0, cols.saturating_sub(1) as i32) as u16) + 1;
+                    let r = (row.clamp(0, rows.saturating_sub(1) as i32) as u16) + 1;
+                    let btn: u16 = if dir > 0 { 64 } else { 65 }; // wheel up / down
+                    if screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr {
+                        format!("\x1b[<{btn};{c};{r}M").into_bytes()
+                    } else {
+                        // Legacy X10 encoding: ESC [ M  Cb Cx Cy  (each value + 32).
+                        let cb = (btn + 32) as u8;
+                        let cx = (c.min(223) + 32) as u8;
+                        let cy = (r.min(223) + 32) as u8;
+                        vec![0x1b, b'[', b'M', cb, cx, cy]
+                    }
+                } else {
+                    // alternate-scroll: 3 arrow presses per notch, app-cursor aware.
+                    let one: &[u8] = if dir > 0 {
+                        if screen.application_cursor() { b"\x1bOA" } else { b"\x1b[A" }
+                    } else if screen.application_cursor() {
+                        b"\x1bOB"
+                    } else {
+                        b"\x1b[B"
+                    };
+                    one.repeat(3)
+                }
+            };
+            if let Some(h) = handles_wheel.borrow().get(&tid) {
+                h.send_raw(bytes);
             }
         });
     }
@@ -5998,11 +7327,22 @@ impl TermBuffer {
     /// after each — that way no batch ever scrolls more than the diff can see,
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
-    fn ingest(&mut self, raw: &[u8]) {
+    fn ingest(&mut self, input: &[u8]) {
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
-        let bytes = self.rewrite_hvp(raw);
-        let bytes = &bytes[..];
+        let bytes = self.rewrite_hvp(input);
+        // Retain the (post-rewrite) stream, capped, so a resize can replay it at
+        // the new width and reflow already-printed output (#169).
+        self.raw.extend(bytes.iter().copied());
+        self.cap_raw();
+        self.feed_batched(&bytes);
+    }
+
+    /// Feed a (already HVP-rewritten) byte slice to vt100 in newline-bounded
+    /// batches, capturing scrolled-off lines into history after each (see the
+    /// `ingest` doc comment). Does NOT touch `self.raw`, so it is reused by both
+    /// live ingest and resize-reflow replay.
+    fn feed_batched(&mut self, bytes: &[u8]) {
         let rows = self.parser.screen().size().0 as usize;
         let batch_lines = (rows / 2).max(1);
         let mut start = 0usize;
@@ -6020,6 +7360,41 @@ impl TermBuffer {
         if start < bytes.len() {
             self.ingest_chunk(&bytes[start..]);
         }
+    }
+
+    /// Trim the retained stream to `RAW_CAP`, dropping from the front up to the
+    /// next line boundary so a replay never starts mid-escape / mid-wrapped-line.
+    fn cap_raw(&mut self) {
+        if self.raw.len() <= RAW_CAP {
+            return;
+        }
+        let overflow = self.raw.len() - RAW_CAP;
+        self.raw.drain(0..overflow);
+        while let Some(&b) = self.raw.front() {
+            self.raw.pop_front();
+            if b == b'\n' {
+                break;
+            }
+        }
+    }
+
+    /// Resize-reflow (#169): rebuild the screen + scrollback at a new width by
+    /// replaying the retained byte stream through a fresh parser. vt100 itself
+    /// can't reflow (`set_size` just truncates/pads each row), and we only keep
+    /// rendered grid rows in `history`, so replaying the raw stream is what lets
+    /// long lines rewrap to the new width like FinalShell. Used only on the normal
+    /// screen — alt-screen programs (tmux/vim) get a SIGWINCH redraw from the
+    /// remote instead.
+    fn reflow(&mut self, new_rows: u16, new_cols: u16) {
+        let stream: Vec<u8> = self.raw.iter().copied().collect();
+        self.parser = vt100::Parser::new(new_rows, new_cols, 5000);
+        self.history.clear();
+        self.prev.clear();
+        self.view_offset = 0;
+        // Scrollback line count changes, so absolute selection coords no longer map.
+        self.sel_anchor = None;
+        self.sel_focus = None;
+        self.feed_batched(&stream);
     }
 
     /// Translate every CSI sequence terminated by `f` (HVP) into the identical
@@ -6618,6 +7993,7 @@ mod selection_tests {
             view_offset,
             displayed_text: Vec::new(),
             csi_state: CsiState::Normal,
+            raw: std::collections::VecDeque::new(),
         }
     }
 

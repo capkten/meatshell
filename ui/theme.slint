@@ -22,7 +22,10 @@ export global Theme {
     in-out property <bool>  wallpaper-active: false;
     in-out property <color> wp-accent: #4a90e2;   // vivid accent from the image
     in-out property <color> wp-tint:   #808080;   // average colour, tints surfaces
-    in-out property <float> panel-alpha: 0.86;    // frosted-panel opacity
+    // Frosted-panel opacity over a wallpaper (0.40–1.00). User-adjustable via the
+    // Interface › Wallpaper opacity slider; bg-root / term-bg derive from it so one
+    // control scales the whole wallpaper wash. Default 0.86 (#v0.5).
+    in-out property <float> panel-alpha: 0.86;
     property <float> tint-amt: 0.10;              // how far surfaces pull to wp-tint
 
     // Frost a base surface: pull it slightly toward the wallpaper tint and make
@@ -48,7 +51,7 @@ export global Theme {
 
     // bg-root frosts lighter (lower alpha) so the wallpaper reads clearly in
     // empty / inset areas; panels stay mostly opaque for legible text.
-    out property <brush> bg-root:      frost(base-bg-root, 0.42);
+    out property <brush> bg-root:      frost(base-bg-root, max(0.0, root.panel-alpha - 0.44));
     out property <brush> bg-panel:     frost(base-bg-panel, root.panel-alpha);
     out property <brush> bg-panel-alt: frost(base-bg-panel-alt, root.panel-alpha);
     out property <brush> bg-elevated:  frost(base-bg-elevated, root.panel-alpha);
@@ -59,8 +62,10 @@ export global Theme {
     out property <brush> border-strong: dark ? #4a4e59 : #c7c7cc;
 
     out property <brush> text-primary:   dark ? #e6e8ee : #1d1d1f;
-    out property <brush> text-secondary: dark ? #b4b9c4 : #6e6e73;
-    out property <brush> text-muted:     dark ? #9196a3 : #aeaeb2;
+    // Light-mode secondary/muted darkened (#aeaeb2 → #7c7c82, #6e6e73 → #55555a):
+    // the old greys were too faint on the bright (frosted-wallpaper) background.
+    out property <brush> text-secondary: dark ? #b4b9c4 : #55555a;
+    out property <brush> text-muted:     dark ? #9196a3 : #7c7c82;
 
     out property <brush> accent:         root.wallpaper-active ? root.wp-accent          : (dark ? #4a90e2 : #0071e3);
     out property <brush> accent-hover:   root.wallpaper-active ? root.wp-accent.brighter(0.12) : (dark ? #5aa0f2 : #0077ed);
@@ -74,13 +79,25 @@ export global Theme {
     // what the shell / remote app outputs via ANSI colour codes. With a
     // wallpaper it frosts (kept neutral, not tinted) so text stays legible.
     property <color> base-term-bg: dark ? #0e0f13 : #fafafa;
-    out property <brush> term-bg: root.wallpaper-active ? base-term-bg.with-alpha(0.72) : base-term-bg;
+    out property <brush> term-bg: root.wallpaper-active ? base-term-bg.with-alpha(max(0.0, root.panel-alpha - 0.14)) : base-term-bg;
     out property <brush> term-fg: dark ? #d4d4d4 : #2d2d2f;
+
+    // True on macOS (set by Rust). App shortcuts use Cmd (⌘) here instead of
+    // Ctrl, so the physical Ctrl key stays free for the shell (^C/^X…) (#158).
+    in-out property <bool> is-mac: false;
+
+    // Whether the app window is focused & visible. Rust drives this from winit
+    // focus/minimize/occlusion events; the terminal cursor stops blinking when
+    // it's false, so an idle background window doesn't repaint (#127).
+    in-out property <bool> window-focused: true;
 
     // Global UI scale (#100/#117/#118). Rust sets this from the saved setting;
     // all font sizes and spacing/radii below multiply by it, so the whole UI
     // grows/shrinks live (the terminal font has its own size setting).
     in-out property <float> ui-scale: 1.0;
+    // Settings-panel font scale (#v0.5). The settings card + its text multiply by
+    // this so the panel (which is exempt from ui-scale) can still be enlarged.
+    in-out property <float> panel-font: 1.0;
 
     // --- Typography --------------------------------------------------------
     out property <length> fs-xs: 11px * root.ui-scale;

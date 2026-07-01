@@ -20,7 +20,7 @@ import { TabBar, TabInfo } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
-import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton } from "widgets.slint";
+import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint";
 import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
@@ -68,6 +68,36 @@ export struct TerminalState {
     sftp-loading: bool,
     sftp-tree-nodes: [SftpTreeNode],
     sftp-selected-count: int,   // checked entries in the SFTP panel (#100)
+    sftp-collapsed: bool,       // SFTP panel minimised — per session (#v0.5)
+    sftp-panel-height: length,  // SFTP panel extent (bottom dock) — per session
+    sftp-panel-width: length,   // SFTP panel extent (side dock) — per session
+    sftp-saved-height: length,  // height to restore on un-collapse — per session
+}
+
+// One leaf pane of the split layout (v0.5). Geometry (x/y/w/h) is computed in Rust
+// from the split tree; `tabs` is the pane's own tab group and `active-id` the tab
+// it currently shows. `reserve-right` keeps room for the top-right toolbar icons on
+// whichever pane touches the top-right corner.
+export struct PaneInfo {
+    id: int,
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+    active-id: string,
+    focused: bool,
+    reserve-right: length,
+    tabs: [TabInfo],
+}
+
+// A draggable splitter between two regions of the split layout (v0.5).
+export struct SplitterInfo {
+    split-id: int,
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+    vertical: bool,   // true = vertical handle (drag left/right)
 }
 
 // A 26×26 top-bar icon button with a hover tooltip (right-aligned so it never
@@ -235,6 +265,10 @@ export component AppWindow inherits Window {
     // Default true so the window is frameless from creation (no native-bar flash);
     // Rust sets it false on macOS, which keeps native decorations.
     in-out property <bool> custom-titlebar: true;
+    // macOS immersive title bar: Rust makes the native bar transparent and lets
+    // content render under it, so we reserve this much space at the top for the
+    // traffic-light buttons + a clean drag strip (0 elsewhere). See setup_macos_platform.
+    property <length> titlebar-inset: root.is-mac ? 28px : 0px;
     in-out property <bool> window-maximized: false;
     callback win-minimize();
     callback win-maximize-toggle();
@@ -275,11 +309,12 @@ export component AppWindow inherits Window {
         (root.sidebar-dock == "right" && !root.sidebar-collapsed) ? root.sidebar-width + 4px
         // Docked right + collapsed: shift left to leave room for the expand
         // button at the far-right corner (#dock).
-      : (root.sidebar-dock == "right" && root.sidebar-collapsed) ? 30px
+      : (root.sidebar-dock == "right" && root.sidebar-collapsed) ? 36px
       : 0px;
     property <length> toolbar-y-off:
         (root.sidebar-dock == "top" && !root.sidebar-collapsed) ? root.sidebar-height + 4px : 0px;
     in-out property <bool> about-open: false;     // centered About dialog
+    callback open-repo();                          // open the project's GitHub page
     in-out property <bool> shortcuts-open: false; // centered keyboard-shortcuts dialog (#103)
     in property <string> download-dir;      // preset SFTP download folder ("" = ask)
     // Process monitor is now a detachable top-level window (ProcWindow). Rust
@@ -329,18 +364,30 @@ export component AppWindow inherits Window {
     in-out property <string> term-font-family <=> Theme.term-font-family;
     in-out property <length> term-font-size <=> Theme.term-font-size;
     in-out property <float> ui-scale <=> Theme.ui-scale;   // global UI zoom (#100)
+    in-out property <float> panel-font <=> Theme.panel-font;  // settings-panel font scale
+    callback set-panel-font(int);                          // apply + persist (percent)
     in-out property <string> ui-font-family <=> Theme.ui-font-family;
+    // Window focused & visible — Rust drives it from winit events; gates the
+    // cursor blink so an idle background window stops repainting (#127).
+    in-out property <bool> window-focused <=> Theme.window-focused;
+    // macOS flag — Rust sets it so shortcuts switch to Cmd (⌘) there (#158).
+    in-out property <bool> is-mac <=> Theme.is-mac;
     // Wallpaper / immersive theming — Rust drives these from the wallpaper module.
     in-out property <image> wallpaper-img <=> Theme.wallpaper;
     in-out property <bool> wallpaper-active <=> Theme.wallpaper-active;
     in-out property <color> wp-accent <=> Theme.wp-accent;
     in-out property <color> wp-tint <=> Theme.wp-tint;
+    // User-adjustable wallpaper overlay opacity (0.40–1.00), persisted.
+    in-out property <float> wallpaper-overlay <=> Theme.panel-alpha;
+    callback persist-wallpaper-overlay(float);
     in property <[string]> term-fonts;             // installed monospace families
     in-out property <bool> interface-open: false;  // Interface settings overlay
     // Interface card position (draggable by its title bar, clamped inside the
     // window so it can't leave the parent); init centered.
-    property <length> ifd-x: (root.width - 660px) / 2;
-    property <length> ifd-y: (root.height - 430px) / 2;
+    // Centred, snapped to whole logical pixels: a half-pixel origin makes the
+    // card's text render on subpixel offsets and look blurry (#v0.5).
+    property <length> ifd-x: round((root.width - 720px * Theme.panel-font) / 2 / 1px) * 1px;
+    property <length> ifd-y: round((root.height - 480px * Theme.panel-font) / 2 / 1px) * 1px;
     property <bool> ifd-dragging;
     property <length> ifd-base-x;
     property <length> ifd-base-y;
@@ -364,10 +411,25 @@ export component AppWindow inherits Window {
     // Collapse-by-default settings + shared SFTP collapse state (#78).
     in-out property <bool> collapse-sidebar-default: false;
     callback set-collapse-sidebar-default(bool);   // apply + persist
+    // Render the welcome/session list as a left sidebar instead of a tab (v0.5).
+    in-out property <bool> welcome-as-sidebar: false;
+    callback set-welcome-as-sidebar(bool);         // apply + persist
+    // Drag-resizable width of that welcome sidebar (logical px), persisted.
+    in-out property <length> welcome-sidebar-width: 240px;
+    callback persist-welcome-sidebar-width(float);
+    // Welcome sidebar collapsed to the edge icon strip (IDEA-style), persisted.
+    in-out property <bool> welcome-collapsed: false;
+    callback set-welcome-collapsed(bool);          // apply + persist
     in-out property <bool> collapse-sftp-default: false;
     callback set-collapse-sftp-default(bool);      // apply + persist
-    in-out property <bool> sftp-collapsed: false;       // shared across tabs
+    in-out property <bool> sftp-collapsed: false;       // (legacy global; per-tab now)
     in-out property <length> sftp-saved-height: 220px;  // restore height on un-collapse
+    // Per-session SFTP state: persist the collapse + sizes into that tab's
+    // TerminalState so split panes / other tabs keep their own (#v0.5).
+    callback set-pane-sftp-collapsed(string /* tab-id */, bool);
+    callback set-pane-sftp-height(string /* tab-id */, length);
+    callback set-pane-sftp-width(string /* tab-id */, length);
+    callback set-pane-sftp-saved-height(string /* tab-id */, length);
     // Confirm-before-close when there are live session tabs (#88): a stray
     // double-click on the title-bar icon / X shouldn't drop active sessions.
     in-out property <bool> confirm-close-open: false;
@@ -394,6 +456,15 @@ export component AppWindow inherits Window {
     in-out property <bool> cred-remember: false;   // persist to the saved session
     callback cred-accept();                        // use the entered credentials
     callback cred-reject();                        // cancel the connection
+    // MFA / keyboard-interactive prompt (#86-MFA). Rust opens this when a bastion
+    // (e.g. JumpServer with MFA) sends a verification-code challenge mid-login.
+    in-out property <bool> mfa-prompt-open: false;
+    in-out property <string> mfa-host;             // host shown in the dialog title
+    in-out property <string> mfa-prompt;           // the server's prompt text
+    in-out property <bool> mfa-echo: false;        // false = hide typed input
+    in-out property <string> mfa-answer;           // the entered code
+    callback mfa-submit();                         // send the entered answer
+    callback mfa-cancel();                         // cancel the connection
     // Group create / rename dialog (#41).
     in-out property <bool> group-dialog-open: false;
     in-out property <string> group-dialog-orig;    // "" = create, else rename
@@ -467,6 +538,9 @@ export component AppWindow inherits Window {
 
     // --- Tabs --------------------------------------------------------------
     in property <[TabInfo]> tabs;
+    // --- Split panes (v0.5) — flattened from the Rust split tree -----------
+    in property <[PaneInfo]> panes;
+    in property <[SplitterInfo]> splitters;
     in-out property <string> active-tab-id: "welcome";
     in property <[TerminalState]> terminals;
 
@@ -485,6 +559,8 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-proxy-hostport;
     in-out property <string> dialog-group;
     in-out property <string> dialog-notes;
+    // Existing group names (from Rust) for the dialog's group dropdown (#179).
+    in property <[string]> session-groups;
     in-out property <string> dialog-kind: "ssh";
     in-out property <string> dialog-serial-port;
     in-out property <string> dialog-baud: "115200";
@@ -492,6 +568,7 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-stop-bits: "1";
     in-out property <string> dialog-parity: "none";
     in-out property <string> dialog-flow: "none";
+    in-out property <bool> dialog-disable-shell-integration: false;
 
     // Delete-confirmation modal state (#28).
     in-out property <bool> confirm-delete-open: false;
@@ -505,6 +582,9 @@ export component AppWindow inherits Window {
     in-out property <string> ssh-import-hint;  // result text shown after import
     callback export-sessions();               // export all sessions to a file (#46)
     callback import-sessions();               // import sessions from a file (#46)
+    in-out property <bool> batch-import-open: false;  // text batch-import dialog (#150)
+    in-out property <string> batch-import-text;       // the textarea content
+    callback batch-import-confirm(string /* pasted text */);
     callback connect-session(string /* session-id */);
     callback edit-session(string /* session-id */);
     callback duplicate-session(string /* session-id */);
@@ -523,6 +603,34 @@ export component AppWindow inherits Window {
     callback tab-selected(string);
     callback tab-closed(string);
     callback new-tab-clicked();
+    callback tab-reorder(int /* from-index */, int /* dir: -1 left / +1 right */);
+    // Per-pane tab actions (v0.5): the int is the pane (leaf) id.
+    callback pane-tab-selected(int /* pane-id */, string /* tab-id */);
+    callback pane-tab-closed(int /* pane-id */, string /* tab-id */);
+    callback pane-new-tab(int /* pane-id */);
+    callback pane-tab-reorder(int /* pane-id */, int /* from */, int /* dir */);
+    callback pane-focus(int /* pane-id */);
+    // Split pane `pane-id`, peeling `tab-id` into a new pane on `dir`
+    // ("left"/"right"/"up"/"down").
+    callback pane-split(int /* pane-id */, string /* tab-id */, string /* dir */);
+    // Open another connection to the same session as `tab-id` (a new tab).
+    callback tab-duplicate(string /* tab-id */);
+    // Drag-to-split (v0.5): cursor moved / dropped while dragging `tab-id`, in
+    // pane-area coordinates. Rust hit-tests the pane + edge zone.
+    callback tab-drag-move(string /* tab-id */, length /* x */, length /* y */);
+    callback tab-drag-drop(string /* tab-id */, length /* x */, length /* y */);
+    // Drop-zone highlight (set by Rust during a drag): the region the dropped
+    // tab's new pane would occupy.
+    in property <bool> drag-active;
+    in property <length> drag-hl-x;
+    in property <length> drag-hl-y;
+    in property <length> drag-hl-w;
+    in property <length> drag-hl-h;
+    // Splitter drag: move split `split-id`'s boundary to `pos` (px along its axis).
+    callback splitter-drag(int /* split-id */, length /* pos */, bool /* vertical */);
+    // Reports the pane-area size to Rust so it can flatten the split tree into
+    // absolute pane / splitter rects. Fired whenever the content area resizes.
+    callback content-resized(length /* w */, length /* h */);
     // Asks Rust to recompute the sidebar (status + resources) for whatever tab
     // is now active.  Fired on every active-tab change, UI- or code-driven.
     callback refresh-sidebar();
@@ -586,6 +694,8 @@ export component AppWindow inherits Window {
     callback find-query-changed(string /* tab-id */, string /* query */);
     // Scroll a session's scrollback history by N lines (+ = up/older).
     callback terminal-scroll(string /* tab-id */, int /* delta-lines */);
+    // Wheel forwarded to an alt-screen program (#170): tab-id, dir (+1 up/-1 down), col, row.
+    callback terminal-wheel(string, int, int, int);
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
     // Drag-selection lifecycle (grid row/col coordinates).
     callback term-select-start(string /* tab-id */, int /* row */, int /* col */);
@@ -605,6 +715,16 @@ export component AppWindow inherits Window {
 
     VerticalLayout {
         spacing: 0;
+
+        // macOS immersive bar: a strip under the native traffic-light buttons.
+        // Frosted like the other panels (bg-panel) so it matches in both themes —
+        // a plain transparent strip would show the raw wallpaper here and look dark
+        // in light mode. Left as a plain reserve (no TouchArea) so macOS's own title
+        // bar keeps handling the window drag in this region.
+        if root.titlebar-inset > 0px : Rectangle {
+            height: root.titlebar-inset;
+            background: Theme.bg-panel;
+        }
 
         // Immersive custom title bar (#119) — only on frameless platforms
         // (Windows/Linux). App icon + name on the left, a draggable middle
@@ -660,15 +780,109 @@ export component AppWindow inherits Window {
         // `sidebar-dock`, so the sidebar can sit on any window edge (#dock).
         dock-area := Rectangle {
         vertical-stretch: 1;
-        // Sidebar extent along its docked axis (0 when collapsed); plus a 4px
-        // splitter unless collapsed.
-        property <length> sb-w: root.sidebar-collapsed ? 0px : root.sidebar-width;
-        property <length> sb-h: root.sidebar-collapsed ? 0px : root.sidebar-height;
+        // Left-edge layout (welcome-as-sidebar mode): a thin always-on icon strip
+        // (IDEA-style) + the welcome/session sidebar (0 when collapsed). The rest
+        // (resource panel + central terminal, which never collapses) sits to their
+        // right in `rest`.
+        // Collapsed-only (M5): the icon strip shows only while collapsed; the
+        // panel itself (welcome-w) only while expanded — one or the other.
+        property <length> strip-w: (root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
+        property <length> welcome-w: (root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
+        property <bool> welcome-sidebar-dragging;
+
+        // Collapsed welcome → a thin left icon strip (click the icon to re-open).
+        if root.welcome-as-sidebar && root.welcome-collapsed : ToolStrip {
+            x: 0; y: 0; width: parent.strip-w; height: parent.height;
+            dock-edge: "left";
+            glyph: "\u{E88A}";   // session list / welcome
+            expand => {
+                root.welcome-collapsed = false;
+                root.set-welcome-collapsed(false);
+            }
+        }
+
+        // Welcome / session list, to the right of the icon strip. Hidden when
+        // collapsed — its icon stays in the strip; clicking it re-opens.
+        if root.welcome-as-sidebar && !root.welcome-collapsed : Rectangle {
+            x: parent.strip-w; y: 0; width: parent.welcome-w; height: parent.height;
+            background: Theme.bg-panel;
+            clip: true;
+            Welcome {
+                width: parent.width;
+                height: parent.height;
+                compact: true;
+                sessions: root.sessions;
+                import-hint: root.ssh-import-hint;
+                collapse => {
+                    root.welcome-collapsed = true;
+                    root.set-welcome-collapsed(true);
+                }
+                new-session => { root.new-session-clicked(); }
+                import-ssh-config => { root.import-ssh-config(); }
+                connect-session(id) => { root.connect-session(id); }
+                edit-session(id) => { root.edit-session(id); }
+                duplicate-session(id) => { root.duplicate-session(id); }
+                move-session(id, group) => { root.move-session(id, group); }
+                toggle-group(group) => { root.toggle-group(group); }
+                new-group => {
+                    root.group-dialog-orig = "";
+                    root.group-dialog-name = "";
+                    root.group-dialog-open = true;
+                }
+                edit-group(name) => {
+                    root.group-dialog-orig = name;
+                    root.group-dialog-name = name;
+                    root.group-dialog-open = true;
+                }
+                delete-group(name) => { root.delete-group(name); }
+                remove-session(id) => { root.remove-session(id); }
+            }
+            Rectangle {
+                x: parent.width - 1px; width: 1px; height: parent.height;
+                background: Theme.border-subtle;
+            }
+        }
+
+        // Drag the welcome sidebar's right edge to resize it (v0.5 M3b).
+        if root.welcome-as-sidebar && !root.welcome-collapsed : Rectangle {
+            x: parent.strip-w + parent.welcome-w - 2px; y: 0;
+            width: 4px; height: parent.height;
+            background: ws-split-ta.has-hover || dock-area.welcome-sidebar-dragging
+                ? Theme.accent : transparent;
+            ws-split-ta := TouchArea {
+                mouse-cursor: ew-resize;
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.down) {
+                        dock-area.welcome-sidebar-dragging = true;
+                    } else if (ev.kind == PointerEventKind.up) {
+                        dock-area.welcome-sidebar-dragging = false;
+                        root.persist-welcome-sidebar-width(root.welcome-sidebar-width / 1px);
+                    }
+                }
+                moved => {
+                    if (dock-area.welcome-sidebar-dragging) {
+                        root.welcome-sidebar-width = clamp(
+                            self.absolute-position.x + self.mouse-x
+                                - dock-area.absolute-position.x - dock-area.strip-w,
+                            160px, 480px);
+                    }
+                }
+            }
+        }
+
+        // Everything except the welcome strip/sidebar — the resource panel,
+        // splitter and the central tab/pane content — sits to the right of them.
+        rest := Rectangle {
+        x: parent.strip-w + parent.welcome-w; y: 0;
+        width: parent.width - parent.strip-w - parent.welcome-w; height: parent.height;
+        // Sidebar extent along its docked axis. When collapsed it shrinks to the
+        // 36px ToolStrip icon bar (M5) instead of 0 + a floating button; the 4px
+        // splitter is gone while collapsed.
+        property <length> sb-w: root.sidebar-collapsed ? 36px : root.sidebar-width;
+        property <length> sb-h: root.sidebar-collapsed ? 36px : root.sidebar-height;
         property <length> sp: root.sidebar-collapsed ? 0px : 4px;
-        // Docked bottom + collapsed: reserve a thin full-width expand strip at the
-        // very bottom (the bottom edge is full of the command bar / SFTP status, so
-        // a floating corner button would overlap them) (#dock).
-        property <length> bottom-strip-h: (root.sidebar-dock == "bottom" && root.sidebar-collapsed) ? 22px : 0px;
+        // The collapsed bar (sb-h) already reserves the bottom strip now.
+        property <length> bottom-strip-h: 0px;
 
         // Left sidebar — collapsible and drag-resizable, dockable to any edge.
         // The animation is disabled while dragging so the splitter tracks the
@@ -723,6 +937,18 @@ export component AppWindow inherits Window {
                 root.panel-dragging = false;
             }
             toggle-collapse() => { root.sidebar-collapsed = !root.sidebar-collapsed; }
+        }
+
+        // Collapsed resource panel → a ToolStrip icon bar at the same docked edge
+        // (M5), in place of the old floating expand button.
+        if root.sidebar-collapsed : ToolStrip {
+            x: root.sidebar-dock == "right" ? parent.width - parent.sb-w : 0px;
+            y: root.sidebar-dock == "bottom" ? parent.height - parent.sb-h : 0px;
+            width: root.sidebar-horizontal ? parent.sb-w : parent.width;
+            height: root.sidebar-horizontal ? parent.height : parent.sb-h;
+            dock-edge: root.sidebar-dock;
+            glyph: "\u{E871}";   // dashboard — resource panel
+            expand => { root.sidebar-collapsed = false; }
         }
 
         // Splitter — drag to resize the sidebar. Orientation + which dimension it
@@ -786,30 +1012,45 @@ export component AppWindow inherits Window {
             width:  root.sidebar-horizontal ? parent.width - parent.sb-w - parent.sp : parent.width;
             height: root.sidebar-horizontal ? parent.height : parent.height - parent.sb-h - parent.sp - parent.bottom-strip-h;
             clip: true;
-            VerticalLayout {
-            spacing: 0;
-
-            HorizontalLayout {
+            // Split-pane area (v0.5): panes tile this rect; each pane has its own
+            // tab strip + active terminal / welcome. Rust flattens the split tree
+            // into `panes` for the size we report here.
+            pane-area := Rectangle {
+            changed width => { root.content-resized(self.width, self.height); }
+            changed height => { root.content-resized(self.width, self.height); }
+            for pane[pi] in root.panes : Rectangle {
+                x: pane.x; y: pane.y; width: pane.w; height: pane.h;
+                clip: true;
+                VerticalLayout {
                 spacing: 0;
-                // The sidebar collapse toggle now lives inside the panel header
-                // (so it follows the panel to any edge); expand-when-collapsed is
-                // a floating button at the docked edge below (#dock).
-                // When docked left/top + collapsed, leave room on the far left so
-                // the expand button sits just left of the first tab (not over it).
-                if (root.sidebar-dock == "left" || root.sidebar-dock == "top") && root.sidebar-collapsed : Rectangle { width: 30px; }
+
+                HorizontalLayout {
+                spacing: 0;
+                // (Collapsed resource panel now reserves its own ToolStrip slot in
+                // `rest`, so the tab strip no longer needs a spacer for it.)
                 TabBar {
                     horizontal-stretch: 1;
                     // Reserve room for the top-right toolbar icons that sit over
                     // this row so tabs don't slide underneath them (#122).
-                    reserve-right: 140px;
-                    tabs: root.tabs;
-                    active-id: root.active-tab-id;
-                    tab-selected(id) => {
-                        root.active-tab-id = id;
-                        root.tab-selected(id);
+                    reserve-right: pane.reserve-right;
+                    tabs: pane.tabs;
+                    active-id: pane.active-id;
+                    tab-selected(id) => { root.pane-tab-selected(pane.id, id); }
+                    tab-closed(id) => { root.pane-tab-closed(pane.id, id); }
+                    new-tab() => { root.pane-new-tab(pane.id); }
+                    tab-reorder(from, dir) => { root.pane-tab-reorder(pane.id, from, dir); }
+                    tab-split(id, dir) => { root.pane-split(pane.id, id, dir); }
+                    tab-duplicate(id) => { root.tab-duplicate(id); }
+                    tab-drag-move(id, ax, ay) => {
+                        root.tab-drag-move(id,
+                            ax - pane-area.absolute-position.x,
+                            ay - pane-area.absolute-position.y);
                     }
-                    tab-closed(id) => { root.tab-closed(id); }
-                    new-tab() => { root.new-tab-clicked(); }
+                    tab-drag-drop(id, ax, ay) => {
+                        root.tab-drag-drop(id,
+                            ax - pane-area.absolute-position.x,
+                            ay - pane-area.absolute-position.y);
+                    }
                 }
             }
 
@@ -818,9 +1059,25 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
                 background: Theme.bg-root;
 
+                // Empty pane (welcome-as-sidebar mode, no session open yet): a
+                // centered hint pointing at the left session list.
+                if pane.tabs.length == 0 : Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    Text {
+                        text: root.lang-en
+                            ? "Pick a session on the left to begin"
+                            : "从左侧选择一个会话开始";
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-sm;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
                 // Welcome tab — fill the content area explicitly (some renderers
                 // don't auto-fill, which spread the header/card apart) (#dock).
-                if root.active-tab-id == "welcome" : Welcome {
+                if pane.active-id == "welcome" : Welcome {
                     width: parent.width;
                     height: parent.height;
                     sessions: root.sessions;
@@ -851,9 +1108,9 @@ export component AppWindow inherits Window {
                 // allow nesting `if` directly inside a `for`, so we toggle
                 // visibility instead and rely on the layout to overlap them.
                 for term[i] in root.terminals : TerminalView {
-                    visible: term.id == root.active-tab-id;
-                    width: term.id == root.active-tab-id ? parent.width : 0px;
-                    height: term.id == root.active-tab-id ? parent.height : 0px;
+                    visible: term.id == pane.active-id;
+                    width: term.id == pane.active-id ? parent.width : 0px;
+                    height: term.id == pane.active-id ? parent.height : 0px;
                     tab-id: term.id;
                     status-line: term.status;
                     spans: term.spans;
@@ -865,11 +1122,15 @@ export component AppWindow inherits Window {
                     is-alt-screen: term.is-alt-screen;
                     find-matches: term.find-matches;
                     selection: term.selection;
-                    sftp-panel-height <=> root.sftp-panel-height;
-                    sftp-panel-width <=> root.sftp-panel-width;
+                    sftp-panel-height: term.sftp-panel-height;
+                    set-sftp-panel-height(v) => { root.set-pane-sftp-height(term.id, v); }
+                    sftp-panel-width: term.sftp-panel-width;
+                    set-sftp-panel-width(v) => { root.set-pane-sftp-width(term.id, v); }
                     sftp-dock <=> root.sftp-dock;
-                    sftp-collapsed <=> root.sftp-collapsed;
-                    sftp-saved-height <=> root.sftp-saved-height;
+                    sftp-collapsed: term.sftp-collapsed;
+                    set-sftp-collapsed(v) => { root.set-pane-sftp-collapsed(term.id, v); }
+                    sftp-saved-height: term.sftp-saved-height;
+                    set-sftp-saved-height(v) => { root.set-pane-sftp-saved-height(term.id, v); }
                     sftp-path: term.sftp-path;
                     sftp-entries: term.sftp-entries;
                     sftp-status: term.sftp-status;
@@ -959,24 +1220,58 @@ export component AppWindow inherits Window {
                     clear-terminal() => { root.clear-terminal(term.id); }
                     find-query-changed(q) => { root.find-query-changed(term.id, q); }
                     terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
+                    terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
                     terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
                     select-start(r, c) => { root.term-select-start(term.id, r, c); }
                     select-update(r, c) => { root.term-select-update(term.id, r, c); }
                     select-end() => { root.term-select-end(term.id); }
                     select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
                 }
+                }
+                }
+            }
+
+            // Draggable splitters between panes. Single pane => the model is
+            // empty, so this renders nothing. The handle is a thin 6px bar but its
+            // TouchArea reaches ±5px beyond so it's easy to grab.
+            for sp[si] in root.splitters : Rectangle {
+                x: sp.x; y: sp.y; width: sp.w; height: sp.h;
+                background: sp-ta.has-hover || sp-ta.pressed ? Theme.accent : Theme.border-strong;
+                animate background { duration: 100ms; }
+                sp-ta := TouchArea {
+                    x: sp.vertical ? -5px : 0px;
+                    y: sp.vertical ? 0px : -5px;
+                    width: sp.vertical ? parent.width + 10px : parent.width;
+                    height: sp.vertical ? parent.height : parent.height + 10px;
+                    mouse-cursor: sp.vertical ? ew-resize : ns-resize;
+                    moved => {
+                        if (self.pressed) {
+                            root.splitter-drag(sp.split-id,
+                                sp.vertical ? sp.x - 5px + self.mouse-x
+                                            : sp.y - 5px + self.mouse-y,
+                                sp.vertical);
+                        }
+                    }
+                }
+            }
+
+            // Drag-to-split drop-zone highlight (v0.5). Purely visual (no
+            // TouchArea) so it never eats the drag; Rust sets the rect.
+            if root.drag-active : Rectangle {
+                x: root.drag-hl-x;
+                y: root.drag-hl-y;
+                width: root.drag-hl-w;
+                height: root.drag-hl-h;
+                background: Theme.accent.with-alpha(0.22);
+                border-width: 2px;
+                border-color: Theme.accent;
+                border-radius: Theme.radius-sm;
             }
             }
+        }
         }
 
-        // Collapsed → small per-edge expand button (shared with SFTP). Left/right/
-        // top sit in line with the tab / toolbar row (those shift to make room);
-        // bottom sits in the reserved 22px gap (bottom-strip-h) so it never
-        // overlaps the command bar / SFTP status bar above (#dock).
-        if root.sidebar-collapsed : DockExpandButton {
-            dock-edge: root.sidebar-dock;
-            expand => { root.sidebar-collapsed = false; }
-        }
+        // (Resource collapse now uses a ToolStrip inside `rest`, above.)
 
         // Drag-to-dock snap overlay — four edge zones; the one under the cursor
         // (root.dock-target) lights up. Purely visual (no TouchArea) so the
@@ -1021,28 +1316,28 @@ export component AppWindow inherits Window {
     // of the tab row — below the custom title bar when frameless (y offset), or
     // at the very top on macOS where the native title bar is separate (#119).
     IconBtn {
-        x: root.width - 34px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px) + root.toolbar-y-off;
+        x: root.width - 34px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
         icon: "\u{E8B8}";
         tooltip: root.lang-en ? "Settings" : "设置";
         active: root.settings-open;
         clicked => { root.settings-open = !root.settings-open; root.download-open = false; root.ssh-import-hint = ""; }
     }
     IconBtn {
-        x: root.width - 64px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px) + root.toolbar-y-off;
+        x: root.width - 64px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
         icon: "\u{E2C4}";
         tooltip: root.lang-en ? "Download" : "下载";
         active: root.download-open;
         clicked => { root.download-open = !root.download-open; root.settings-open = false; }
     }
     IconBtn {
-        x: root.width - 94px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px) + root.toolbar-y-off;
+        x: root.width - 94px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
         icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
         icon-color: Theme.dark ? #f5c542 : #5856d6;
         tooltip: root.lang-en ? "Toggle theme" : "切换主题";
         clicked => { root.toggle-theme(); }
     }
     IconBtn {
-        x: root.width - 124px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px) + root.toolbar-y-off;
+        x: root.width - 124px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
         icon: "\u{E627}";
         icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
         active: root.sync-input;
@@ -1166,7 +1461,11 @@ export component AppWindow inherits Window {
             // Ctrl+S saves, Esc closes. These bubble up from the focused
             // TextInput because it doesn't consume them.
             key-pressed(e) => {
-                if (e.text == "s" && e.modifiers.control) {
+                // ⌘S on macOS, Ctrl+S elsewhere. (Slint maps `control` to Cmd on
+                // macOS — see #158, so no platform branch is needed here.) On macOS
+                // Cmd+letter arrives as the C0 control char (Cmd+S = "\u{13}"), not
+                // "s" — confirmed on an M4 — so accept both forms (#158).
+                if (e.modifiers.control && (e.text == "s" || e.text == "S" || e.text == "\u{0013}")) {
                     root.save-file();
                     return accept;
                 }
@@ -1374,8 +1673,10 @@ export component AppWindow inherits Window {
     // Always present; toggled via `visible` (avoids destroying interactive
     // elements mid-event, which crashes when created/removed at the Window root).
     Rectangle {
-        x: parent.width - 364px;
-        y: root.custom-titlebar ? 78px : 40px;
+        // Follow the download button (shifts with the toolbar when the resource
+        // panel docks right/top) (#dock).
+        x: parent.width - 364px - root.toolbar-x-off;
+        y: (root.custom-titlebar ? 78px : 40px + root.titlebar-inset) + root.toolbar-y-off;
         width: 350px;
         height: 400px;
         visible: root.download-open;
@@ -1584,10 +1885,15 @@ export component AppWindow inherits Window {
         clicked => { root.settings-open = false; }
     }
     Rectangle {
-        x: parent.width - 196px;
-        y: root.custom-titlebar ? 78px : 40px;
+        // Follow the gear button: it shifts by toolbar-x/y-off when the resource
+        // panel docks right/top, so the menu must shift the same amount or it ends
+        // up floating over the resource panel (#dock).
+        x: parent.width - 196px - root.toolbar-x-off;
+        y: (root.custom-titlebar ? 78px : 40px + root.titlebar-inset) + root.toolbar-y-off;
         width: 198px;
-        height: 220px;
+        // Size to the menu's content so adding/removing items (or the
+        // ~/.ssh/config import hint expanding) never overflows the card (#150-fix).
+        height: menu-vl.preferred-height;
         visible: root.settings-open;
         background: Theme.bg-panel;
         border-radius: Theme.radius-md;
@@ -1598,7 +1904,7 @@ export component AppWindow inherits Window {
 
         TouchArea {}   // swallow events so they don't reach the terminal
 
-        VerticalLayout {
+        menu-vl := VerticalLayout {
             padding: 4px;
             spacing: 1px;
             // Interface (font) settings.
@@ -1663,6 +1969,29 @@ export component AppWindow inherits Window {
                            color: Theme.text-secondary; font-size: Theme.fs-sm;
                            vertical-alignment: center; }
                     Text { text: root.lang-en ? "Import connections" : "导入连接";
+                           color: Theme.text-primary; font-size: Theme.fs-md;
+                           vertical-alignment: center; horizontal-stretch: 1; }
+                }
+            }
+            // Batch-import connections from pasted text (#150).
+            Rectangle {
+                height: 28px;
+                border-radius: Theme.radius-sm;
+                background: batchimp-ta.has-hover ? Theme.bg-hover : transparent;
+                batchimp-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        root.settings-open = false;
+                        root.batch-import-text = "";
+                        root.batch-import-open = true;
+                    }
+                }
+                HorizontalLayout {
+                    padding-left: 8px; spacing: 8px;
+                    Text { text: "\u{E1C3}"; font-family: "Material Icons"; // table/rows
+                           color: Theme.text-secondary; font-size: Theme.fs-sm;
+                           vertical-alignment: center; }
+                    Text { text: root.lang-en ? "Batch import (text)" : "批量导入(文本)";
                            color: Theme.text-primary; font-size: Theme.fs-md;
                            vertical-alignment: center; horizontal-stretch: 1; }
                 }
@@ -2269,6 +2598,23 @@ export component AppWindow inherits Window {
         height: parent.height;
         background: #00000088;
         TouchArea { clicked => { root.confirm-close-open = false; } }
+        // Grab the keyboard so the terminal beneath stops receiving input, and
+        // make the dialog operable without the mouse: Enter/Space close, Esc
+        // cancels (so X → Space closes, X → Esc backs out) (#140-3).
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) {
+                    root.confirm-close-open = false;
+                    accept
+                } else if (e.text == Key.Return || e.text == " ") {
+                    root.confirm-close-yes();
+                    accept
+                } else {
+                    accept   // modal: swallow everything else
+                }
+            }
+        }
 
         Rectangle {
             x: (parent.width - self.width) / 2;
@@ -2453,11 +2799,18 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                // Scrollable so the list never overflows the fixed-height card (#140).
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 5px;
+
                 Text { text: root.lang-en ? "Terminal" : "终端";
                        color: Theme.text-muted; font-size: Theme.fs-xs; }
-                ShortcutRow { keys: "Ctrl+Shift+C"; desc: root.lang-en ? "Copy selection" : "复制选中内容"; }
-                ShortcutRow { keys: "Ctrl+V"; desc: root.lang-en ? "Paste" : "粘贴"; }
-                ShortcutRow { keys: "Ctrl+F"; desc: root.lang-en ? "Find in terminal" : "查找"; }
+                ShortcutRow { keys: root.is-mac ? "⌘C" : "Ctrl+Shift+C"; desc: root.lang-en ? "Copy selection" : "复制选中内容"; }
+                ShortcutRow { keys: root.is-mac ? "⌘V" : "Ctrl+V"; desc: root.lang-en ? "Paste" : "粘贴"; }
+                ShortcutRow { keys: root.is-mac ? "⌘F" : "Ctrl+F"; desc: root.lang-en ? "Find in terminal" : "查找"; }
+                ShortcutRow { keys: root.is-mac ? "⌘⇧R" : "Ctrl+Shift+R"; desc: root.lang-en ? "Jump to command history search" : "跳到命令历史搜索"; }
                 ShortcutRow { keys: root.lang-en ? "Drag" : "鼠标拖动"; desc: root.lang-en ? "Select text" : "选择文本"; }
                 ShortcutRow { keys: root.lang-en ? "Wheel / Scrollbar" : "滚轮 / 滚动条"; desc: root.lang-en ? "Scroll history" : "滚动历史"; }
 
@@ -2466,12 +2819,15 @@ export component AppWindow inherits Window {
                        color: Theme.text-muted; font-size: Theme.fs-xs; }
                 ShortcutRow { keys: "Enter"; desc: root.lang-en ? "Send command" : "发送命令"; }
                 ShortcutRow { keys: "↑ / ↓"; desc: root.lang-en ? "Previous / next in history" : "上一条 / 下一条历史"; }
-                ShortcutRow { keys: "Ctrl+A"; desc: root.lang-en ? "Move to start of line" : "移到行首"; }
-                ShortcutRow { keys: "Ctrl+E"; desc: root.lang-en ? "Move to end of line" : "移到行尾"; }
-                ShortcutRow { keys: "Ctrl+K"; desc: root.lang-en ? "Delete to end of line" : "删除到行尾"; }
-                ShortcutRow { keys: "Ctrl+U"; desc: root.lang-en ? "Delete to start of line" : "删除到行首"; }
-
-                Rectangle { vertical-stretch: 1; }
+                ShortcutRow { keys: root.is-mac ? "⌃R" : "Ctrl+R"; desc: root.lang-en ? "Search history (↑↓ select, Enter run, Esc close)" : "搜索命令历史(↑↓ 选择,回车执行,Esc 关闭)"; }
+                ShortcutRow { keys: "Esc"; desc: root.lang-en ? "Close history / focus terminal" : "关闭历史 / 聚焦终端"; }
+                ShortcutRow { keys: root.is-mac ? "⌃A" : "Ctrl+A"; desc: root.lang-en ? "Move to start of line" : "移到行首"; }
+                ShortcutRow { keys: root.is-mac ? "⌃E" : "Ctrl+E"; desc: root.lang-en ? "Move to end of line" : "移到行尾"; }
+                ShortcutRow { keys: root.is-mac ? "⌃K" : "Ctrl+K"; desc: root.lang-en ? "Delete to end of line" : "删除到行尾"; }
+                ShortcutRow { keys: root.is-mac ? "⌃U" : "Ctrl+U"; desc: root.lang-en ? "Delete to start of line" : "删除到行首"; }
+                        Rectangle { height: 2px; }
+                    }
+                }
             }
         }
     }
@@ -2484,13 +2840,14 @@ export component AppWindow inherits Window {
         background: #00000080;            // dim backdrop
         TouchArea { clicked => { root.about-open = false; } }
 
+        // Landscape card: logo on the left, a short intro + repo link on the right.
         Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            width: 380px;
-            height: 440px;
+            width: 520px;
+            height: 188px;
             background: Theme.bg-panel;
-            border-radius: Theme.radius-md;
+            border-radius: Theme.radius-lg;
             border-width: 1px;
             border-color: Theme.border-strong;
             drop-shadow-blur: 24px;
@@ -2499,67 +2856,98 @@ export component AppWindow inherits Window {
             // Swallow clicks so the backdrop doesn't close when clicking inside.
             TouchArea {}
 
-            VerticalLayout {
-                padding: 18px;
-                spacing: 8px;
+            // Close (×) in the top-right corner.
+            Rectangle {
+                x: parent.width - 30px;
+                y: 8px;
+                width: 22px; height: 22px;
+                border-radius: Theme.radius-sm;
+                background: ab-close-ta.has-hover ? Theme.bg-hover : transparent;
+                ab-close-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.about-open = false; }
+                }
+                Text { text: "\u{E5CD}"; font-family: "Material Icons";
+                       color: Theme.text-secondary; font-size: Theme.fs-sm;
+                       horizontal-alignment: center; vertical-alignment: center; }
+            }
 
-                HorizontalLayout {
-                    Text {
-                        text: @tr("About meatshell");
-                        color: Theme.text-primary;
-                        font-size: Theme.fs-lg;
-                        font-weight: 700;
-                        horizontal-stretch: 1;
-                        vertical-alignment: center;
+            HorizontalLayout {
+                padding: 24px;
+                spacing: 20px;
+
+                VerticalLayout {
+                    alignment: center;
+                    Image {
+                        source: @image-url("../assets/icon.png");
+                        width: 76px;
+                        height: 76px;
                     }
-                    Rectangle {
-                        width: 22px; height: 22px;
-                        border-radius: Theme.radius-sm;
-                        background: ab-close-ta.has-hover ? Theme.bg-hover : transparent;
-                        ab-close-ta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => { root.about-open = false; }
-                        }
-                        Text { text: "\u{E5CD}"; font-family: "Material Icons";
-                               color: Theme.text-secondary; font-size: Theme.fs-sm;
-                               horizontal-alignment: center; vertical-alignment: center; }
-                    }
                 }
 
-                Text {
-                    text: @tr("A lightweight Rust + Slint SSH terminal client by 'lil meatball'.");
-                    color: Theme.text-secondary;
-                    font-size: Theme.fs-sm;
-                    wrap: word-wrap;
-                }
-                Text {
-                    text: @tr("Open source · MIT / Apache-2.0");
-                    color: Theme.text-muted;
-                    font-size: Theme.fs-xs;
-                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 7px;
+                    horizontal-stretch: 1;
 
-                Rectangle { height: 1px; background: Theme.border-subtle; }
-
-                Text {
-                    text: @tr("Open-source libraries used");
-                    color: Theme.text-secondary;
-                    font-size: Theme.fs-sm;
-                }
-
-                Flickable {
-                    vertical-stretch: 1;
-                    viewport-width: self.width;
-                    viewport-height: max(self.height, libs-col.preferred-height);
-                    libs-col := VerticalLayout {
+                    HorizontalLayout {
                         alignment: start;
-                        spacing: 4px;
-                        for lib in root.about-libs : Text {
-                            text: lib;
+                        spacing: 8px;
+                        Text {
+                            text: "meatshell";
                             color: Theme.text-primary;
-                            font-size: Theme.fs-xs;
-                            wrap: no-wrap;
-                            overflow: elide;
+                            font-size: 22px;
+                            font-weight: 700;
+                            vertical-alignment: center;
                         }
+                        Text {
+                            text: "v" + root.app-version;
+                            color: Theme.text-muted;
+                            font-size: Theme.fs-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: @tr("meatshell — a lightweight Rust + Slint SSH client by 'lil meatball'");
+                        color: Theme.text-secondary;
+                        font-size: Theme.fs-sm;
+                        wrap: word-wrap;
+                    }
+
+                    // Clickable open-source link → opens the GitHub page.
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: 6px;
+                        Text {
+                            text: @tr("Open source");
+                            color: Theme.text-muted;
+                            font-size: Theme.fs-sm;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            border-radius: Theme.radius-sm;
+                            background: repo-ta.has-hover ? Theme.bg-hover : transparent;
+                            HorizontalLayout {
+                                padding-left: 4px; padding-right: 4px;
+                                Text {
+                                    text: "github.com/jeff141/meatshell";
+                                    color: Theme.accent;
+                                    font-size: Theme.fs-sm;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            repo-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.open-repo(); }
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "MIT / Apache-2.0";
+                        color: Theme.text-muted;
+                        font-size: Theme.fs-xs;
                     }
                 }
             }
@@ -2584,6 +2972,7 @@ export component AppWindow inherits Window {
         draft-proxy-hostport <=> root.dialog-proxy-hostport;
         draft-group <=> root.dialog-group;
         draft-notes <=> root.dialog-notes;
+        session-groups: root.session-groups;
         draft-kind <=> root.dialog-kind;
         draft-serial-port <=> root.dialog-serial-port;
         draft-baud <=> root.dialog-baud;
@@ -2591,6 +2980,7 @@ export component AppWindow inherits Window {
         draft-stop-bits <=> root.dialog-stop-bits;
         draft-parity <=> root.dialog-parity;
         draft-flow <=> root.dialog-flow;
+        draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
         forwards: root.dialog-forwards;
         submit(draft) => { root.session-dialog-submit(draft); }
         cancel => { root.session-dialog-cancel(); }
@@ -2623,18 +3013,107 @@ export component AppWindow inherits Window {
         cancel => { root.confirm-delete-batch = false; root.confirm-delete-open = false; }
     }
 
-    // Host-key confirmation (#109-5). Reuses the confirm-dialog card; the
-    // backdrop / Cancel both reject (safe default = don't connect).
+    // Host-key confirmation (#109-5). Reuses the confirm-dialog card. The backdrop
+    // is NOT a dismiss here (#152): clicking outside the card used to count as a
+    // reject and — worse — poison the host for the whole run. The user must pick
+    // "Trust & connect" or the explicit Cancel/Reject button.
     ConfirmDialog {
         width: parent.width;
         height: parent.height;
         is-open <=> root.hostkey-prompt-open;
+        dismiss-on-backdrop: false;
         title: root.hostkey-title;
         message: root.hostkey-message;
         detail: root.hostkey-detail;
         confirm-label: root.hostkey-confirm-label;
         confirm => { root.hostkey-accept(); }
         cancel => { root.hostkey-reject(); }
+    }
+
+    // Batch-import connections from pasted text (#150).
+    if root.batch-import-open : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000aa;
+        TouchArea { clicked => { root.batch-import-open = false; } }   // backdrop closes
+        Rectangle {
+            width: 540px;
+            height: 440px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.bg-panel;
+            border-radius: Theme.radius-lg;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000080;
+            TouchArea {}   // swallow clicks inside the card
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text {
+                    text: root.lang-en ? "Batch import connections" : "批量导入连接";
+                    color: Theme.text-primary;
+                    font-size: Theme.fs-xl;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.lang-en
+                        ? "One per line:  host|port|user|password|name   (port/user/password/name optional)"
+                        : "每行一个:  host|port|user|password|name   (端口/用户/密码/名称可省略)";
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                // Paste area — themed multiline input.
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: bi-input.has-focus ? Theme.accent : Theme.border-subtle;
+                    background: Theme.bg-root;
+                    clip: true;
+                    Flickable {
+                        viewport-height: max(self.height, bi-input.preferred-height + 16px);
+                        bi-input := TextInput {
+                            x: 10px;
+                            y: 8px;
+                            width: parent.width - 20px;
+                            text <=> root.batch-import-text;
+                            color: Theme.text-primary;
+                            font-family: Theme.font-mono;
+                            font-size: Theme.fs-md;
+                            single-line: false;
+                            wrap: no-wrap;
+                        }
+                    }
+                    if root.batch-import-text == "" : Text {
+                        x: 10px;
+                        y: 8px;
+                        text: "192.168.1.108|22|root|pass@123|服务器1";
+                        color: Theme.text-muted;
+                        font-family: Theme.font-mono;
+                        font-size: Theme.fs-md;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton {
+                        text: @tr("Cancel");
+                        clicked => { root.batch-import-open = false; }
+                    }
+                    PrimaryButton {
+                        text: root.lang-en ? "Import" : "导入";
+                        clicked => {
+                            root.batch-import-confirm(root.batch-import-text);
+                            root.batch-import-open = false;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Connect-time credential prompt (#110). Backdrop / Cancel abort the connect.
@@ -2674,12 +3153,16 @@ export component AppWindow inherits Window {
                     label: @tr("Username");
                     placeholder: "root";
                     value <=> root.cred-user;
+                    accepted => { root.cred-accept(); }
+                    canceled => { root.cred-reject(); }   // Esc cancels (#140-3)
                 }
                 if root.cred-need-password : LabeledInput {
                     label: @tr("Password");
                     placeholder: "••••••••";
                     password: true;
                     value <=> root.cred-password;
+                    accepted => { root.cred-accept(); }
+                    canceled => { root.cred-reject(); }   // Esc cancels (#140-3)
                 }
                 CheckBox {
                     text: @tr("Remember for this session");
@@ -2701,6 +3184,74 @@ export component AppWindow inherits Window {
         }
     }
 
+    // MFA / keyboard-interactive prompt (#86-MFA). A bastion (JumpServer with MFA
+    // forced on) challenges for a verification code mid-login; backdrop / Cancel
+    // abort the connect.
+    if root.mfa-prompt-open : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: #000000aa;
+        TouchArea { clicked => { root.mfa-cancel(); } }
+        Rectangle {
+            width: 360px;
+            height: mfa-card.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: Theme.bg-panel;
+            border-radius: Theme.radius-lg;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000080;
+            TouchArea {}   // swallow clicks inside the card
+            mfa-card := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+                Text {
+                    text: root.lang-en ? "Two-factor verification" : "双重验证 (MFA)";
+                    color: Theme.text-primary;
+                    font-size: Theme.fs-xl;
+                    font-weight: 600;
+                }
+                Text {
+                    text: root.mfa-host;
+                    color: Theme.text-secondary;
+                    font-family: Theme.font-mono;
+                    font-size: Theme.fs-sm;
+                }
+                // The server's own prompt text (falls back to a generic hint).
+                Text {
+                    text: root.mfa-prompt != "" ? root.mfa-prompt
+                        : (root.lang-en ? "Enter your verification code" : "请输入验证码");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                code-input := LabeledInput {
+                    label: root.lang-en ? "Code" : "验证码";
+                    placeholder: "123456";
+                    password: !root.mfa-echo;
+                    value <=> root.mfa-answer;
+                    auto-focus: true;
+                    accepted => { root.mfa-submit(); }   // Enter submits
+                    canceled => { root.mfa-cancel(); }   // Esc cancels (#140-3)
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 8px;
+                    GhostButton {
+                        text: @tr("Cancel");
+                        clicked => { root.mfa-cancel(); }
+                    }
+                    PrimaryButton {
+                        text: root.lang-en ? "Verify" : "验证";
+                        clicked => { root.mfa-submit(); }
+                    }
+                }
+            }
+        }
+    }
+
     // --- Interface settings (modal overlay) -------------------------------
     // Embedded in the main window (not a detached window), so it can't be
     // dragged outside the parent. The dim backdrop + a focus-grabbing scope make
@@ -2710,10 +3261,14 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         background: #00000080;            // dim backdrop
-        // Grab focus and swallow keys so nothing leaks to the terminal beneath.
+        // Grab focus and swallow keys so nothing leaks to the terminal beneath;
+        // Esc closes the panel (#140-3).
         FocusScope {
             init => { self.focus(); }
-            key-pressed(e) => { accept }
+            key-pressed(e) => {
+                if (e.text == Key.Escape) { root.interface-open = false; }
+                accept
+            }
             key-released(e) => { accept }
         }
         // Modal: clicking the backdrop does nothing (only the ✕ closes it).
@@ -2722,8 +3277,9 @@ export component AppWindow inherits Window {
         Rectangle {
             x: root.ifd-x;
             y: root.ifd-y;
-            width: 660px;
-            height: 430px;
+            // Bigger base, and scales with the settings font size (#v0.5).
+            width: 720px * Theme.panel-font;
+            height: 480px * Theme.panel-font;
             background: Theme.bg-panel;
             border-radius: Theme.radius-md;
             border-width: 1px;
@@ -2754,11 +3310,11 @@ export component AppWindow inherits Window {
                         moved => {
                             if (root.ifd-dragging) {
                                 root.ifd-x = clamp(
-                                    root.ifd-base-x + (self.absolute-position.x + self.mouse-x - root.ifd-grab-x),
-                                    0px, max(0px, root.width - 660px));
+                                    round((root.ifd-base-x + (self.absolute-position.x + self.mouse-x - root.ifd-grab-x)) / 1px) * 1px,
+                                    0px, max(0px, root.width - 720px * Theme.panel-font));
                                 root.ifd-y = clamp(
-                                    root.ifd-base-y + (self.absolute-position.y + self.mouse-y - root.ifd-grab-y),
-                                    0px, max(0px, root.height - 430px));
+                                    round((root.ifd-base-y + (self.absolute-position.y + self.mouse-y - root.ifd-grab-y)) / 1px) * 1px,
+                                    0px, max(0px, root.height - 480px * Theme.panel-font));
                             }
                         }
                     }
@@ -2804,6 +3360,8 @@ export component AppWindow inherits Window {
                     collapse-sftp-default <=> root.collapse-sftp-default;
                     sync-upload-enabled <=> root.sync-upload-enabled;
                     download-always-ask <=> root.download-always-ask;
+                    welcome-as-sidebar <=> root.welcome-as-sidebar;
+                    wallpaper-overlay <=> root.wallpaper-overlay;
                     current-wallpaper: root.current-wallpaper;
                     custom-wallpaper-name: root.custom-wallpaper-name;
                     set-wallpaper(v) => { root.set-wallpaper(v); }
@@ -2811,11 +3369,14 @@ export component AppWindow inherits Window {
                     set-term-font(v) => { root.set-term-font(v); }
                     set-term-font-size(v) => { root.set-term-font-size(v); }
                     set-ui-scale(v) => { root.set-ui-scale(v); }
+                    set-panel-font(v) => { root.set-panel-font(v); }
                     set-sftp-follow-cd(v) => { root.set-sftp-follow-cd(v); }
                     set-collapse-sidebar-default(v) => { root.set-collapse-sidebar-default(v); }
                     set-collapse-sftp-default(v) => { root.set-collapse-sftp-default(v); }
                     set-sync-upload-enabled(v) => { root.set-sync-upload-enabled(v); }
                     set-download-always-ask(v) => { root.set-download-always-ask(v); }
+                    set-welcome-as-sidebar(v) => { root.set-welcome-as-sidebar(v); }
+                    persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
                 }
             }
         }

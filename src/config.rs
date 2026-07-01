@@ -348,6 +348,13 @@ pub struct Session {
     /// Tunnels established automatically when this SSH session connects.
     #[serde(default)]
     pub forwards: Vec<PortForward>,
+
+    /// Skip the shell-integration setup (the cwd-follow PROMPT_COMMAND hook + the
+    /// remote resource monitor). Those assume a POSIX shell; on a Windows server
+    /// whose shell is pwsh/cmd the injected hook breaks the shell. Turn this on
+    /// for such servers (#140).
+    #[serde(default)]
+    pub disable_shell_integration: bool,
 }
 
 /// One SSH tunnel (#56). `kind` is "local" (-L), "remote" (-R) or
@@ -393,6 +400,7 @@ impl Session {
             parity: default_parity(),
             flow_control: default_flow(),
             forwards: Vec::new(),
+            disable_shell_integration: false,
         }
     }
 }
@@ -496,6 +504,23 @@ pub struct ConfigFile {
     /// Maximum file size (in bytes) for image preview via SFTP. Default 100 MiB.
     #[serde(default = "default_image_preview_max_bytes")]
     pub image_preview_max_bytes: u64,
+    /// Render the welcome page (session list) as a docked left sidebar instead of
+    /// a "New tab" tab (v0.5). Persisted so the layout choice sticks.
+    #[serde(default)]
+    pub welcome_as_sidebar: bool,
+    /// Width (logical px) of the welcome/session sidebar when docked (v0.5).
+    #[serde(default)]
+    pub welcome_sidebar_width: f32,
+    /// Welcome sidebar collapsed to the edge icon strip (IDEA-style) (v0.5).
+    #[serde(default)]
+    pub welcome_collapsed: bool,
+    /// Frosted-panel opacity over a wallpaper (0.40-1.00); user-adjustable via the
+    /// Interface -> Wallpaper opacity slider. 0 = use the 0.86 default (v0.5).
+    #[serde(default)]
+    pub wallpaper_overlay: f32,
+    /// Settings-panel font scale, percent (80-160). 0 = 100% default (v0.5).
+    #[serde(default)]
+    pub panel_font: u32,
 }
 
 /// Portable export file (issue #46): sessions with everything in plaintext
@@ -924,6 +949,38 @@ impl ConfigStore {
     }
     pub fn set_sidebar_dock(&mut self, v: String) {
         self.cache.sidebar_dock = v;
+    }
+    pub fn welcome_as_sidebar(&self) -> bool {
+        self.cache.welcome_as_sidebar
+    }
+    pub fn set_welcome_as_sidebar(&mut self, v: bool) {
+        self.cache.welcome_as_sidebar = v;
+    }
+    pub fn welcome_sidebar_width(&self) -> f32 {
+        let w = self.cache.welcome_sidebar_width;
+        if w <= 0.0 { 240.0 } else { w }
+    }
+    pub fn set_welcome_sidebar_width(&mut self, v: f32) {
+        self.cache.welcome_sidebar_width = v;
+    }
+    pub fn welcome_collapsed(&self) -> bool {
+        self.cache.welcome_collapsed
+    }
+    pub fn set_welcome_collapsed(&mut self, v: bool) {
+        self.cache.welcome_collapsed = v;
+    }
+    pub fn wallpaper_overlay(&self) -> f32 {
+        let a = self.cache.wallpaper_overlay;
+        if a <= 0.0 { 0.86 } else { a.clamp(0.40, 1.0) }
+    }
+    pub fn set_wallpaper_overlay(&mut self, v: f32) {
+        self.cache.wallpaper_overlay = v.clamp(0.40, 1.0);
+    }
+    pub fn panel_font(&self) -> u32 {
+        if self.cache.panel_font == 0 { 100 } else { self.cache.panel_font }
+    }
+    pub fn set_panel_font(&mut self, percent: u32) {
+        self.cache.panel_font = percent.clamp(80, 160);
     }
     pub fn sftp_panel_width(&self) -> f32 {
         let w = self.cache.sftp_panel_width;
