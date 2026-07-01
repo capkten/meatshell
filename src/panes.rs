@@ -87,8 +87,16 @@ const MIN_PANE: f32 = 80.0;
 impl Layout {
     /// A fresh single-pane layout owning `tabs` with `active` selected.
     pub fn new(tabs: Vec<String>, active: String) -> Self {
-        let root = Node::Leaf(Leaf { id: 1, tabs, active });
-        Layout { root, focused: 1, next_id: 2 }
+        let root = Node::Leaf(Leaf {
+            id: 1,
+            tabs,
+            active,
+        });
+        Layout {
+            root,
+            focused: 1,
+            next_id: 2,
+        }
     }
 
     fn alloc(&mut self) -> u64 {
@@ -101,7 +109,16 @@ impl Layout {
     pub fn flatten(&self, x: f32, y: f32, w: f32, h: f32) -> (Vec<PaneRect>, Vec<SplitterRect>) {
         let mut panes = Vec::new();
         let mut splits = Vec::new();
-        layout_node(&self.root, x, y, w, h, self.focused, &mut panes, &mut splits);
+        layout_node(
+            &self.root,
+            x,
+            y,
+            w,
+            h,
+            self.focused,
+            &mut panes,
+            &mut splits,
+        );
         (panes, splits)
     }
 
@@ -264,7 +281,13 @@ fn layout_node(
             active: l.active.clone(),
             focused: l.id == focused,
         }),
-        Node::Split { id, dir, ratio, first, second } => {
+        Node::Split {
+            id,
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
             let half = SPLITTER / 2.0;
             match dir {
                 Dir::Horizontal => {
@@ -309,9 +332,7 @@ fn find_leaf(node: &Node, id: u64) -> Option<&Leaf> {
     match node {
         Node::Leaf(l) if l.id == id => Some(l),
         Node::Leaf(_) => None,
-        Node::Split { first, second, .. } => {
-            find_leaf(first, id).or_else(|| find_leaf(second, id))
-        }
+        Node::Split { first, second, .. } => find_leaf(first, id).or_else(|| find_leaf(second, id)),
     }
 }
 
@@ -352,9 +373,7 @@ fn take_leaf(node: &mut Node, id: u64) -> Option<Node> {
     match node {
         Node::Leaf(l) if l.id == id => Some(Node::Leaf(l.clone())),
         Node::Leaf(_) => None,
-        Node::Split { first, second, .. } => {
-            take_leaf(first, id).or_else(|| take_leaf(second, id))
-        }
+        Node::Split { first, second, .. } => take_leaf(first, id).or_else(|| take_leaf(second, id)),
     }
 }
 
@@ -384,13 +403,18 @@ fn contains_leaf(node: &Node, id: u64) -> bool {
 fn set_split_ratio(node: &mut Node, split_id: u64, ratio: f32) -> bool {
     match node {
         Node::Leaf(_) => false,
-        Node::Split { id, ratio: r, first, second, .. } => {
+        Node::Split {
+            id,
+            ratio: r,
+            first,
+            second,
+            ..
+        } => {
             if *id == split_id {
                 *r = ratio;
                 true
             } else {
-                set_split_ratio(first, split_id, ratio)
-                    || set_split_ratio(second, split_id, ratio)
+                set_split_ratio(first, split_id, ratio) || set_split_ratio(second, split_id, ratio)
             }
         }
     }
@@ -415,7 +439,11 @@ fn prune_node(node: &mut Node) {
 }
 
 fn placeholder() -> Node {
-    Node::Leaf(Leaf { id: 0, tabs: Vec::new(), active: String::new() })
+    Node::Leaf(Leaf {
+        id: 0,
+        tabs: Vec::new(),
+        active: String::new(),
+    })
 }
 
 #[cfg(test)]
@@ -432,7 +460,10 @@ mod tests {
         let (panes, splits) = l.flatten(0.0, 0.0, 1000.0, 600.0);
         assert_eq!(panes.len(), 1);
         assert!(splits.is_empty());
-        assert_eq!((panes[0].x, panes[0].y, panes[0].w, panes[0].h), (0.0, 0.0, 1000.0, 600.0));
+        assert_eq!(
+            (panes[0].x, panes[0].y, panes[0].w, panes[0].h),
+            (0.0, 0.0, 1000.0, 600.0)
+        );
         assert!(panes[0].focused);
     }
 

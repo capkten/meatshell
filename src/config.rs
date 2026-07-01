@@ -958,7 +958,11 @@ impl ConfigStore {
     }
     pub fn welcome_sidebar_width(&self) -> f32 {
         let w = self.cache.welcome_sidebar_width;
-        if w <= 0.0 { 240.0 } else { w }
+        if w <= 0.0 {
+            240.0
+        } else {
+            w
+        }
     }
     pub fn set_welcome_sidebar_width(&mut self, v: f32) {
         self.cache.welcome_sidebar_width = v;
@@ -971,13 +975,21 @@ impl ConfigStore {
     }
     pub fn wallpaper_overlay(&self) -> f32 {
         let a = self.cache.wallpaper_overlay;
-        if a <= 0.0 { 0.86 } else { a.clamp(0.40, 1.0) }
+        if a <= 0.0 {
+            0.86
+        } else {
+            a.clamp(0.40, 1.0)
+        }
     }
     pub fn set_wallpaper_overlay(&mut self, v: f32) {
         self.cache.wallpaper_overlay = v.clamp(0.40, 1.0);
     }
     pub fn panel_font(&self) -> u32 {
-        if self.cache.panel_font == 0 { 100 } else { self.cache.panel_font }
+        if self.cache.panel_font == 0 {
+            100
+        } else {
+            self.cache.panel_font
+        }
     }
     pub fn set_panel_font(&mut self, percent: u32) {
         self.cache.panel_font = percent.clamp(80, 160);

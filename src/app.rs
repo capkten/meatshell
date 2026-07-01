@@ -255,7 +255,9 @@ fn setup_macos_platform() {
                 tracing::warn!("winit backend already set; immersive macOS titlebar disabled");
             }
         }
-        Err(e) => tracing::warn!("winit backend build failed ({e}); immersive macOS titlebar disabled"),
+        Err(e) => {
+            tracing::warn!("winit backend build failed ({e}); immersive macOS titlebar disabled")
+        }
     }
 }
 
@@ -263,7 +265,6 @@ pub fn run() -> Result<()> {
     // Immersive native title bar on macOS (must precede the first window).
     #[cfg(target_os = "macos")]
     setup_macos_platform();
-
 
     // --- Runtime + store -------------------------------------------------
     let runtime = Arc::new(Runtime::new().context("failed to start tokio runtime")?);
@@ -1742,7 +1743,11 @@ fn parse_batch_import(text: &str) -> Vec<Session> {
             .and_then(|p| p.parse::<u16>().ok())
             .filter(|&p| p > 0)
             .unwrap_or(22);
-        let user = parts.get(2).copied().filter(|s| !s.is_empty()).unwrap_or("root");
+        let user = parts
+            .get(2)
+            .copied()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("root");
         let password = parts.get(3).copied().unwrap_or("");
         let name = parts
             .get(4)
@@ -1786,7 +1791,10 @@ fn session_groups_model(store: &ConfigStore) -> ModelRc<SharedString> {
     named.sort_by_key(|g| g.to_lowercase());
     named.dedup();
     ModelRc::from(Rc::new(VecModel::from(
-        named.into_iter().map(SharedString::from).collect::<Vec<_>>(),
+        named
+            .into_iter()
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
     )))
 }
 
@@ -2048,9 +2056,10 @@ fn wire_session_callbacks(
                 let mut s = store.borrow_mut();
                 for sess in parsed {
                     // Skip a host/user/port we already have.
-                    let dup = s.sessions().iter().any(|x| {
-                        x.host == sess.host && x.user == sess.user && x.port == sess.port
-                    });
+                    let dup = s
+                        .sessions()
+                        .iter()
+                        .any(|x| x.host == sess.host && x.user == sess.user && x.port == sess.port);
                     if dup {
                         continue;
                     }
@@ -3639,7 +3648,9 @@ fn apply_session_event_to_window(
         let panes = win.get_panes();
         if let Some(pm) = panes.as_any().downcast_ref::<VecModel<PaneInfo>>() {
             for pi in 0..pm.row_count() {
-                let Some(pane) = pm.row_data(pi) else { continue };
+                let Some(pane) = pm.row_data(pi) else {
+                    continue;
+                };
                 let Some(tm) = pane.tabs.as_any().downcast_ref::<VecModel<TabInfo>>() else {
                     continue;
                 };
@@ -4193,7 +4204,8 @@ fn resolve_front_hostkey(win: &AppWindow, accept: bool) {
             // only fails the current attempt; the next connect prompts again.
             if accept {
                 HOSTKEY_DECIDED.with(|d| {
-                    d.borrow_mut().insert(format!("{}:{}", p.host, p.port), true);
+                    d.borrow_mut()
+                        .insert(format!("{}:{}", p.host, p.port), true);
                 });
             }
             for r in &p.responders {
@@ -4782,7 +4794,11 @@ fn wire_tab_callbacks(
         window.on_pane_new_tab(move |pane_id: i32| {
             // In welcome-as-sidebar mode there is no welcome tab — the session list
             // lives in the left panel, so "+" has nothing to open.
-            if weak.upgrade().map(|w| w.get_welcome_as_sidebar()).unwrap_or(false) {
+            if weak
+                .upgrade()
+                .map(|w| w.get_welcome_as_sidebar())
+                .unwrap_or(false)
+            {
                 return;
             }
             {
@@ -4910,13 +4926,13 @@ fn wire_tab_callbacks(
                 }
                 if let Some(w) = weak.upgrade() {
                     refresh_panes(
-                    &w,
-                    &layout.borrow(),
-                    content_size.get(),
-                    &tabs_model,
-                    &panes_model,
-                    &splitters_model,
-                );
+                        &w,
+                        &layout.borrow(),
+                        content_size.get(),
+                        &tabs_model,
+                        &panes_model,
+                        &splitters_model,
+                    );
                 }
             },
         );
@@ -6233,8 +6249,7 @@ fn wire_key_input(
                 slint::TimerMode::SingleShot,
                 std::time::Duration::from_millis(150),
                 move || {
-                    let settled: Vec<(String, (u32, u32))> =
-                        pending.borrow_mut().drain().collect();
+                    let settled: Vec<(String, (u32, u32))> = pending.borrow_mut().drain().collect();
                     for (tab, (cols, rows)) in settled {
                         tracing::debug!("terminal_resize tab={} cols={} rows={}", tab, cols, rows);
                         apply_terminal_resize(&handles, &bufs, &last, &tab, cols, rows);
@@ -6422,7 +6437,11 @@ fn wire_key_input(
                 } else {
                     // alternate-scroll: 3 arrow presses per notch, app-cursor aware.
                     let one: &[u8] = if dir > 0 {
-                        if screen.application_cursor() { b"\x1bOA" } else { b"\x1b[A" }
+                        if screen.application_cursor() {
+                            b"\x1bOA"
+                        } else {
+                            b"\x1b[A"
+                        }
                     } else if screen.application_cursor() {
                         b"\x1bOB"
                     } else {

@@ -601,9 +601,9 @@ pub(crate) const COMPAT_CIPHER: &[russh::cipher::Name] = &[
     russh::cipher::AES_256_CTR,
     russh::cipher::AES_192_CTR,
     russh::cipher::AES_128_CTR,
-    russh::cipher::AES_256_CBC, // legacy fallback
-    russh::cipher::AES_192_CBC, // legacy fallback
-    russh::cipher::AES_128_CBC, // legacy fallback
+    russh::cipher::AES_256_CBC,    // legacy fallback
+    russh::cipher::AES_192_CBC,    // legacy fallback
+    russh::cipher::AES_128_CBC,    // legacy fallback
     russh::cipher::TRIPLE_DES_CBC, // legacy fallback
 ];
 
@@ -1191,8 +1191,7 @@ fn parse_monitor_block(
     // overlay mount per container layer, all with identical size. Like dropping rows
     // into a Set: skip a (total, available) we've already shown. `df` lists the real
     // mount first, so that's the one kept.
-    let mut seen_fs: std::collections::HashSet<(u64, u64)> =
-        std::collections::HashSet::new();
+    let mut seen_fs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     // Processes from `ps` (#23): top-by-CPU rows.
     let mut procs: Vec<ProcInfo> = Vec::new();
     // The sample is split into sections by `echo` markers; everything before the
