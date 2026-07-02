@@ -15,6 +15,7 @@ use sysinfo::{Disks, Networks, System};
 
 /// Per-GPU snapshot returned by any GPU backend.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct GpuSnapshot {
     /// GPU index (0-based).
     pub index: u32,
@@ -113,6 +114,7 @@ pub struct SystemSnapshot {
     /// Per-filesystem (mount, available_bytes, total_bytes).
     pub disks: Vec<(String, u64, u64)>,
     /// Per-GPU stats. Empty when no GPU backend is available.
+    #[allow(dead_code)]
     pub gpus: Vec<GpuSnapshot>,
 }
 

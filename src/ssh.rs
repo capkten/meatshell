@@ -395,6 +395,7 @@ pub enum SessionEvent {
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
         /// Per-GPU stats from nvidia-smi. Empty if no NVIDIA GPU or command failed.
+        #[allow(dead_code)]
         gpus: Vec<GpuSnapshot>,
     },
 

@@ -1,6 +1,5 @@
 import { Theme } from "theme.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
-import { TextEdit } from "std-widgets.slint";
 
 // One SSH port-forward row shown in the session dialog (#56). `summary` is a
 // ready-to-display line like "-L 127.0.0.1:8080 → host:80".
@@ -22,7 +21,6 @@ export struct SessionDraft {
     private-key-path: string,
     proxy: string,     // "" | "socks5://host:port" | "http://host:port"
     group: string,     // folder/group name ("" = ungrouped)
-    notes: string,     // user-defined notes/memo
     // Serial-only (ignored unless kind == "serial")
     serial-port: string,
     baud-rate: int,
@@ -33,6 +31,8 @@ export struct SessionDraft {
     // Skip the POSIX shell-integration setup (cwd-follow hook + monitor) for
     // Windows / pwsh servers where it breaks the shell (#140).
     disable-shell-integration: bool,
+    // Free-form note (B站 suggestion).
+    note: string,
 }
 
 // A single segment in a segmented selector (auth toggle, baud presets, …).
@@ -213,7 +213,6 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> draft-proxy-hostport;
     in-out property <string> draft-group;
-    in-out property <string> draft-notes;
     in property <[string]> session-groups;   // existing groups for the dropdown (#179)
     in-out property <string> draft-serial-port;
     in-out property <string> draft-baud: "115200";
@@ -222,6 +221,7 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-parity: "none";
     in-out property <string> draft-flow: "none";
     in-out property <bool> draft-disable-shell-integration: false;
+    in-out property <string> draft-note;
 
     // Port forwards / tunnels (#56). `forwards` is the current list (fed from
     // Rust); the nf-* properties hold the add-form fields.
@@ -332,20 +332,11 @@ export component SessionDialog inherits Rectangle {
                 groups: root.session-groups;
             }
 
-            // Optional notes/memo for this session (multi-line).
-            VerticalLayout {
-                spacing: 4px;
-                Text {
-                    text: @tr("Notes (optional)");
-                    color: Theme.text-secondary;
-                    font-size: Theme.fs-sm;
-                }
-                notes-te := TextEdit {
-                    height: 80px;
-                    text <=> root.draft-notes;
-                    font-size: Theme.fs-sm;
-                    wrap: word-wrap;
-                }
+            // Free-form note — extra info to keep with the session (B站 suggestion).
+            LabeledInput {
+                label: @tr("Note (optional)");
+                placeholder: @tr("Anything to remember about this host");
+                value <=> root.draft-note;
             }
 
             // ── SSH / Telnet share host + port ──────────────────────────────
@@ -744,7 +735,6 @@ export component SessionDialog inherits Rectangle {
                                  : root.draft-proxy-type == "http" ? "http://" + root.draft-proxy-hostport
                                  : "socks5://" + root.draft-proxy-hostport,
                             group: root.draft-group,
-                            notes: root.draft-notes,
                             serial-port: root.draft-serial-port,
                             baud-rate: root.draft-baud.to-float(),
                             data-bits: root.draft-data-bits.to-float(),
@@ -752,6 +742,7 @@ export component SessionDialog inherits Rectangle {
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
                             disable-shell-integration: root.draft-disable-shell-integration,
+                            note: root.draft-note,
                         });
                     }
                 }

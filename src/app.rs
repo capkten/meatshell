@@ -117,8 +117,6 @@ struct TabStatus {
     disks: Vec<(String, u64, u64)>,
     /// Top remote processes by CPU, for the process monitor popup (#23).
     procs: Vec<ProcInfo>,
-    /// Remote GPU stats from nvidia-smi.
-    gpus: Vec<crate::system::GpuSnapshot>,
 }
 type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 /// Last local-machine sample (shown on the welcome tab).
@@ -501,6 +499,7 @@ pub fn run() -> Result<()> {
         window.set_welcome_sidebar_width(s.welcome_sidebar_width());
         window.set_welcome_collapsed(s.welcome_collapsed());
         window.set_wallpaper_overlay(s.wallpaper_overlay());
+        window.set_update_check_enabled(s.update_check_enabled()); // #184
         if collapse_sidebar {
             window.set_sidebar_collapsed(true);
         }
@@ -519,6 +518,16 @@ pub fn run() -> Result<()> {
         window.on_set_collapse_sidebar_default(move |v| {
             let mut s = store.borrow_mut();
             s.set_collapse_sidebar_default(v);
+            let _ = s.save();
+        });
+    }
+    {
+        // Toggle the startup new-version check (#184). Takes effect next launch
+        // for the check itself; the banner just won't appear once it's off.
+        let store = store.clone();
+        window.on_set_update_check_enabled(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_update_check_enabled(v);
             let _ = s.save();
         });
     }
@@ -828,11 +837,6 @@ pub fn run() -> Result<()> {
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
 
     // --- Wire callbacks --------------------------------------------------
-    // Image viewer state: list of image file paths in the current SFTP directory,
-    // shared with the preview/prev/next callbacks and populated on SftpEntries.
-    // Arc<Mutex> because it crosses the event-pump thread boundary.
-    let image_entries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
     wire_session_callbacks(
         &window,
         store.clone(),
@@ -853,7 +857,6 @@ pub fn run() -> Result<()> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
-        image_entries.clone(),
     );
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
@@ -1053,7 +1056,7 @@ pub fn run() -> Result<()> {
     // --- In-app update check (#48) -----------------------------------------
     // "Download" on the banner opens the latest-release page in the browser.
     window.on_open_update_url(move || {
-        let url = "https://github.com/capkten/meatshell/releases/latest";
+        let url = "https://github.com/jeff141/meatshell/releases/latest";
         #[cfg(windows)]
         let _ = std::process::Command::new("explorer").arg(url).spawn();
         #[cfg(target_os = "macos")]
@@ -1074,11 +1077,12 @@ pub fn run() -> Result<()> {
     // Query the GitHub releases API on a background thread; if a newer version
     // exists, flip the banner on. Best-effort: any network/parse error is
     // silently ignored and the app keeps working on the current version.
-    {
+    // Skipped entirely when the user turned the check off (#184).
+    if store.borrow().update_check_enabled() {
         let weak = window.as_weak();
         std::thread::spawn(move || {
             let body =
-                match ureq::get("https://api.github.com/repos/capkten/meatshell/releases/latest")
+                match ureq::get("https://api.github.com/repos/jeff141/meatshell/releases/latest")
                     .set("User-Agent", "meatshell-update-check")
                     .timeout(std::time::Duration::from_secs(8))
                     .call()
@@ -1198,86 +1202,6 @@ pub fn run() -> Result<()> {
         sftp_last_cwd.clone(),
     );
     wire_sftp_callbacks(&window, sftp_handles.clone(), sftp_last_cwd.clone());
-
-    // SFTP image preview: load the image via read_bytes and open the viewer.
-    {
-        let image_entries_clone = image_entries.clone();
-        let sftp_handles_clone = sftp_handles.clone();
-        let store_clone = store.clone();
-        let weak = window.as_weak();
-        window.on_sftp_preview(move |tab_id: SharedString, path: SharedString| {
-            let entries = image_entries_clone.lock().unwrap();
-            let idx = entries.iter().position(|p| p == path.as_str()).unwrap_or(0);
-            let total = entries.len();
-            let max_bytes = store_clone.borrow().image_preview_max_bytes();
-            if let Some(h) = sftp_handles_clone.lock().unwrap().get(tab_id.as_str()) {
-                h.read_bytes(path.to_string(), max_bytes);
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_image_viewer_index(idx as i32);
-                w.set_image_viewer_total(total as i32);
-            }
-        });
-    }
-
-    // Image viewer prev/next/close.
-    {
-        let entries_c = image_entries.clone();
-        let handles_c = sftp_handles.clone();
-        let store_c = store.clone();
-        let weak = window.as_weak();
-        window.on_image_viewer_prev(move || {
-            if let Some(w) = weak.upgrade() {
-                let idx = w.get_image_viewer_index() as usize;
-                if idx > 0 {
-                    let new_idx = idx - 1;
-                    let entries = entries_c.lock().unwrap();
-                    if let Some(path) = entries.get(new_idx) {
-                        let max_bytes = store_c.borrow().image_preview_max_bytes();
-                        // Use the active tab's SFTP handle.
-                        let active = w.get_active_tab_id();
-                        if let Some(h) = handles_c.lock().unwrap().get(active.as_str()) {
-                            h.read_bytes(path.clone(), max_bytes);
-                        }
-                        w.set_image_viewer_index(new_idx as i32);
-                    }
-                }
-            }
-        });
-    }
-    {
-        let entries_c = image_entries.clone();
-        let handles_c = sftp_handles.clone();
-        let store_c = store.clone();
-        let weak = window.as_weak();
-        window.on_image_viewer_next(move || {
-            if let Some(w) = weak.upgrade() {
-                let idx = w.get_image_viewer_index() as usize;
-                let total = w.get_image_viewer_total() as usize;
-                if idx + 1 < total {
-                    let new_idx = idx + 1;
-                    let entries = entries_c.lock().unwrap();
-                    if let Some(path) = entries.get(new_idx) {
-                        let max_bytes = store_c.borrow().image_preview_max_bytes();
-                        let active = w.get_active_tab_id();
-                        if let Some(h) = handles_c.lock().unwrap().get(active.as_str()) {
-                            h.read_bytes(path.clone(), max_bytes);
-                        }
-                        w.set_image_viewer_index(new_idx as i32);
-                    }
-                }
-            }
-        });
-    }
-    {
-        let weak = window.as_weak();
-        window.on_image_viewer_close(move || {
-            if let Some(w) = weak.upgrade() {
-                w.set_image_viewer_open(false);
-            }
-        });
-    }
-
     wire_key_input(
         &window,
         handles.clone(),
@@ -1296,7 +1220,6 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
-            image_entries: image_entries.clone(),
         },
     );
 
@@ -1877,7 +1800,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                         "".into()
                     },
                     collapsed: false,
-                    notes: s.notes.lines().next().unwrap_or("").to_string().into(),
+                    notes: "".into(),
                 });
             }
         }
@@ -1910,7 +1833,6 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
-    image_entries: Arc<Mutex<Vec<String>>>,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
@@ -1941,7 +1863,6 @@ fn wire_session_callbacks(
             w.set_dialog_proxy_type("none".into());
             w.set_dialog_proxy_hostport("".into());
             w.set_dialog_group("".into());
-            w.set_dialog_notes("".into());
             w.set_dialog_kind("ssh".into());
             w.set_dialog_serial_port("".into());
             w.set_dialog_baud("115200".into());
@@ -1950,6 +1871,7 @@ fn wire_session_callbacks(
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
             w.set_dialog_disable_shell_integration(false);
+            w.set_dialog_note("".into());
             w.set_dialog_editing(false);
             w.set_dialog_open(true);
         }
@@ -2144,7 +2066,6 @@ fn wire_session_callbacks(
                 w.set_dialog_proxy_type(proxy_type.into());
                 w.set_dialog_proxy_hostport(proxy_hostport.into());
                 w.set_dialog_group(session.group.clone().into());
-                w.set_dialog_notes(session.notes.clone().into());
                 w.set_dialog_kind(session.kind.as_str().into());
                 w.set_dialog_serial_port(session.serial_port.clone().into());
                 w.set_dialog_baud(session.baud_rate.to_string().into());
@@ -2153,6 +2074,7 @@ fn wire_session_callbacks(
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
+                w.set_dialog_note(session.note.clone().into());
                 w.set_dialog_editing(true);
                 w.set_dialog_open(true);
             }
@@ -2369,7 +2291,6 @@ fn wire_session_callbacks(
                 proxy: draft.proxy.to_string(),
                 last_used: None,
                 group: draft.group.to_string(),
-                notes: draft.notes.to_string(),
                 kind,
                 serial_port: draft.serial_port.to_string(),
                 baud_rate: if draft.baud_rate <= 0 {
@@ -2383,6 +2304,7 @@ fn wire_session_callbacks(
                 flow_control: draft.flow_control.to_string(),
                 forwards: edit_forwards.borrow().clone(),
                 disable_shell_integration: draft.disable_shell_integration,
+                note: draft.note.to_string(),
             };
             {
                 let mut s = store.borrow_mut();
@@ -2499,7 +2421,6 @@ fn wire_session_callbacks(
         let local_snap = local_snap.clone();
         let local_net_hist = local_net_hist.clone();
         let sftp_follow_cd = sftp_follow_cd.clone();
-        let image_entries = image_entries.clone();
         window.on_connect_session(move |id: SharedString| {
             let id = id.to_string();
             let session = match store.borrow().get(&id).cloned() {
@@ -2636,7 +2557,6 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
-                image_entries: image_entries.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -2691,8 +2611,6 @@ struct ConnectCtx {
     last_term_size: Arc<Mutex<(u32, u32)>>,
     /// Interface setting: SFTP panel follows the terminal's cd (OSC 7).
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
-    /// Image file paths in the current SFTP directory, shared with image viewer callbacks.
-    image_entries: Arc<Mutex<Vec<String>>>,
 }
 
 /// Spawn the shell (+ SFTP) workers and their event-pump threads for an
@@ -2749,7 +2667,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let local_pump = ctx.local_snap.clone();
         let net_pump = ctx.local_net_hist.clone();
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
-        let image_entries_pump = ctx.image_entries.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
@@ -2842,12 +2759,11 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let st_evt = statuses_pump.clone();
                 let lc_evt = local_pump.clone();
                 let nh_evt = net_pump.clone();
-                let ie_evt = image_entries_pump.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = weak_evt.upgrade() {
                         for evt in ui_batch {
                             apply_session_event_to_window(
-                                &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt, &ie_evt,
+                                &win, &tid, evt, &bufs_evt, &st_evt, &lc_evt, &nh_evt,
                             );
                         }
                     }
@@ -2864,7 +2780,6 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let statuses_sftp = ctx.tab_statuses.clone();
         let local_sftp = ctx.local_snap.clone();
         let net_sftp = ctx.local_net_hist.clone();
-        let ie_sftp = ctx.image_entries.clone();
         std::thread::spawn(move || {
             let mut sftp_rx = sftp_evt_tx;
             loop {
@@ -2877,11 +2792,10 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         let st_s = statuses_sftp.clone();
                         let lc_s = local_sftp.clone();
                         let nh_s = net_sftp.clone();
-                        let ie_s = ie_sftp.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             if let Some(win) = weak_s.upgrade() {
                                 apply_session_event_to_window(
-                                    &win, &tid, sftp_evt, &bufs_s, &st_s, &lc_s, &nh_s, &ie_s,
+                                    &win, &tid, sftp_evt, &bufs_s, &st_s, &lc_s, &nh_s,
                                 );
                             }
                         });
@@ -2944,24 +2858,6 @@ fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Build the GPU model for the sidebar from local GPU snapshots.
-fn gpu_model(gpus: &[crate::system::GpuSnapshot]) -> ModelRc<GpuInfo> {
-    let rows: Vec<GpuInfo> = gpus
-        .iter()
-        .map(|g| GpuInfo {
-            label: format!("GPU{}", g.index).into(),
-            detail: format_mem(g.vram_used_mib, g.vram_total_mib).into(),
-            percent: g.gpu_percent,
-        })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
-}
-
-/// Build the GPU model for the sidebar from remote GPU data.
-fn gpu_model_remote(gpus: &[crate::system::GpuSnapshot]) -> ModelRc<GpuInfo> {
-    gpu_model(gpus)
 }
 
 /// Build the process-monitor model for the popup (#23). `cpu`/`mem` are
@@ -3099,6 +2995,7 @@ fn quick_cmd_model(
                 group_header: group.clone().into(),
                 collapsed: is_collapsed,
                 orig_index: -1,
+                send_enter: true,
             });
         } else {
             for (i, (orig_idx, c)) in members.iter().enumerate() {
@@ -3113,6 +3010,7 @@ fn quick_cmd_model(
                     },
                     collapsed: is_collapsed,
                     orig_index: *orig_idx as i32,
+                    send_enter: c.send_enter,
                 });
             }
         }
@@ -3471,6 +3369,13 @@ fn selected_iface(st: &TabStatus) -> (String, u64, u64) {
 /// for whichever tab is active.  Welcome tab → local machine; a session tab →
 /// that server.  The bottom network graph is always the local machine.
 /// Must run on the Slint event loop thread.
+/// The copyable IP/host from a `user@host` connection label (#192): the part
+/// after the last `@`, trimmed. Falls back to the whole string when there's no
+/// `@` (already a bare host/IP).
+fn conn_ip(host: &str) -> String {
+    host.rsplit('@').next().unwrap_or(host).trim().to_string()
+}
+
 fn refresh_sidebar(
     win: &AppWindow,
     statuses: &TabStatuses,
@@ -3508,7 +3413,6 @@ fn refresh_sidebar(
         win.set_swap_percent(snap.swap_percent);
         win.set_mem_detail(format_mem(snap.mem_used_mib, snap.mem_total_mib).into());
         win.set_swap_detail(format_mem(snap.swap_used_mib, snap.swap_total_mib).into());
-        win.set_gpus(gpu_model(&snap.gpus));
     };
     let clear_stats = |win: &AppWindow| {
         win.set_cpu_percent(0.0);
@@ -3516,7 +3420,6 @@ fn refresh_sidebar(
         win.set_swap_percent(0.0);
         win.set_mem_detail("".into());
         win.set_swap_detail("".into());
-        win.set_gpus(ModelRc::from(Rc::new(VecModel::<GpuInfo>::default())));
     };
 
     // Process monitor (#23) lives in a shared model (the AppWindow and the
@@ -3548,6 +3451,7 @@ fn refresh_sidebar(
         Some(st) if st.state == 1 => {
             win.set_conn_state(1);
             win.set_connection_state(st.host.clone().into());
+            win.set_conn_host(conn_ip(&st.host).into());
             win.set_resource_title(t("服务器资源", "Server resources").into());
             win.set_cpu_percent(st.cpu);
             win.set_mem_percent(pct(st.mem_used_kib, st.mem_total_kib));
@@ -3556,7 +3460,6 @@ fn refresh_sidebar(
             win.set_swap_detail(
                 format_mem(st.swap_used_kib / 1024, st.swap_total_kib / 1024).into(),
             );
-            win.set_gpus(gpu_model_remote(&st.gpus));
             let (name, rx, tx) = selected_iface(&st);
             win.set_net_top_up(format_bytes_per_sec(tx).into());
             win.set_net_top_down(format_bytes_per_sec(rx).into());
@@ -3573,6 +3476,7 @@ fn refresh_sidebar(
         Some(st) if st.state == 2 => {
             win.set_conn_state(2);
             win.set_connection_state(format!("{} {}", st.host, t("已断开", "disconnected")).into());
+            win.set_conn_host(conn_ip(&st.host).into());
             win.set_resource_title(t("服务器资源", "Server resources").into());
             clear_stats(win);
             set_top_local(win);
@@ -3581,6 +3485,7 @@ fn refresh_sidebar(
         Some(st) => {
             win.set_conn_state(0);
             win.set_connection_state(format!("{} {}", t("连接中", "Connecting"), st.host).into());
+            win.set_conn_host(conn_ip(&st.host).into());
             win.set_resource_title(t("服务器资源", "Server resources").into());
             clear_stats(win);
             set_top_local(win);
@@ -3589,6 +3494,7 @@ fn refresh_sidebar(
         None => {
             win.set_conn_state(0);
             win.set_connection_state(t("未连接", "Not connected").into());
+            win.set_conn_host("".into());
             show_local_res(win);
             set_top_local(win);
         }
@@ -3597,7 +3503,6 @@ fn refresh_sidebar(
 
 /// Apply a session event to the live UI models. Must be called on the Slint
 /// event loop thread.
-#[allow(clippy::too_many_arguments)]
 fn apply_session_event_to_window(
     win: &AppWindow,
     tab_id: &str,
@@ -3606,7 +3511,6 @@ fn apply_session_event_to_window(
     statuses: &TabStatuses,
     local: &LocalSnap,
     local_net_hist: &NetHist,
-    image_entries: &Arc<Mutex<Vec<String>>>,
 ) {
     let tabs_rc = win.get_tabs();
     let terminals_rc = win.get_terminals();
@@ -3742,7 +3646,6 @@ fn apply_session_event_to_window(
                 statuses,
                 local,
                 local_net_hist,
-                image_entries,
             );
             update_tab(&|t| t.connected = false);
             update_terminal(&|t| {
@@ -3764,7 +3667,7 @@ fn apply_session_event_to_window(
             net,
             disks,
             procs,
-            gpus,
+            ..
         } => {
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.cpu = cpu_percent;
@@ -3775,7 +3678,6 @@ fn apply_session_event_to_window(
                 st.net = net;
                 st.disks = disks;
                 st.procs = procs;
-                st.gpus = gpus;
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;
@@ -3801,31 +3703,35 @@ fn apply_session_event_to_window(
         SessionEvent::SftpEntries { path, entries } => {
             let slint_entries: Vec<SftpEntry> = entries
                 .iter()
-                .map(|e| SftpEntry {
-                    name: e.name.clone().into(),
-                    full_path: e.full_path.clone().into(),
-                    is_dir: e.is_dir,
-                    is_image: {
-                        let lower = e.name.to_lowercase();
-                        lower.ends_with(".png")
-                            || lower.ends_with(".jpg")
-                            || lower.ends_with(".jpeg")
-                            || lower.ends_with(".gif")
-                            || lower.ends_with(".webp")
-                            || lower.ends_with(".bmp")
-                            || lower.ends_with(".ico")
-                            || lower.ends_with(".tiff")
-                            || lower.ends_with(".tif")
-                            || lower.ends_with(".svg")
-                    },
-                    size: if e.is_dir {
-                        "".into()
-                    } else {
-                        format_size(e.size).into()
-                    },
-                    modified: format_mtime(e.modified).into(),
-                    mode: (e.mode & 0o7777) as i32,
-                    selected: false,
+                .map(|e| {
+                    let ext = e.name.rsplit('.').next().unwrap_or("");
+                    let is_image = matches!(
+                        ext,
+                        "png"
+                            | "jpg"
+                            | "jpeg"
+                            | "gif"
+                            | "bmp"
+                            | "webp"
+                            | "svg"
+                            | "ico"
+                            | "tiff"
+                            | "tif"
+                    );
+                    SftpEntry {
+                        name: e.name.clone().into(),
+                        full_path: e.full_path.clone().into(),
+                        is_dir: e.is_dir,
+                        is_image,
+                        size: if e.is_dir {
+                            "".into()
+                        } else {
+                            format_size(e.size).into()
+                        },
+                        modified: format_mtime(e.modified).into(),
+                        mode: (e.mode & 0o7777) as i32,
+                        selected: false,
+                    }
                 })
                 .collect();
             let model = ModelRc::from(std::rc::Rc::new(VecModel::from(slint_entries)));
@@ -3834,27 +3740,6 @@ fn apply_session_event_to_window(
                 t.sftp_entries = model.clone();
                 t.sftp_loading = false;
             });
-            // Populate the shared image-entries list for the image viewer.
-            let image_paths: Vec<String> = entries
-                .iter()
-                .filter(|e| {
-                    !e.is_dir && {
-                        let lower = e.name.to_lowercase();
-                        lower.ends_with(".png")
-                            || lower.ends_with(".jpg")
-                            || lower.ends_with(".jpeg")
-                            || lower.ends_with(".gif")
-                            || lower.ends_with(".webp")
-                            || lower.ends_with(".bmp")
-                            || lower.ends_with(".ico")
-                            || lower.ends_with(".tiff")
-                            || lower.ends_with(".tif")
-                            || lower.ends_with(".svg")
-                    }
-                })
-                .map(|e| e.full_path.clone())
-                .collect();
-            *image_entries.lock().unwrap() = image_paths;
         }
         SessionEvent::SftpStatus(msg) => {
             update_terminal(&|t| t.sftp_status = msg.clone().into());
@@ -3900,7 +3785,6 @@ fn apply_session_event_to_window(
                     statuses,
                     local,
                     local_net_hist,
-                    image_entries,
                 );
                 update_terminal(&|t| t.sftp_status = error.clone().into());
             }
@@ -4037,29 +3921,8 @@ fn apply_session_event_to_window(
                 }
             });
         }
-        SessionEvent::SftpImageLoaded {
-            path: _,
-            name,
-            index,
-            total,
-            width,
-            height,
-            data,
-            error,
-        } => {
-            if error.is_empty() && !data.is_empty() {
-                let buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
-                    &data, width, height,
-                );
-                win.set_image_viewer_preview(slint::Image::from_rgba8(buf));
-                win.set_image_viewer_error("".into());
-            } else if !error.is_empty() {
-                win.set_image_viewer_error(error.into());
-            }
-            win.set_image_viewer_name(name.into());
-            win.set_image_viewer_index(index as i32);
-            win.set_image_viewer_total(total as i32);
-            win.set_image_viewer_open(true);
+        SessionEvent::SftpImageLoaded { .. } => {
+            // Image viewer callback — no-op until the viewer is wired up.
         }
     }
 }
@@ -5225,7 +5088,8 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
             let path = path.to_string();
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(&tab_id) {
-                    h.list_dir(path);
+                    // Refresh re-syncs the left tree too, not just the file list (#189).
+                    h.refresh_dir(path);
                 }
             }
         });
@@ -5706,7 +5570,10 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_add_quick_command(
-            move |name: SharedString, command: SharedString, group: SharedString| {
+            move |name: SharedString,
+                  command: SharedString,
+                  group: SharedString,
+                  send_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
@@ -5720,6 +5587,7 @@ fn wire_key_input(
                         name,
                         command,
                         group,
+                        send_enter,
                     });
                     s.set_quick_commands(v);
                     let _ = s.save();
@@ -5778,6 +5646,7 @@ fn wire_key_input(
                 w.set_qcm_name(c.name.into());
                 w.set_qcm_command(c.command.into());
                 w.set_qcm_group(c.group.into());
+                w.set_qcm_send_enter(c.send_enter);
                 w.set_qcm_edit_index(index);
                 w.set_quick_cmd_manage_open(true);
             }
@@ -5789,7 +5658,11 @@ fn wire_key_input(
         let weak = window.as_weak();
         let collapsed = collapsed_quick_groups.clone();
         window.on_save_quick_command(
-            move |index: i32, name: SharedString, command: SharedString, group: SharedString| {
+            move |index: i32,
+                  name: SharedString,
+                  command: SharedString,
+                  group: SharedString,
+                  send_enter: bool| {
                 let name = name.trim().to_string();
                 let command = command.to_string();
                 let group = group.trim().to_string();
@@ -5804,6 +5677,7 @@ fn wire_key_input(
                             name,
                             command,
                             group,
+                            send_enter,
                         },
                     );
                     let _ = s.save();
@@ -5828,6 +5702,7 @@ fn wire_key_input(
                         name: format!("{} (copy)", c.name),
                         command: c.command,
                         group: c.group,
+                        send_enter: c.send_enter,
                     };
                     v.insert(index as usize + 1, dup);
                     s.set_quick_commands(v);
@@ -6885,19 +6760,25 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
         "\u{F72B}" => Some(b"\x1b[F"),                                      // End
         "\u{F72C}" => Some(b"\x1b[5~"),                                     // PageUp
         "\u{F72D}" => Some(b"\x1b[6~"),                                     // PageDown
-        "\u{F728}" => Some(b"\x1b[3~"),                                     // Delete (forward)
-        "\u{F704}" => Some(b"\x1bOP"),                                      // F1
-        "\u{F705}" => Some(b"\x1bOQ"),                                      // F2
-        "\u{F706}" => Some(b"\x1bOR"),                                      // F3
-        "\u{F707}" => Some(b"\x1bOS"),                                      // F4
-        "\u{F708}" => Some(b"\x1b[15~"),                                    // F5
-        "\u{F709}" => Some(b"\x1b[17~"),                                    // F6
-        "\u{F70A}" => Some(b"\x1b[18~"),                                    // F7
-        "\u{F70B}" => Some(b"\x1b[19~"),                                    // F8
-        "\u{F70C}" => Some(b"\x1b[20~"),                                    // F9
-        "\u{F70D}" => Some(b"\x1b[21~"),                                    // F10
-        "\u{F70E}" => Some(b"\x1b[23~"),                                    // F11
-        "\u{F70F}" => Some(b"\x1b[24~"),                                    // F12
+        // Forward-Delete. Slint's canonical key code for the Delete key is
+        // U+007F (see i-slint-common key_codes: F728 is explicitly *not* used,
+        // it collapses to the 0x7f control code). The old F728 mapping never
+        // matched on any platform, so Delete fell through to the generic path
+        // and behaved like backspace / garbled the char instead of sending the
+        // VT "delete forward" sequence (B站 fan report).
+        "\u{007F}" | "\u{F728}" => Some(b"\x1b[3~"), // Delete (forward)
+        "\u{F704}" => Some(b"\x1bOP"),               // F1
+        "\u{F705}" => Some(b"\x1bOQ"),               // F2
+        "\u{F706}" => Some(b"\x1bOR"),               // F3
+        "\u{F707}" => Some(b"\x1bOS"),               // F4
+        "\u{F708}" => Some(b"\x1b[15~"),             // F5
+        "\u{F709}" => Some(b"\x1b[17~"),             // F6
+        "\u{F70A}" => Some(b"\x1b[18~"),             // F7
+        "\u{F70B}" => Some(b"\x1b[19~"),             // F8
+        "\u{F70C}" => Some(b"\x1b[20~"),             // F9
+        "\u{F70D}" => Some(b"\x1b[21~"),             // F10
+        "\u{F70E}" => Some(b"\x1b[23~"),             // F11
+        "\u{F70F}" => Some(b"\x1b[24~"),             // F12
         _ => None,
     };
     if let Some(seq) = special {
