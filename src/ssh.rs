@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{AuthMethod, Session};
 use crate::i18n::t;
+use crate::system::GpuSnapshot;
 
 // ---------------------------------------------------------------------------
 // SFTP-related shared types
@@ -417,6 +418,8 @@ pub enum SessionEvent {
         disks: Vec<(String, u64, u64)>,
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
+        /// Per-GPU stats from nvidia-smi. Empty when unavailable.
+        gpus: Vec<GpuSnapshot>,
     },
 
     /// A command the user ran in the terminal, captured via the shell hook
@@ -969,7 +972,7 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __GPU__; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
     // Skip the resource monitor entirely when shell integration is off (a
     // non-POSIX / Windows server) — the /proc-based loop only spews errors there
     // (#140).
@@ -1326,12 +1329,14 @@ fn parse_monitor_block(
     let mut seen_fs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     // Processes from `ps` (#23): top-by-CPU rows.
     let mut procs: Vec<ProcInfo> = Vec::new();
+    let mut gpus: Vec<GpuSnapshot> = Vec::new();
     // The sample is split into sections by `echo` markers; everything before the
     // first marker is the cpu/mem/net block.
     enum Section {
         Top,
         Df,
         Ps,
+        Gpu,
     }
     let mut section = Section::Top;
 
@@ -1347,6 +1352,10 @@ fn parse_monitor_block(
         }
         if line == "__PS__" {
             section = Section::Ps;
+            continue;
+        }
+        if line == "__GPU__" {
+            section = Section::Gpu;
             continue;
         }
         match section {
@@ -1367,6 +1376,26 @@ fn parse_monitor_block(
                 if procs.len() < MAX_MON_ENTRIES {
                     if let Some(p) = parse_ps_line(line) {
                         procs.push(p);
+                    }
+                }
+                continue;
+            }
+            Section::Gpu => {
+                if gpus.len() < MAX_MON_ENTRIES {
+                    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+                    if parts.len() >= 3 {
+                        if let (Ok(util), Ok(used), Ok(total)) = (
+                            parts[0].parse::<f32>(),
+                            parts[1].parse::<u64>(),
+                            parts[2].parse::<u64>(),
+                        ) {
+                            gpus.push(GpuSnapshot {
+                                index: gpus.len() as u32,
+                                gpu_percent: (util / 100.0).clamp(0.0, 1.0),
+                                vram_used_mib: used,
+                                vram_total_mib: total,
+                            });
+                        }
                     }
                 }
                 continue;
@@ -1455,6 +1484,7 @@ fn parse_monitor_block(
         net,
         disks,
         procs,
+        gpus,
     })
 }
 
@@ -1861,6 +1891,24 @@ mod monitor_hardening_tests {
         assert!(parse_monitor_block(&block, &mut prev, &mut prev_net, &mut at).is_some());
         // The remembered interface set is capped, not 500.
         assert!(prev_net.len() <= 64, "prev_net held {}", prev_net.len());
+    }
+
+    #[test]
+    fn parses_multiple_remote_gpus() {
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__GPU__\n45, 2048, 16384\n0, 0, 8192";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let Some(super::SessionEvent::ResourceStats { gpus, .. }) =
+            parse_monitor_block(block, &mut prev, &mut prev_net, &mut at)
+        else {
+            panic!("expected resource stats");
+        };
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].index, 0);
+        assert_eq!(gpus[0].vram_used_mib, 2048);
+        assert_eq!(gpus[1].index, 1);
+        assert_eq!(gpus[1].gpu_percent, 0.0);
     }
 }
 

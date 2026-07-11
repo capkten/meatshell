@@ -135,7 +135,7 @@ use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
     format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent, SessionHandle,
 };
-use crate::system::{format_bytes_per_sec, format_mem, SystemSampler, SystemSnapshot};
+use crate::system::{format_bytes_per_sec, format_mem, GpuSnapshot, SystemSampler, SystemSnapshot};
 
 fn tab_title_len(title: &str) -> i32 {
     title
@@ -177,6 +177,7 @@ struct TabStatus {
     disks: Vec<(String, u64, u64)>,
     /// Top remote processes by CPU, for the process monitor popup (#23).
     procs: Vec<ProcInfo>,
+    gpus: Vec<GpuSnapshot>,
 }
 type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 /// Last local-machine sample (shown on the welcome tab).
@@ -3869,6 +3870,18 @@ fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
+fn gpu_model(gpus: &[GpuSnapshot]) -> ModelRc<GpuInfo> {
+    let rows: Vec<GpuInfo> = gpus
+        .iter()
+        .map(|gpu| GpuInfo {
+            label: format!("GPU{}", gpu.index).into(),
+            detail: format_mem(gpu.vram_used_mib, gpu.vram_total_mib).into(),
+            percent: gpu.gpu_percent,
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
 /// Build the process-monitor model for the popup (#23). `cpu`/`mem` are
 /// pre-formatted to one decimal; `cpu_frac` (0..1) drives the row's load bar.
 fn proc_rows(procs: &[ProcInfo]) -> Vec<ProcRow> {
@@ -4424,6 +4437,7 @@ fn refresh_sidebar(
         win.set_net_ifaces(ModelRc::from(Rc::new(VecModel::<SharedString>::default())));
         // Non-connected tabs show the local machine's filesystems.
         win.set_disks(disk_model(&snap.disks));
+        win.set_gpus(gpu_model(&snap.gpus));
     };
     let show_local_res = |win: &AppWindow| {
         win.set_resource_title(t("本机资源", "Local resources").into());
@@ -4432,6 +4446,7 @@ fn refresh_sidebar(
         win.set_swap_percent(snap.swap_percent);
         win.set_mem_detail(format_mem(snap.mem_used_mib, snap.mem_total_mib).into());
         win.set_swap_detail(format_mem(snap.swap_used_mib, snap.swap_total_mib).into());
+        win.set_gpus(gpu_model(&snap.gpus));
     };
     let clear_stats = |win: &AppWindow| {
         win.set_cpu_percent(0.0);
@@ -4439,6 +4454,7 @@ fn refresh_sidebar(
         win.set_swap_percent(0.0);
         win.set_mem_detail("".into());
         win.set_swap_detail("".into());
+        win.set_gpus(ModelRc::from(Rc::new(VecModel::<GpuInfo>::default())));
     };
 
     // Process monitor (#23) lives in a shared model (the AppWindow and the
@@ -4488,6 +4504,7 @@ fn refresh_sidebar(
             let ifaces: Vec<SharedString> = st.net.iter().map(|e| e.0.clone().into()).collect();
             win.set_net_ifaces(ModelRc::from(Rc::new(VecModel::from(ifaces))));
             win.set_disks(disk_model(&st.disks));
+            win.set_gpus(gpu_model(&st.gpus));
             win.set_proc_available(true);
             set_procs(win, &st.procs);
         }
@@ -4650,6 +4667,7 @@ fn apply_session_event_to_window(
             net,
             disks,
             procs,
+            gpus,
         } => {
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.cpu = cpu_percent;
@@ -4660,6 +4678,7 @@ fn apply_session_event_to_window(
                 st.net = net;
                 st.disks = disks;
                 st.procs = procs;
+                st.gpus = gpus;
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;

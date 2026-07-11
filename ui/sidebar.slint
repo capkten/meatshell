@@ -8,6 +8,12 @@ export struct DiskInfo {
     percent: float,   // used fraction 0.0..1.0
 }
 
+export struct GpuInfo {
+    label: string,
+    detail: string,
+    percent: float,
+}
+
 // --- StatRow ---------------------------------------------------------------
 // A single label / percentage / progress-bar row used for CPU / memory / swap.
 component StatRow inherits HorizontalLayout {
@@ -295,6 +301,7 @@ component StatsBlock inherits VerticalLayout {
     in property <float> swap-percent;
     in property <string> mem-detail;
     in property <string> swap-detail;
+    in property <[GpuInfo]> gpus;
     callback show-processes();
     spacing: 6px;
     HorizontalLayout {
@@ -313,6 +320,9 @@ component StatsBlock inherits VerticalLayout {
     StatRow { label: "CPU"; percent: root.cpu-percent; detail: ""; bar-color: Theme.accent; }
     StatRow { label: @tr("Memory"); percent: root.mem-percent; detail: root.mem-detail; bar-color: Theme.success; }
     StatRow { label: @tr("Swap"); percent: root.swap-percent; detail: root.swap-detail; bar-color: Theme.warning; }
+    for gpu in root.gpus : StatRow {
+        label: gpu.label; percent: gpu.percent; detail: gpu.detail; bar-color: #a855f7;
+    }
 }
 
 // Dual network graph (active tab on top, local below).
@@ -421,6 +431,7 @@ export component Sidebar inherits Rectangle {
     in property <bool> net-show-selector;
     in property <[DiskInfo]> disks;
     in property <bool> proc-available;   // a live remote session → show the process button (#23)
+    in property <[GpuInfo]> gpus;
     // App version string, injected from Rust (env!("CARGO_PKG_VERSION")) so it
     // always matches Cargo.toml without hand-editing this file.
     in property <string> app-version;
@@ -492,6 +503,7 @@ export component Sidebar inherits Rectangle {
                 resource-title: root.resource-title; proc-available: root.proc-available;
                 cpu-percent: root.cpu-percent; mem-percent: root.mem-percent; swap-percent: root.swap-percent;
                 mem-detail: root.mem-detail; swap-detail: root.swap-detail;
+                gpus: root.gpus;
                 show-processes() => { root.show-processes(); }
             }
             Rectangle { height: 1px; background: Theme.border-subtle; }
@@ -545,6 +557,7 @@ export component Sidebar inherits Rectangle {
                     resource-title: root.resource-title; proc-available: root.proc-available;
                     cpu-percent: root.cpu-percent; mem-percent: root.mem-percent; swap-percent: root.swap-percent;
                     mem-detail: root.mem-detail; swap-detail: root.swap-detail;
+                    gpus: root.gpus;
                     show-processes() => { root.show-processes(); }
                 }
             }
