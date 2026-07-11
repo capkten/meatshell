@@ -90,6 +90,14 @@ pub enum SftpCommand {
     TouchFile(String),
     /// Read a remote file's text for the built-in viewer/editor (#70).
     ReadText { remote: String, edit: bool },
+    /// Read a bounded remote raster image for the image viewer.
+    ReadBytes {
+        remote: String,
+        max_bytes: u64,
+        index: usize,
+        total: usize,
+        gen: i32,
+    },
     /// Overwrite a remote file with text from the built-in editor (#70).
     WriteText { remote: String, content: String },
     /// Gracefully shut down the SFTP worker.
@@ -167,6 +175,15 @@ impl SftpHandle {
     }
     pub fn read_text(&self, remote: String, edit: bool) {
         let _ = self.commands.send(SftpCommand::ReadText { remote, edit });
+    }
+    pub fn read_bytes(&self, remote: String, max_bytes: u64, index: usize, total: usize, gen: i32) {
+        let _ = self.commands.send(SftpCommand::ReadBytes {
+            remote,
+            max_bytes,
+            index,
+            total,
+            gen,
+        });
     }
     pub fn write_text(&self, remote: String, content: String) {
         let _ = self
@@ -1313,6 +1330,42 @@ async fn run_sftp(
                     error,
                 });
             }
+            SftpCommand::ReadBytes {
+                remote,
+                max_bytes,
+                index,
+                total,
+                gen,
+            } => {
+                let name = base_name(&remote);
+                let (width, height, data, error) =
+                    match read_bytes_guarded(&sftp, &remote, max_bytes).await {
+                        Ok(bytes) => match image::load_from_memory(&bytes) {
+                            Ok(image) => {
+                                let rgba = image.to_rgba8();
+                                (rgba.width(), rgba.height(), rgba.into_raw(), String::new())
+                            }
+                            Err(err) => (
+                                0,
+                                0,
+                                Vec::new(),
+                                format!("{}: {err}", t("图片解码失败", "Image decode failed")),
+                            ),
+                        },
+                        Err(error) => (0, 0, Vec::new(), error),
+                    };
+                let _ = events.send(SessionEvent::SftpImageLoaded {
+                    path: remote,
+                    name,
+                    index,
+                    total,
+                    width,
+                    height,
+                    data,
+                    error,
+                    gen,
+                });
+            }
             SftpCommand::WriteText { remote, content } => {
                 let name = base_name(&remote);
                 match write_text_file(&sftp, &remote, &content).await {
@@ -1385,6 +1438,40 @@ async fn read_text_guarded(
     }
     String::from_utf8(bytes)
         .map_err(|_| t("非 UTF-8 文本,无法打开", "Not UTF-8 text; cannot open").into())
+}
+
+async fn read_bytes_guarded(
+    sftp: &SftpSession,
+    remote: &str,
+    max_bytes: u64,
+) -> std::result::Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let size = sftp
+        .metadata(remote)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.size)
+        .unwrap_or(0);
+    if size > max_bytes {
+        return Err(format!(
+            "{} ({} > {})",
+            t("图片文件过大", "Image file too large"),
+            size,
+            max_bytes
+        ));
+    }
+    let mut file = sftp
+        .open(remote)
+        .await
+        .map_err(|err| format!("{}: {err}", t("打开失败", "Open failed")))?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.read_to_end(&mut bytes)
+        .await
+        .map_err(|err| format!("{}: {err}", t("读取失败", "Read failed")))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(t("图片文件过大", "Image file too large").into());
+    }
+    Ok(bytes)
 }
 
 /// Overwrite a remote file with the given text (CREATE | WRITE | TRUNCATE).
@@ -1728,6 +1815,7 @@ async fn list_dirs_only_impl(sftp: &SftpSession, path: &str) -> Result<Vec<(Stri
 }
 
 /// Emit a transfer-progress event.
+#[allow(clippy::too_many_arguments)]
 fn emit_transfer(
     events: &UnboundedSender<SessionEvent>,
     id: &str,

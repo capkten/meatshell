@@ -25,6 +25,7 @@ import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint
 import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { InterfacePanel } from "interface_panel.slint";
+import { ImageViewer } from "image_viewer.slint";
 // Re-export so `slint::include_modules!` generates the ProcWindow Rust type.
 export { ProcWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
@@ -697,6 +698,18 @@ export component AppWindow inherits Window {
     callback sftp-edit-external(string /* tab-id */, string /* path */);
     callback sftp-sort-request(string /* tab-id */, string /* key */);
     callback sftp-clear-sort(string /* tab-id */);
+    in-out property <bool> image-viewer-open: false;
+    in-out property <bool> image-viewer-loading: false;
+    in-out property <int> image-viewer-gen: 0;
+    in-out property <string> image-viewer-name;
+    in-out property <string> image-viewer-tab;
+    in-out property <int> image-viewer-index;
+    in-out property <int> image-viewer-total;
+    in-out property <image> image-viewer-preview;
+    in-out property <string> image-viewer-error;
+    callback image-viewer-close();
+    callback image-viewer-prev();
+    callback image-viewer-next();
     // SFTP context-menu extensions (#69): rename / chmod / mkdir / touch share
     // one single-input prompt dialog; copy-path goes straight to the clipboard.
     in-out property <bool> sftp-prompt-open: false;
@@ -3614,5 +3627,17 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.image-viewer-open : ImageViewer {
+        file-name: root.image-viewer-name;
+        index: root.image-viewer-index;
+        total: root.image-viewer-total;
+        preview-image: root.image-viewer-preview;
+        error-msg: root.image-viewer-error;
+        loading: root.image-viewer-loading;
+        close() => { root.image-viewer-close(); }
+        prev() => { root.image-viewer-prev(); }
+        next() => { root.image-viewer-next(); }
     }
 }

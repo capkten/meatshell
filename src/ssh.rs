@@ -461,6 +461,19 @@ pub enum SessionEvent {
         edit: bool,
         error: String,
     },
+    /// A remote raster image decoded to RGBA for the image viewer.
+    #[allow(dead_code)]
+    SftpImageLoaded {
+        path: String,
+        name: String,
+        index: usize,
+        total: usize,
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+        error: String,
+        gen: i32,
+    },
 }
 
 /// Handle retained by the UI layer to talk to a running session.
@@ -656,18 +669,16 @@ pub(crate) async fn authenticate_session(
             }
             ok
         }
-        AuthMethod::KeyboardInteractive => {
-            keyboard_interactive_auth(
-                handle,
-                &user,
-                password.as_str(),
-                &session.id,
-                &session.host,
-                events,
-            )
-            .await
-            .context("keyboard-interactive auth failed")?
-        }
+        AuthMethod::KeyboardInteractive => keyboard_interactive_auth(
+            handle,
+            &user,
+            password.as_str(),
+            &session.id,
+            &session.host,
+            events,
+        )
+        .await
+        .context("keyboard-interactive auth failed")?,
         AuthMethod::Key => {
             // An encrypted private key needs its passphrase; we reuse the
             // session's password field for it (empty = unencrypted key) (#90).
@@ -1128,7 +1139,7 @@ async fn run_session(
                                     let _ = events.send(SessionEvent::Output(format!(
                                         "\r\n[meatshell] {}: {e}\r\n",
                                         t("ZMODEM 接收失败,已取消", "ZMODEM receive failed; cancelled")
-                                    ).into()));
+                                    )));
                                 }
                             }
                             continue;
@@ -1448,7 +1459,7 @@ fn parse_monitor_block(
         }
         *prev_net_at = now;
         // Show busiest first so the default-selected NIC is the active one.
-        net.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        net.sort_by_key(|b| std::cmp::Reverse(b.1 + b.2));
     }
 
     let cpu_percent = if have_cpu {

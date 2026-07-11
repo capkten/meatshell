@@ -146,6 +146,7 @@ fn tab_title_len(title: &str) -> i32 {
 }
 
 type SftpHandles = Arc<Mutex<HashMap<String, SftpHandle>>>;
+type ImageEntries = Arc<Mutex<HashMap<String, Vec<String>>>>;
 /// Per-tab flag: once the user explicitly navigates via the SFTP tree or
 /// toolbar, stop auto-syncing to the terminal's `cd` path.
 /// Per-tab last cwd the SFTP panel followed (from OSC 7). Used to ignore the
@@ -284,10 +285,8 @@ fn do_tab_render_flush(
         }
     }
 
-    if gate.pending.swap(false, Ordering::AcqRel) {
-        if !gate.scheduled.swap(true, Ordering::AcqRel) {
-            run_coalesced_tab_render(weak, tab_id, bufs, gates);
-        }
+    if gate.pending.swap(false, Ordering::AcqRel) && !gate.scheduled.swap(true, Ordering::AcqRel) {
+        run_coalesced_tab_render(weak, tab_id, bufs, gates);
     }
 }
 
@@ -334,8 +333,12 @@ fn set_window_icon(window: &AppWindow) {
 fn apply_window_chrome(window: &slint::Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     window.with_winit_window(|ww| {
-        let Ok(handle) = ww.window_handle() else { return };
-        let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+        let Ok(handle) = ww.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(h) = handle.as_raw() else {
+            return;
+        };
         let hwnd = h.hwnd.get();
 
         #[link(name = "dwmapi")]
@@ -358,9 +361,7 @@ fn apply_window_chrome(window: &slint::Window) {
                 (&pref as *const u32).cast(),
                 4,
             );
-            tracing::debug!(
-                "window chrome applied: hwnd={hwnd:#x} corner_hr={corner_hr:#x}"
-            );
+            tracing::debug!("window chrome applied: hwnd={hwnd:#x} corner_hr={corner_hr:#x}");
         }
     });
 }
@@ -380,9 +381,7 @@ fn setup_windows_platform() {
     }
     let backend = builder
         .with_window_attributes_hook(|attrs| {
-            attrs
-                .with_transparent(false)
-                .with_undecorated_shadow(false)
+            attrs.with_transparent(false).with_undecorated_shadow(false)
         })
         .build();
 
@@ -766,9 +765,9 @@ pub fn run() -> Result<()> {
         // Restore the user's preferred window size, if any (#dock).
         let (ww, wh) = s.window_size();
         if ww > 0.0 && wh > 0.0 {
-            let _ = clamp_window_size_to_monitor(&window.window(), Some((ww, wh)));
+            let _ = clamp_window_size_to_monitor(window.window(), Some((ww, wh)));
         } else {
-            let _ = clamp_window_size_to_monitor(&window.window(), None);
+            let _ = clamp_window_size_to_monitor(window.window(), None);
         }
     }
     {
@@ -1102,7 +1101,7 @@ pub fn run() -> Result<()> {
     let tabs_model: Rc<VecModel<TabInfo>> = Rc::new(VecModel::default());
     tabs_model.push(TabInfo {
         id: "welcome".into(),
-        title_len: tab_title_len(&t("新标签页", "New tab")),
+        title_len: tab_title_len(t("新标签页", "New tab")),
         title: t("新标签页", "New tab").into(),
         kind: "welcome".into(),
         connected: false,
@@ -1241,6 +1240,7 @@ pub fn run() -> Result<()> {
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
+    let image_entries: ImageEntries = Arc::new(Mutex::new(HashMap::new()));
 
     // --- Wire callbacks --------------------------------------------------
     wire_session_callbacks(
@@ -1264,6 +1264,7 @@ pub fn run() -> Result<()> {
         local_snap.clone(),
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
+        image_entries.clone(),
     );
 
     // Recompute the sidebar whenever the active tab changes (fired from Slint's
@@ -1288,7 +1289,7 @@ pub fn run() -> Result<()> {
         let store = store.clone();
         let tabs_model = tabs_model.clone();
         window.on_set_language(move |code| {
-            crate::i18n::set_language(&code.to_string());
+            crate::i18n::set_language(code.as_ref());
             {
                 let mut s = store.borrow_mut();
                 s.set_language(crate::i18n::current_code().to_string());
@@ -1298,7 +1299,7 @@ pub fn run() -> Result<()> {
             for i in 0..tabs_model.row_count() {
                 if let Some(mut row) = tabs_model.row_data(i) {
                     if row.id.as_str() == "welcome" {
-                        row.title_len = tab_title_len(&t("新标签页", "New tab"));
+                        row.title_len = tab_title_len(t("新标签页", "New tab"));
                         row.title = t("新标签页", "New tab").into();
                         tabs_model.set_row_data(i, row);
                     }
@@ -1610,7 +1611,13 @@ pub fn run() -> Result<()> {
         sftp_handles.clone(),
         sftp_last_cwd.clone(),
     );
-    wire_sftp_callbacks(&window, sftp_handles.clone(), sftp_last_cwd.clone());
+    wire_sftp_callbacks(
+        &window,
+        sftp_handles.clone(),
+        sftp_last_cwd.clone(),
+        image_entries.clone(),
+    );
+    wire_image_viewer_callbacks(&window, sftp_handles.clone(), image_entries.clone());
     wire_key_input(
         &window,
         handles.clone(),
@@ -1630,6 +1637,7 @@ pub fn run() -> Result<()> {
             local_net_hist: local_net_hist.clone(),
             last_term_size: last_term_size.clone(),
             sftp_follow_cd: sftp_follow_cd.clone(),
+            image_entries: image_entries.clone(),
             store: store.clone(),
         },
     );
@@ -2041,7 +2049,14 @@ fn terminal_wheel_hit(
     } else {
         term_state.sftp_panel_height + 4.0
     };
-    shrink_edge(&mut term_x, &mut term_y, &mut term_w, &mut term_h, &sftp_dock, sftp_take);
+    shrink_edge(
+        &mut term_x,
+        &mut term_y,
+        &mut term_w,
+        &mut term_h,
+        &sftp_dock,
+        sftp_take,
+    );
 
     // Leave the command bar to TextInput/history handling; wheel fallback is for
     // terminal output only.
@@ -2104,7 +2119,7 @@ fn contains_logical(rect: LogicalRect, x: f32, y: f32) -> bool {
 
 fn app_content_area(win: &AppWindow) -> LogicalRect {
     let size = win.window().size();
-    let scale = win.window().scale_factor().max(0.01) as f32;
+    let scale = win.window().scale_factor().max(0.01);
     let mut area = LogicalRect {
         x: 0.0,
         y: if win.get_custom_titlebar() {
@@ -2523,6 +2538,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
 // Session callbacks (welcome page + dialog)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn wire_session_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
@@ -2544,6 +2560,7 @@ fn wire_session_callbacks(
     local_snap: LocalSnap,
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    image_entries: ImageEntries,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
@@ -2816,7 +2833,7 @@ fn wire_session_callbacks(
         window.on_remove_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove(&id.to_string());
+                s.remove(id.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -2837,7 +2854,7 @@ fn wire_session_callbacks(
         window.on_duplicate_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut copy = orig;
                     copy.id = uuid::Uuid::new_v4().to_string();
                     copy.name = format!("{} (copy)", copy.name);
@@ -2863,7 +2880,7 @@ fn wire_session_callbacks(
         window.on_move_session(move |id: SharedString, group: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut moved = orig;
                     // "default" is the display label for ungrouped → store empty.
                     moved.group = if group.as_str() == "default" {
@@ -2929,7 +2946,7 @@ fn wire_session_callbacks(
                 if orig.is_empty() {
                     s.add_group(name.to_string());
                 } else {
-                    s.rename_group(&orig.to_string(), name.to_string());
+                    s.rename_group(orig.as_ref(), name.to_string());
                 }
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
@@ -2949,7 +2966,7 @@ fn wire_session_callbacks(
         window.on_delete_group(move |name: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove_group(&name.to_string());
+                s.remove_group(name.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -2999,7 +3016,7 @@ fn wire_session_callbacks(
             } else {
                 draft.private_key_path.to_string().replace('\\', "/")
             };
-            let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
+            let kind = crate::config::SessionKind::from_str(draft.kind.as_ref());
             // Auto-name: serial → port label; otherwise user@host, or just the
             // host when no username was given (#110).
             let auto_name = match kind {
@@ -3029,7 +3046,7 @@ fn wire_session_callbacks(
                     draft.port as u16
                 },
                 user: draft.user.to_string(),
-                auth: AuthMethod::from_str(&draft.auth.to_string()),
+                auth: AuthMethod::from_str(draft.auth.as_ref()),
                 password,
                 // Store the key path with forward slashes uniformly.
                 private_key_path,
@@ -3378,6 +3395,7 @@ fn wire_session_callbacks(
                 local_net_hist: local_net_hist.clone(),
                 last_term_size: last_term_size.clone(),
                 sftp_follow_cd: sftp_follow_cd.clone(),
+                image_entries: image_entries.clone(),
                 store: store.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
@@ -3434,6 +3452,7 @@ struct ConnectCtx {
     last_term_size: Arc<Mutex<(u32, u32)>>,
     /// Interface setting: SFTP panel follows the terminal's cd (OSC 7).
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
+    image_entries: ImageEntries,
     /// Config store, so a session's jump host (#211) can be resolved by id at
     /// connect time on the UI thread.
     store: Rc<RefCell<ConfigStore>>,
@@ -3509,6 +3528,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let local_pump = ctx.local_snap.clone();
         let net_pump = ctx.local_net_hist.clone();
         let follow_cd_pump = ctx.sftp_follow_cd.clone();
+        let image_entries = ctx.image_entries.clone();
         let render_gates_pump = ctx.render_gates.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
@@ -3636,11 +3656,20 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let lc_evt = local_pump.clone();
                 let nh_evt = net_pump.clone();
                 let gates_evt = render_gates_pump.clone();
+                let image_entries_evt = image_entries.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = weak_evt.upgrade() {
                         for evt in ui_only {
                             apply_session_event_to_window(
-                                &win, &tid, evt, &bufs_evt, &gates_evt, &st_evt, &lc_evt, &nh_evt,
+                                &win,
+                                &tid,
+                                evt,
+                                &bufs_evt,
+                                &gates_evt,
+                                &st_evt,
+                                &lc_evt,
+                                &nh_evt,
+                                &image_entries_evt,
                             );
                         }
                     }
@@ -3658,6 +3687,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let local_sftp = ctx.local_snap.clone();
         let net_sftp = ctx.local_net_hist.clone();
         let gates_sftp = ctx.render_gates.clone();
+        let image_entries = ctx.image_entries.clone();
         std::thread::spawn(move || {
             let mut sftp_rx = sftp_evt_tx;
             let mut drained: Vec<SessionEvent> = Vec::new();
@@ -3673,7 +3703,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                         Err(_) => break,
                     }
                 }
-                let ui_batch: Vec<SessionEvent> = drained.drain(..).collect();
+                let ui_batch: Vec<SessionEvent> = std::mem::take(&mut drained);
                 if ui_batch.is_empty() {
                     continue;
                 }
@@ -3684,11 +3714,20 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let lc_s = local_sftp.clone();
                 let nh_s = net_sftp.clone();
                 let gates_s = gates_sftp.clone();
+                let image_entries_sftp = image_entries.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(win) = weak_s.upgrade() {
                         for sftp_evt in ui_batch {
                             apply_session_event_to_window(
-                                &win, &tid, sftp_evt, &bufs_s, &gates_s, &st_s, &lc_s, &nh_s,
+                                &win,
+                                &tid,
+                                sftp_evt,
+                                &bufs_s,
+                                &gates_s,
+                                &st_s,
+                                &lc_s,
+                                &nh_s,
+                                &image_entries_sftp,
                             );
                         }
                     }
@@ -3870,6 +3909,29 @@ fn disk_model(disks: &[(String, u64, u64)]) -> ModelRc<DiskInfo> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
+fn is_supported_image_name(name: &str) -> bool {
+    matches!(
+        name.rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif"
+    )
+}
+
+fn image_paths_in_display_order(entries: &[SftpEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| !entry.is_dir && is_supported_image_name(entry.name.as_str()))
+        .map(|entry| entry.full_path.to_string())
+        .collect()
+}
+
+fn clamp_image_index(index: usize, total: usize) -> Option<usize> {
+    total.checked_sub(1).map(|last| index.min(last))
+}
+
 fn gpu_model(gpus: &[GpuSnapshot]) -> ModelRc<GpuInfo> {
     let rows: Vec<GpuInfo> = gpus
         .iter()
@@ -3940,7 +4002,7 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
         .with_winit_window(|ww| ww.is_maximized())
         .unwrap_or_else(|| win.get_window_maximized());
     if !native_maximized && w > 200.0 && h > 200.0 {
-        let (w, h) = clamp_window_size_to_monitor(&win.window(), Some((w, h))).unwrap_or((w, h));
+        let (w, h) = clamp_window_size_to_monitor(win.window(), Some((w, h))).unwrap_or((w, h));
         s.set_window_size(w, h);
     }
     let _ = s.save();
@@ -4196,8 +4258,8 @@ fn char_at_cell_start(prefix: &[usize], target: usize) -> usize {
 /// than `target` (#132).
 fn char_after_cell_end(prefix: &[usize], target: usize) -> usize {
     let n = prefix.len().saturating_sub(1); // chars.len()
-    for i in 0..n {
-        if prefix[i] > target {
+    for (i, &item) in prefix.iter().enumerate().take(n) {
+        if item > target {
             return i;
         }
     }
@@ -4539,6 +4601,7 @@ fn refresh_sidebar(
 
 /// Apply a session event to the live UI models. Must be called on the Slint
 /// event loop thread.
+#[allow(clippy::too_many_arguments)]
 fn apply_session_event_to_window(
     win: &AppWindow,
     tab_id: &str,
@@ -4548,6 +4611,7 @@ fn apply_session_event_to_window(
     statuses: &TabStatuses,
     local: &LocalSnap,
     local_net_hist: &NetHist,
+    image_entries: &ImageEntries,
 ) {
     let tabs_rc = win.get_tabs();
     let terminals_rc = win.get_terminals();
@@ -4646,6 +4710,7 @@ fn apply_session_event_to_window(
                 statuses,
                 local,
                 local_net_hist,
+                image_entries,
             );
             update_tab(&|t| t.connected = false);
             update_terminal(&|t| {
@@ -4718,6 +4783,7 @@ fn apply_session_event_to_window(
                     modified_ts: e.modified as f32,
                     mode: (e.mode & 0o7777) as i32,
                     selected: false,
+                    is_image: !e.is_dir && is_supported_image_name(&e.name),
                 })
                 .collect();
             let (sort_key, sort_dir) = (0..terminals.row_count())
@@ -4728,6 +4794,27 @@ fn apply_session_event_to_window(
                 })
                 .unwrap_or_default();
             sort_sftp_entries(&mut slint_entries, &sort_key, sort_dir);
+            let image_paths = image_paths_in_display_order(&slint_entries);
+            image_entries
+                .lock()
+                .unwrap()
+                .insert(tab_id.to_string(), image_paths);
+            if win.get_image_viewer_tab().as_str() == tab_id {
+                let total = image_entries
+                    .lock()
+                    .unwrap()
+                    .get(tab_id)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                if let Some(index) =
+                    clamp_image_index(win.get_image_viewer_index().max(0) as usize, total)
+                {
+                    win.set_image_viewer_index(index as i32);
+                    win.set_image_viewer_total(total as i32);
+                } else {
+                    win.set_image_viewer_open(false);
+                }
+            }
             let model = ModelRc::from(std::rc::Rc::new(VecModel::from(slint_entries)));
             update_terminal(&|t| {
                 t.sftp_path = path.clone().into();
@@ -4780,9 +4867,42 @@ fn apply_session_event_to_window(
                     statuses,
                     local,
                     local_net_hist,
+                    image_entries,
                 );
                 update_terminal(&|t| t.sftp_status = error.clone().into());
             }
+        }
+        SessionEvent::SftpImageLoaded {
+            path: _,
+            name,
+            index,
+            total,
+            width,
+            height,
+            data,
+            error,
+            gen,
+        } => {
+            // Stale-response guard: if the viewer has moved on (gen advanced),
+            // silently discard this response so a slow load doesn't overwrite
+            // a newer image.
+            if gen != win.get_image_viewer_gen() {
+                return;
+            }
+            if error.is_empty() && !data.is_empty() {
+                let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+                    &data, width, height,
+                );
+                win.set_image_viewer_preview(slint::Image::from_rgba8(buffer));
+                win.set_image_viewer_error("".into());
+            } else {
+                win.set_image_viewer_error(error.into());
+            }
+            win.set_image_viewer_loading(false);
+            win.set_image_viewer_name(name.into());
+            win.set_image_viewer_index(index as i32);
+            win.set_image_viewer_total(total as i32);
+            win.set_image_viewer_open(true);
         }
         SessionEvent::SftpTreeUpdate(nodes) => {
             let slint_nodes: Vec<SftpTreeNode> = nodes
@@ -4947,7 +5067,7 @@ struct PendingHostKey {
 thread_local! {
     /// Prompts awaiting a decision; the front one is shown. Lives on the Slint
     /// event-loop thread (all access is from there).
-    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = RefCell::new(VecDeque::new());
+    static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = const { RefCell::new(VecDeque::new()) };
     /// host:port → decision, remembered for this run so a duplicate prompt
     /// (second connection to the same host) is answered without a new dialog.
     static HOSTKEY_DECIDED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
@@ -5093,7 +5213,7 @@ struct PendingCred {
 }
 
 thread_local! {
-    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = RefCell::new(VecDeque::new());
+    static CRED_QUEUE: RefCell<VecDeque<PendingCred>> = const { RefCell::new(VecDeque::new()) };
     /// session id → the answer given this run (`None` = cancelled), so a second
     /// connection for the same session is answered without re-prompting.
     static CRED_DECIDED: RefCell<HashMap<String, Option<crate::ssh::CredentialReply>>> =
@@ -5230,7 +5350,7 @@ struct PendingMfa {
 }
 
 thread_local! {
-    static MFA_QUEUE: RefCell<VecDeque<PendingMfa>> = RefCell::new(VecDeque::new());
+    static MFA_QUEUE: RefCell<VecDeque<PendingMfa>> = const { RefCell::new(VecDeque::new()) };
 }
 
 /// Queue an MFA prompt: a concurrent connection for the same session (the shell
@@ -5437,6 +5557,7 @@ fn refresh_panes(
 /// "tabstrip"/"left"/"right"/"up"/"down"/"center"; `None` when the point is
 /// outside every pane. The 30% edge bands trigger a split; the tab strip and
 /// middle drop into the pane's tab group.
+#[allow(clippy::type_complexity)]
 fn drag_target(
     layout: &crate::panes::Layout,
     content: (f32, f32),
@@ -5479,6 +5600,7 @@ fn drag_target(
 // Tab callbacks
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn wire_tab_callbacks(
     window: &AppWindow,
     tabs_model: Rc<VecModel<TabInfo>>,
@@ -5909,7 +6031,12 @@ fn wire_tab_callbacks(
 // SFTP callbacks
 // ---------------------------------------------------------------------------
 
-fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_cwd: SftpLastCwd) {
+fn wire_sftp_callbacks(
+    window: &AppWindow,
+    sftp_handles: SftpHandles,
+    sftp_last_cwd: SftpLastCwd,
+    image_entries: ImageEntries,
+) {
     // Navigate to a remote path (or ".." to go up one level).
     {
         let sftp_handles = sftp_handles.clone();
@@ -6394,7 +6521,48 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
     }
     {
         let sftp_handles = sftp_handles.clone();
+        let image_entries = image_entries.clone();
+        let weak = window.as_weak();
         window.on_sftp_view(move |tab_id: SharedString, path: SharedString| {
+            if is_supported_image_name(path.as_str()) {
+                let paths = image_entries
+                    .lock()
+                    .unwrap()
+                    .get(tab_id.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                let index = paths
+                    .iter()
+                    .position(|item| item == path.as_str())
+                    .unwrap_or(0);
+                let gen = if let Some(window) = weak.upgrade() {
+                    let g = window.get_image_viewer_gen().wrapping_add(1);
+                    window.set_image_viewer_gen(g);
+                    window.set_image_viewer_tab(tab_id.clone());
+                    window.set_image_viewer_index(index as i32);
+                    window.set_image_viewer_total(paths.len() as i32);
+                    window.set_image_viewer_name(path.clone());
+                    window.set_image_viewer_error("".into());
+                    window.set_image_viewer_preview(slint::Image::default());
+                    window.set_image_viewer_loading(true);
+                    window.set_image_viewer_open(true);
+                    g
+                } else {
+                    0
+                };
+                if let Ok(handles) = sftp_handles.lock() {
+                    if let Some(handle) = handles.get(tab_id.as_str()) {
+                        handle.read_bytes(
+                            path.to_string(),
+                            16 * 1024 * 1024,
+                            index,
+                            paths.len(),
+                            gen,
+                        );
+                    }
+                }
+                return;
+            }
             if let Ok(handles) = sftp_handles.lock() {
                 if let Some(h) = handles.get(tab_id.as_str()) {
                     h.read_text(path.to_string(), false);
@@ -6586,6 +6754,72 @@ fn wire_sftp_callbacks(window: &AppWindow, sftp_handles: SftpHandles, sftp_last_
 // ---------------------------------------------------------------------------
 // Raw keystroke forwarding and PTY resize
 // ---------------------------------------------------------------------------
+
+fn wire_image_viewer_callbacks(
+    window: &AppWindow,
+    sftp_handles: SftpHandles,
+    image_entries: ImageEntries,
+) {
+    {
+        let weak = window.as_weak();
+        window.on_image_viewer_close(move || {
+            if let Some(window) = weak.upgrade() {
+                window.set_image_viewer_open(false);
+            }
+        });
+    }
+    for direction in ["prev", "next"] {
+        let weak = window.as_weak();
+        let handles = sftp_handles.clone();
+        let entries = image_entries.clone();
+        match direction {
+            "prev" => {
+                window.on_image_viewer_prev(move || navigate_image(&weak, &handles, &entries, -1))
+            }
+            _ => window.on_image_viewer_next(move || navigate_image(&weak, &handles, &entries, 1)),
+        }
+    }
+}
+
+fn navigate_image(
+    weak: &slint::Weak<AppWindow>,
+    handles: &SftpHandles,
+    image_entries: &ImageEntries,
+    delta: i32,
+) {
+    let Some(window) = weak.upgrade() else { return };
+    let tab_id = window.get_image_viewer_tab().to_string();
+    let paths = image_entries
+        .lock()
+        .unwrap()
+        .get(&tab_id)
+        .cloned()
+        .unwrap_or_default();
+    let Some(current) =
+        clamp_image_index(window.get_image_viewer_index().max(0) as usize, paths.len())
+    else {
+        window.set_image_viewer_open(false);
+        return;
+    };
+    let next = if delta < 0 {
+        current.checked_sub(1)
+    } else {
+        (current + 1 < paths.len()).then_some(current + 1)
+    };
+    let Some(next) = next else { return };
+    let Some(path) = paths.get(next) else { return };
+    let gen = window.get_image_viewer_gen().wrapping_add(1);
+    window.set_image_viewer_gen(gen);
+    window.set_image_viewer_index(next as i32);
+    window.set_image_viewer_name(path.rsplit('/').next().unwrap_or(path).into());
+    window.set_image_viewer_preview(slint::Image::default());
+    window.set_image_viewer_loading(true);
+    if let Ok(handles) = handles.lock() {
+        if let Some(handle) = handles.get(&tab_id) {
+            handle.read_bytes(path.clone(), 16 * 1024 * 1024, next, paths.len(), gen);
+        }
+    }
+}
 
 fn wire_key_input(
     window: &AppWindow,
@@ -6881,7 +7115,7 @@ fn wire_key_input(
                 if orig.is_empty() {
                     s.add_quick_group(name.to_string());
                 } else {
-                    s.rename_quick_group(&orig.to_string(), name.to_string());
+                    s.rename_quick_group(orig.as_ref(), name.to_string());
                 }
                 let _ = s.save();
             }
@@ -6898,7 +7132,7 @@ fn wire_key_input(
         window.on_delete_quick_group(move |name: SharedString| {
             {
                 let mut s = store_rc.borrow_mut();
-                s.remove_quick_group(&name.to_string());
+                s.remove_quick_group(name.as_ref());
                 let _ = s.save();
             }
             if let Some(w) = weak.upgrade() {
@@ -7857,7 +8091,7 @@ fn webdav_create_dir(agent: &ureq::Agent, url: &str, auth: Option<&str>) -> Resu
     let req = webdav_auth_req(agent.request("MKCOL", url), auth);
     match req.call() {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(status, _)) if status == 405 => Ok(()),
+        Err(ureq::Error::Status(405, _)) => Ok(()),
         Err(ureq::Error::Status(status, _))
             if status == 401 || status == 403 || status == 404 || status == 409 =>
         {
@@ -9401,6 +9635,7 @@ mod selection_tests {
             modified_ts: 0.0,
             mode: 0,
             selected: false,
+            is_image: false,
         }
     }
 
@@ -9439,7 +9674,29 @@ mod selection_tests {
             sftp_entry("dir2", true),
         ];
         sort_sftp_entries(&mut entries, "", 0);
-        assert_eq!(sftp_names(&entries), vec!["dir2", "dir10", "file11", "file100"]);
+        assert_eq!(
+            sftp_names(&entries),
+            vec!["dir2", "dir10", "file11", "file100"]
+        );
+    }
+
+    #[test]
+    fn image_paths_follow_display_order_and_skip_directories() {
+        let entries = vec![
+            sftp_entry("cover.jpg", false),
+            sftp_entry("assets", true),
+            sftp_entry("screen.PNG", false),
+            sftp_entry("notes.txt", false),
+        ];
+        let paths = image_paths_in_display_order(&entries);
+        assert_eq!(paths, vec!["/cover.jpg", "/screen.PNG"]);
+    }
+
+    #[test]
+    fn image_index_clamps_after_directory_refresh() {
+        assert_eq!(clamp_image_index(4, 0), None);
+        assert_eq!(clamp_image_index(4, 2), Some(1));
+        assert_eq!(clamp_image_index(0, 3), Some(0));
     }
 
     fn hist_line(s: &str) -> Line {

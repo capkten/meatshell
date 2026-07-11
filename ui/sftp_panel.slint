@@ -16,6 +16,7 @@ export struct SftpEntry {
     modified-ts: float,
     mode: int,        // POSIX permission bits, for the chmod dialog (#84)
     selected: bool,   // multi-select checkbox state (#100)
+    is-image: bool,
 }
 
 export struct SftpTreeNode {

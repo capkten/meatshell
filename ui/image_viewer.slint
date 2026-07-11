@@ -1,405 +1,194 @@
 import { Theme } from "theme.slint";
 
-export component ImageViewer {
+export component ImageViewer inherits Rectangle {
     in property <string> file-name;
     in property <int> index;
     in property <int> total;
     in property <image> preview-image;
     in property <string> error-msg;
-
+    in property <bool> loading: false;
     callback close();
     callback prev();
     callback next();
 
-    width: 100%;
-    height: 100%;
-
-    // Internal zoom/pan state
     property <float> scale: 1.0;
-    property <length> offset-x: 0;
-    property <length> offset-y: 0;
-    property <bool> is-panning: false;
-    property <length> pan-start-x;
-    property <length> pan-start-y;
-    property <length> pan-start-offset-x;
-    property <length> pan-start-offset-y;
-
-    // Constants
-    property <length> header-h: 44px;
-    property <length> nav-btn-w: 50px;
-    property <length> nav-btn-h: 80px;
+    property <length> offset-x: 0px;
+    property <length> offset-y: 0px;
+    property <bool> panning: false;
+    property <length> start-x;
+    property <length> start-y;
+    property <length> start-offset-x;
+    property <length> start-offset-y;
     property <float> min-scale: 0.1;
     property <float> max-scale: 10.0;
     property <float> zoom-step: 1.15;
+    property <length> header-height: 48px;
 
-    // Viewport dimensions (image area)
-    property <length> vp-w: root.width;
-    property <length> vp-h: root.height - root.header-h;
-
-    // Reset to fit-to-window
     function reset-view() {
         root.scale = 1.0;
-        root.offset-x = 0;
-        root.offset-y = 0;
+        root.offset-x = 0px;
+        root.offset-y = 0px;
     }
 
-    // Clamp offset so image doesn't go completely off-screen
     function clamp-offset() {
-        // Allow some overshoot but keep at least part of image visible
-        root.offset-x = Math.max(-(root.vp-w * 0.5), Math.min(root.offset-x, root.vp-w * 0.5));
-        root.offset-y = Math.max(-(root.vp-h * 0.5), Math.min(root.offset-y, root.vp-h * 0.5));
+        let max-x = root.width * root.scale * 0.55;
+        let max-y = (root.height - root.header-height) * root.scale * 0.55;
+        root.offset-x = clamp(root.offset-x, -max-x, max-x);
+        root.offset-y = clamp(root.offset-y, -max-y, max-y);
     }
 
-    // Dark overlay background
-    Rectangle {
-        background: #000000dd;
-        width: 100%;
-        height: 100%;
-    }
+    width: 100%;
+    height: 100%;
+    background: #080a0fcc;
 
     FocusScope {
         width: 100%;
         height: 100%;
-
         key-pressed(e) => {
-            if (e.text == Key.Escape) {
-                root.close();
-                return accept;
-            }
-            if (e.text == Key.LeftArrow) {
-                root.prev();
-                return accept;
-            }
-            if (e.text == Key.RightArrow) {
-                root.next();
-                return accept;
-            }
-            if (e.text == Key.Space) {
-                root.reset-view();
-                return accept;
-            }
+            if (e.text == Key.Escape) { root.close(); return accept; }
+            if (e.text == Key.LeftArrow) { root.prev(); return accept; }
+            if (e.text == Key.RightArrow) { root.next(); return accept; }
+            if (e.text == Key.Space) { root.reset-view(); return accept; }
             return reject;
         }
 
-        // ── Header / Title bar ──────────────────────────────────────────
-        Rectangle {
-            y: 0;
-            height: root.header-h;
-            background: #00000088;
-
-            HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 12px;
-                alignment: space-between;
-
-                // File name + index
-                HorizontalLayout {
-                    spacing: 12px;
-                    alignment: start;
-
-                    Text {
-                        text: root.file-name;
-                        color: #e6e8ee;
-                        font-size: 14px;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                        overflow: elide;
-                        horizontal-stretch: 1;
-                    }
-
-                    if root.total > 1 : Text {
-                        text: root.index + 1 + " / " + root.total;
-                        color: #a0a4b0;
-                        font-size: 13px;
-                        vertical-alignment: center;
-                    }
-                }
-
-                // Zoom controls
-                HorizontalLayout {
-                    spacing: 4px;
-                    alignment: end;
-
-                    // Zoom out
-                    Rectangle {
-                        width: 32px;
-                        height: 32px;
-                        border-radius: 6px;
-                        background: zoom-out-ta.has-hover ? #ffffff22 : transparent;
-                        zoom-out-ta := TouchArea {
-                            clicked => {
-                                root.scale = Math.max(root.scale / root.zoom-step, root.min-scale);
-                            }
-                        }
-                        Text {
-                            text: "−";
-                            color: #e6e8ee;
-                            font-size: 18px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    // Zoom percentage
-                    Rectangle {
-                        width: 60px;
-                        height: 32px;
-                        background: #ffffff11;
-                        border-radius: 6px;
-                        TouchArea {
-                            clicked => { root.reset-view(); }
-                        }
-                        Text {
-                            text: Math.round(root.scale * 100) + "%";
-                            color: #e6e8ee;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    // Zoom in
-                    Rectangle {
-                        width: 32px;
-                        height: 32px;
-                        border-radius: 6px;
-                        background: zoom-in-ta.has-hover ? #ffffff22 : transparent;
-                        zoom-in-ta := TouchArea {
-                            clicked => {
-                                root.scale = Math.min(root.scale * root.zoom-step, root.max-scale);
-                            }
-                        }
-                        Text {
-                            text: "+";
-                            color: #e6e8ee;
-                            font-size: 18px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    // Spacer
-                    Rectangle { width: 8px; }
-
-                    // Close button
-                    Rectangle {
-                        width: 32px;
-                        height: 32px;
-                        border-radius: 6px;
-                        background: close-ta.has-hover ? #ff4444aa : transparent;
-                        close-ta := TouchArea {
-                            clicked => { root.close(); }
-                        }
-                        Text {
-                            text: "\u{e5cd}";
-                            font-family: "Material Icons";
-                            color: #e6e8ee;
-                            font-size: 20px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
+    Rectangle {
+        x: 16px; y: 12px; width: parent.width - 32px; height: root.header-height;
+        background: #161a22ee;
+        border-radius: Theme.radius-md;
+        border-width: 1px; border-color: #ffffff20;
+        HorizontalLayout {
+            padding-left: 14px; padding-right: 8px; spacing: 10px;
+            Text {
+                text: root.file-name;
+                color: #f4f6fb; font-size: Theme.fs-sm;
+                vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
             }
-        }
-
-        // ── Error message ───────────────────────────────────────────────
-        if root.error-msg != "" : Rectangle {
-            x: 0;
-            y: root.header-h;
-            width: 100%;
-            height: root.vp-h;
-
+            Text {
+                text: root.total > 0 ? (root.index + 1) + " / " + root.total : "";
+                color: #aeb6c5; font-size: Theme.fs-xs;
+                vertical-alignment: center;
+            }
             Rectangle {
-                width: 300px;
-                height: 120px;
-                background: #ff000022;
-                border-radius: 12px;
-                border-width: 1px;
-                border-color: #ff000044;
-
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 8px;
-                    padding: 16px;
-
-                    Text {
-                        text: "\u{e001}";
-                        font-family: "Material Icons";
-                        color: #ff6666;
-                        font-size: 32px;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: root.error-msg;
-                        color: #e6e8ee;
-                        font-size: 14px;
-                        horizontal-alignment: center;
-                        wrap: word-wrap;
-                    }
+                width: 32px; height: 32px; border-radius: Theme.radius-sm;
+                background: zoom-out.has-hover ? #ffffff20 : transparent;
+                zoom-out := TouchArea {
+                    clicked => { root.scale = max(root.min-scale, root.scale / root.zoom-step); root.clamp-offset(); }
                 }
+                Text { text: "-"; color: #f4f6fb; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
             }
-        }
-
-        // ── Image display area ──────────────────────────────────────────
-        if root.error-msg == "" : Rectangle {
-            x: 0;
-            y: root.header-h;
-            width: root.vp-w;
-            height: root.vp-h;
-            clip: true;
-
-            // The image, centered then offset by pan
-            Image {
-                source: root.preview-image;
-                image-fit: contain;
-                // Center the image, then apply zoom and pan offset
-                width: root.vp-w * root.scale;
-                height: root.vp-h * root.scale;
-                x: (root.vp-w - self.width) / 2 + root.offset-x;
-                y: (root.vp-h - self.height) / 2 + root.offset-y;
-            }
-
-            // Interaction layer (must be on top of the image)
-            TouchArea {
-                width: 100%;
-                height: 100%;
-
-                scroll-event(event) => {
-                    // Zoom centered on mouse position
-                    if (event.delta-y < 0) {
-                        // Zoom in: adjust offset so point under mouse stays fixed
-                        root.offset-x = (self.mouse-x - root.vp-w / 2) - ((self.mouse-x - root.vp-w / 2) - root.offset-x) * (root.scale * root.zoom-step / root.scale);
-                        root.offset-y = (self.mouse-y - root.vp-h / 2) - ((self.mouse-y - root.vp-h / 2) - root.offset-y) * (root.scale * root.zoom-step / root.scale);
-                        root.scale = Math.min(root.scale * root.zoom-step, root.max-scale);
-                    } else {
-                        // Zoom out
-                        root.offset-x = (self.mouse-x - root.vp-w / 2) - ((self.mouse-x - root.vp-w / 2) - root.offset-x) * (root.scale / root.zoom-step / root.scale);
-                        root.offset-y = (self.mouse-y - root.vp-h / 2) - ((self.mouse-y - root.vp-h / 2) - root.offset-y) * (root.scale / root.zoom-step / root.scale);
-                        root.scale = Math.max(root.scale / root.zoom-step, root.min-scale);
-                    }
-                    root.clamp-offset();
-                    accept
-                }
-
-                pointer-event(event) => {
-                    if (event.kind == PointerEventKind.down) {
-                        root.is-panning = true;
-                        root.pan-start-x = self.mouse-x;
-                        root.pan-start-y = self.mouse-y;
-                        root.pan-start-offset-x = root.offset-x;
-                        root.pan-start-offset-y = root.offset-y;
-                    } else if (event.kind == PointerEventKind.up) {
-                        if (!root.is-panning) {
-                            // Click without drag: navigate
-                            if (self.mouse-x < root.width / 2) {
-                                root.prev();
-                            } else {
-                                root.next();
-                            }
-                        } else {
-                            // Check if it was actually a click (small movement)
-                            if (Math.abs(self.mouse-x - root.pan-start-x) < 5px && Math.abs(self.mouse-y - root.pan-start-y) < 5px) {
-                                if (self.mouse-x < root.width / 2) {
-                                    root.prev();
-                                } else {
-                                    root.next();
-                                }
-                            }
-                        }
-                        root.is-panning = false;
-                    }
-                }
-
-                moved => {
-                    if (root.is-panning) {
-                        root.offset-x = root.pan-start-offset-x + (self.mouse-x - root.pan-start-x);
-                        root.offset-y = root.pan-start-offset-y + (self.mouse-y - root.pan-start-y);
-                        root.clamp-offset();
-                    }
-                }
-
-                double-clicked => {
-                    if (root.scale > 1.1 || root.scale < 0.9) {
-                        root.reset-view();
-                    } else {
-                        // Zoom to 2x centered on click
-                        root.offset-x = (self.mouse-x - root.vp-w / 2) - ((self.mouse-x - root.vp-w / 2) - root.offset-x) * 2.0;
-                        root.offset-y = (self.mouse-y - root.vp-h / 2) - ((self.mouse-y - root.vp-h / 2) - root.offset-y) * 2.0;
-                        root.scale = 2.0;
-                        root.clamp-offset();
-                    }
-                }
-            }
-        }
-
-        // ── Left navigation button ──────────────────────────────────────
-        if root.index > 0 : Rectangle {
-            x: 12px;
-            y: root.header-h + (root.vp-h - root.nav-btn-h) / 2;
-            width: root.nav-btn-w;
-            height: root.nav-btn-h;
-            border-radius: 12px;
-            background: left-ta.has-hover ? #ffffff33 : #00000044;
-            border-width: 1px;
-            border-color: #ffffff22;
-
-            left-ta := TouchArea {
-                clicked => { root.prev(); }
-            }
-
             Text {
-                text: "\u{e5cb}";
-                font-family: "Material Icons";
-                color: #e6e8ee;
-                font-size: 28px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                opacity: left-ta.has-hover ? 1.0 : 0.7;
+                text: Math.round(root.scale * 100) + "%";
+                width: 54px; color: #d5dae4; font-size: Theme.fs-xs;
+                horizontal-alignment: center; vertical-alignment: center;
             }
-        }
-
-        // ── Right navigation button ─────────────────────────────────────
-        if root.index < root.total - 1 : Rectangle {
-            x: root.width - root.nav-btn-w - 12px;
-            y: root.header-h + (root.vp-h - root.nav-btn-h) / 2;
-            width: root.nav-btn-w;
-            height: root.nav-btn-h;
-            border-radius: 12px;
-            background: right-ta.has-hover ? #ffffff33 : #00000044;
-            border-width: 1px;
-            border-color: #ffffff22;
-
-            right-ta := TouchArea {
-                clicked => { root.next(); }
+            Rectangle {
+                width: 32px; height: 32px; border-radius: Theme.radius-sm;
+                background: zoom-in.has-hover ? #ffffff20 : transparent;
+                zoom-in := TouchArea {
+                    clicked => { root.scale = min(root.max-scale, root.scale * root.zoom-step); root.clamp-offset(); }
+                }
+                Text { text: "+"; color: #f4f6fb; font-size: 18px; horizontal-alignment: center; vertical-alignment: center; }
             }
-
-            Text {
-                text: "\u{e5cc}";
-                font-family: "Material Icons";
-                color: #e6e8ee;
-                font-size: 28px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                opacity: right-ta.has-hover ? 1.0 : 0.7;
-            }
-        }
-
-        // ── Bottom hint bar ─────────────────────────────────────────────
-        Rectangle {
-            x: 0;
-            y: root.height - 36px;
-            width: 100%;
-            height: 36px;
-            background: #00000066;
-
-            Text {
-                text: "滚轮缩放 · 拖拽平移 · 双击切换 · 方向键翻页 · 空格重置 · Esc 关闭";
-                color: #808490;
-                font-size: 12px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+            Rectangle {
+                width: 32px; height: 32px; border-radius: Theme.radius-sm;
+                background: close.has-hover ? #ffffff20 : transparent;
+                close := TouchArea { clicked => { root.close(); } }
+                Text { text: "\u{E5CD}"; font-family: "Material Icons"; color: #f4f6fb;
+                       font-size: Theme.fs-md; horizontal-alignment: center; vertical-alignment: center; }
             }
         }
     }
+
+    Rectangle {
+        x: 16px; y: root.header-height + 20px;
+        width: parent.width - 32px; height: parent.height - root.header-height - 36px;
+        clip: true; background: #050608cc; border-radius: Theme.radius-md;
+        Image {
+            source: root.preview-image;
+            image-fit: contain;
+            width: parent.width * root.scale;
+            height: parent.height * root.scale;
+            x: (parent.width - self.width) / 2 + root.offset-x;
+            y: (parent.height - self.height) / 2 + root.offset-y;
+        }
+        TouchArea {
+            width: 100%; height: 100%;
+            mouse-cursor: root.panning ? grabbing : default;
+            scroll-event(event) => {
+                let old = root.scale;
+                let next = event.delta-y < 0 ? min(root.max-scale, old * root.zoom-step)
+                                            : max(root.min-scale, old / root.zoom-step);
+                let factor = next / old;
+                root.offset-x = (self.mouse-x - self.width / 2) - (self.mouse-x - self.width / 2 - root.offset-x) * factor;
+                root.offset-y = (self.mouse-y - self.height / 2) - (self.mouse-y - self.height / 2 - root.offset-y) * factor;
+                root.scale = next;
+                root.clamp-offset();
+                accept
+            }
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    root.panning = true;
+                    root.start-x = self.mouse-x;
+                    root.start-y = self.mouse-y;
+                    root.start-offset-x = root.offset-x;
+                    root.start-offset-y = root.offset-y;
+                } else if (event.kind == PointerEventKind.up) {
+                    root.panning = false;
+                }
+            }
+            moved => {
+                if (root.panning) {
+                    root.offset-x = root.start-offset-x + self.mouse-x - root.start-x;
+                    root.offset-y = root.start-offset-y + self.mouse-y - root.start-y;
+                    root.clamp-offset();
+                }
+            }
+            double-clicked => {
+                if (root.scale > 1.1) {
+                    root.reset-view();
+                } else {
+                    root.scale = 2.0;
+                    root.clamp-offset();
+                }
+            }
+        }
+        if root.loading : Rectangle {
+            width: 100%; height: 100%;
+            background: #0e1018;
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: @tr("Loading image...", "Loading image...");
+                    color: white; font-size: 16px; font-weight: 600;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+        if !root.loading && root.error-msg != "" : VerticalLayout {
+            alignment: center;
+            Text { text: root.error-msg; color: #ffb4ab; horizontal-alignment: center; }
+        }
+        if !root.loading && root.error-msg == "" && root.total == 0 : Text {
+            text: @tr("Loading image...", "Loading image...");
+            color: #d5dae4; horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+
+    Rectangle {
+        x: 28px; y: root.header-height + 40px; width: 44px; height: 72px;
+        background: prev-ta.has-hover ? #ffffff24 : #161a22cc;
+        border-radius: Theme.radius-md;
+        prev-ta := TouchArea { clicked => { root.prev(); } }
+        Text { text: "\u{E5CB}"; font-family: "Material Icons"; color: #f4f6fb;
+               font-size: 30px; horizontal-alignment: center; vertical-alignment: center; }
+    }
+    Rectangle {
+        x: parent.width - 72px; y: root.header-height + 40px; width: 44px; height: 72px;
+        background: next-ta.has-hover ? #ffffff24 : #161a22cc;
+        next-ta := TouchArea { clicked => { root.next(); } }
+        Text { text: "\u{E5CC}"; font-family: "Material Icons"; color: #f4f6fb;
+               font-size: 30px; horizontal-alignment: center; vertical-alignment: center; }
+    }
+    } // FocusScope
 }

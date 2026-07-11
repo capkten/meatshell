@@ -805,7 +805,7 @@ impl ConfigStore {
 
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        fs::write(&key_path, &key)
+        fs::write(&key_path, key)
             .with_context(|| format!("failed to write {}", key_path.display()))?;
         #[cfg(unix)]
         {
@@ -1560,7 +1560,7 @@ impl ConfigStore {
     /// Returns `(added, skipped)`. The store is saved if anything was added.
     pub fn import_json(&mut self, raw: &str) -> Result<(usize, usize)> {
         let file: ExportFile =
-            serde_json::from_str(&raw).context("not a valid meatshell export file")?;
+            serde_json::from_str(raw).context("not a valid meatshell export file")?;
 
         let mut added = 0usize;
         let mut skipped = 0usize;
