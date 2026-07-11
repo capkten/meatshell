@@ -1,7 +1,201 @@
 # Changelog / 更新日志
 
 All notable changes are documented here. 本文件记录所有重要变更。
-中英对照（English first, 中文在后）.
+中英对照（中文在前，English after）.
+
+## [0.6.0] - 2026-07-10
+
+### 修复 / Fixed
+
+- **修复拖动资源侧栏宽度时突然变宽的问题 (#244)。** 资源侧栏分隔条改为使用稳定的窗口绝对坐标计算宽高，不再把移动中的分隔条局部坐标反复累加到当前宽度，避免拖动时宽度突然跳变。
+- **修复 Windows 10 无边框窗口点击坐标整体错位的问题 (#193)。** Windows 创建 Slint/winit 窗口前会禁用 undecorated shadow 兼容层，避免部分 Win10 环境把隐藏边框计入命中区域，导致渲染位置与鼠标点击位置产生垂直偏移。
+- **改善 Windows 高 DPI 缩放下字体发糊的问题 (#224)。** Windows 默认使用 Slint software 渲染器，避开 2K/4K 屏幕开启 125%/150% 等缩放时 OpenGL/FemtoVG 路径可能导致的 UI 与设置页文字偏糊问题；仍可通过 `SLINT_BACKEND` 手动切换渲染器。
+- **修复 SFTP 面板拖动后拖拽上传命中区域错误的问题 (#253)。** 文件拖拽上传的落点判断会跟随 SFTP 面板的左、右、上、下停靠位置，只在当前文件列表区域内触发上传，不再固定只识别默认底部文件区。
+- **支持显式选择键盘交互认证 (#249)。** SSH 会话新增“键盘交互”认证方式，可直接走 keyboard-interactive 登录；密码 / 首次应答会自动用于第一条普通提示，MFA / OTP 等额外提示继续弹窗询问，SFTP 连接也复用同一认证路径。
+- **修复 macOS 触控板无法滚动终端的问题 (#252)。** 终端滚动命中层显式铺满输出区域，并在 macOS 上增加 winit 级触控板滚轮兜底；触控板双指滚动会进入终端回滚/alt-screen 滚轮逻辑，不再只能拖动右侧滚动条。
+
+---
+
+### Fixed
+
+- **Fix sudden resource-sidebar width jumps while resizing (#244).** The resource-sidebar splitter now computes size from stable window-space coordinates instead of repeatedly adding local splitter deltas to the current width, preventing resize jumps while dragging.
+- **Fix whole-window click offset on Windows 10 frameless windows (#193).** Windows now disables winit's undecorated-shadow compatibility layer before creating Slint/winit windows, preventing some Win10 environments from counting hidden frame space in hit testing and shifting clicks vertically away from rendered pixels.
+- **Improve blurry text on Windows high-DPI scaling (#224).** Windows now defaults to Slint's software renderer, avoiding the OpenGL/FemtoVG path that can make UI and settings text look soft on 2K/4K displays using 125%/150% scaling; `SLINT_BACKEND` can still override the renderer manually.
+- **Fix drag-and-drop upload hit testing after moving the SFTP panel (#253).** File-drop upload detection now follows the SFTP panel on the left, right, top, or bottom dock and only triggers inside the current file-list area instead of staying fixed to the default bottom panel.
+- **Support explicit keyboard-interactive authentication (#249).** SSH sessions can now choose keyboard-interactive directly; the saved password / first answer is used for the first regular prompt, MFA / OTP prompts still ask interactively, and SFTP reuses the same auth path.
+- **Fix terminal scrolling with the macOS trackpad (#252).** The terminal scroll hit layer now explicitly covers the output area, and macOS gets a winit-level trackpad wheel fallback; two-finger scrolling feeds the terminal scrollback/alt-screen wheel path instead of requiring the scrollbar thumb.
+
+## [0.5.71] - 2026-07-10
+
+### 新增 / Added
+
+- **SFTP 文件列表支持排序 (#248)。** 文件列表的名称、大小、修改时间表头支持点击排序，点击循环为升序、降序、恢复默认；右键菜单新增“清除排序”，可直接恢复默认排序。
+
+### 改进 / Changed
+
+- **WebDAV 上传前自动创建缺失目录。** 上传连接配置前会逐级检查远端父目录，目录不存在时尝试通过 WebDAV `MKCOL` 创建；如果文件夹不存在且无权限创建，会返回明确提示“文件夹不存在也无权限创建”。
+
+### 修复 / Fixed
+
+- **修复顶部工具栏与 SFTP 操作栏间距问题 (#245)。** 统一沉浸式标题栏场景下顶部工具栏图标的 Y 轴计算，并增加 SFTP 文件面板操作栏高度和上下内边距，避免上传按钮贴近拖动条。
+- **修复复制终端软换行文本时多出换行的问题 (#241)。** 终端行会保留 vt100 的软换行标记，复制选区时跳过由终端宽度造成的自动折行换行，只在真实换行处插入换行符。
+- **修复部分旧服务器 SFTP 认证失败的问题 (#186)。** SFTP 在 password 认证被拒后会像终端连接一样重连并尝试 keyboard-interactive，兼容只开放键盘交互认证的 GBK/旧服务器。
+
+---
+
+### Added
+
+- **Support sorting the SFTP file list (#248).** The name, size, and modified-time headers now cycle through ascending, descending, and default order when clicked. The context menu also adds “Clear sort” to restore the default order.
+
+### Changed
+
+- **Create missing WebDAV folders before upload.** Before uploading the connection config, WebDAV now checks each remote parent folder and creates missing folders with `MKCOL`; if a folder is missing and cannot be created, it reports “folder does not exist and cannot be created”.
+
+### Fixed
+
+- **Fix top toolbar and SFTP action bar spacing (#245).** The top toolbar Y offset is now centralized for immersive-titlebar layouts, and the SFTP file panel action bar has more height and vertical padding so the upload button no longer sits too close to the splitter.
+- **Preserve logical lines when copying soft-wrapped terminal text (#241).** Terminal rows now retain vt100 soft-wrap metadata, and selection copy skips newlines introduced only by terminal-width wrapping while preserving real line breaks.
+- **Fix SFTP authentication on some legacy servers (#186).** When password authentication is rejected, SFTP now reconnects and tries keyboard-interactive like terminal sessions do, improving compatibility with GBK/legacy servers that only allow keyboard-interactive auth.
+
+## [0.5.7] - 2026-07-08
+
+### 新增 / Added
+
+- **新增默认壁纸 MS (#231)。** 新用户首次启动默认使用 `assets/ms.jpg` 作为壁纸；已有用户配置不会被迁移或覆盖，保留原本的壁纸选择。
+
+### 改进 / Changed
+
+- **优化标签页标题显示与复制 (#228)。** 标签页宽度会按标题显示宽度动态调整，中文等非 ASCII 字符按双宽估算，长标题会适当缩小字号以减少截断；移除悬浮提示以避免影响顶部拖动交互，单击标签页可复制完整标题。
+- **优化壁纸设置面板滚动。** 内置壁纸列表过宽时会在设置面板内横向滚动，避免缩放或窗口较窄时壁纸选项溢出。
+- **欢迎页作为侧栏时隐藏空会话提示。** 开启“欢迎页为侧栏”后，不再在主区域显示“从左侧选择一个会话开始”，避免提示遮挡壁纸和主界面。
+
+### 修复 / Fixed
+
+- **修复版本号与发布校验问题 (#226, #229, #236)。** 命令行支持 `--version` / `-V`，发布脚本与工作流会校验 Cargo 版本、锁文件版本和产物版本，避免再次发布版本号不一致的构建。
+- **修复程序目录配置被卸载删除后连接丢失的问题。** 启动时如果程序目录配置没有连接，会从用户目录配置副本恢复 `sessions.json`、`secret.key` 和 `known_hosts`；后续保存会同步写入程序目录和用户目录两份配置，降低更新/卸载误删风险。
+- **修复串口历史输出搜索不到的问题 (#233)。** 当前可见行没有命中时会继续搜索 scrollback 历史，找到匹配后自动滚动到对应位置并重绘高亮。
+- **修复 Windows 无边框窗口恢复后超出屏幕的问题 (#234)。** 启动与保存布局时按当前显示器尺寸钳制窗口大小，并读取 native 最大化状态，避免 Win11 下恢复到大于屏幕的窗口尺寸。
+
+---
+
+### Added
+
+- **Add MS as the default wallpaper (#231).** New users now start with `assets/ms.jpg` as the default wallpaper; existing user configurations are not migrated or overwritten.
+
+### Changed
+
+- **Improve tab title display and copy (#228).** Tab widths now adapt to the title's display width, counting Chinese and other non-ASCII characters as double width, and long titles use a smaller font to reduce truncation. Hover tooltips were removed to avoid interfering with top-bar drag interactions, while clicking a tab copies the full title.
+- **Improve scrolling in wallpaper settings.** Built-in wallpaper choices now scroll horizontally inside the settings panel instead of overflowing on smaller or scaled windows.
+- **Hide the empty-session prompt when the welcome page is docked as a sidebar.** The main pane no longer shows "Select a session from the left to start" when the welcome sidebar is already visible.
+
+### Fixed
+
+- **Fix version and release validation issues (#226, #229, #236).** The CLI supports `--version` / `-V`, and release scripts/workflows validate Cargo versions, lockfile versions, and built artifact versions to prevent mismatched releases.
+- **Recover connections when the program-directory config was removed during uninstall/update.** If the program config has no connections, startup restores `sessions.json`, `secret.key`, and `known_hosts` from the user config backup; future saves write both the program directory and user directory copies.
+- **Fix searching serial scrollback history (#233).** When no visible row matches, search continues through scrollback history, scrolls to the first match, and redraws highlights.
+- **Clamp restored frameless windows to the current monitor on Windows (#234).** Startup and layout saving now clamp window size to the visible monitor and read the native maximized state, preventing Win11 restores from exceeding the screen.
+
+## [0.5.6] - 2026-07-06
+
+### 修复 / Fixed
+
+- **修复分屏终端在右侧资源面板展开时被错误压缩到 10 列。** 显式绑定分屏内容区尺寸，并仅在终端视图拥有真实布局尺寸后才上报 resize，避免右侧资源面板展开时的瞬时 0 宽布局被折算成 10 列，导致右侧终端内容异常换行。
+
+---
+
+### Fixed
+
+- **Avoid transient 10-column terminal resize in split panes.** Explicitly size the split-pane content area and only report terminal resize events after the terminal view has a real layout size. This prevents right resource panel changes from turning a transient zero-width layout into a 10-column terminal resize.
+
+## [0.5.5] - 2026-07-05
+
+### 新增 / Added
+
+- **支持分屏合并 (#216)。** 标签页右键菜单新增「Merge panes」，可将当前分屏的所有标签合并到其它 pane，并自动折叠空分屏。
+- **支持拖到标签栏合并分屏。** 像 IDEA 一样，将某个分屏里的标签拖到另一个分屏的标签栏后释放，即可把标签移入目标标签组；源分屏移空后会自动合并回单窗口。
+
+### 改进 / Changed
+
+- **优化当前标签页识别度 (#200)。** 暗色模式下当前标签页使用更明确的层级底色；开启壁纸时会从壁纸取色，让标签栏更沉浸。
+- **标签页关闭按钮固定在右侧。** 短标签名不再把关闭按钮挤到中间，所有标签的关闭入口位置保持一致。
+- **关闭确认弹窗按钮接入主题色。** 关闭应用确认弹窗不再使用系统默认蓝色按钮，主按钮会跟随主题和壁纸取色。
+
+### 修复 / Fixed
+
+- **修复 less 搜索高亮不可见 (#217)。** 正确处理默认前景/背景色下的 reverse-video 反色序列，使 `less` 中 `/` 或 `?` 搜索命中能够正常显示高亮。
+
+---
+
+### Added
+
+- **Split-pane merging (#216).** The tab context menu now includes "Merge panes", moving all tabs from the current split pane into another pane and collapsing the emptied pane automatically.
+- **Drag-to-tab-strip pane merge.** Like IDEA, dragging a tab from one split pane onto another pane's tab strip moves it into that tab group; if the source pane becomes empty, it collapses back into a single window.
+
+### Changed
+
+- **Improve active-tab visibility (#200).** Dark mode now gives the active tab a clearer surface level, while wallpaper mode derives the active-tab colour from the wallpaper for a more immersive look.
+- **Pin tab close buttons to the right edge.** Short tab names no longer pull the close button toward the middle, keeping the close affordance aligned across tabs.
+- **Theme the close-confirmation buttons.** The app-close confirmation dialog now uses themed buttons instead of the platform-default blue button, so the primary action follows the current theme and wallpaper accent.
+
+### Fixed
+
+- **Fix invisible `less` search highlights (#217).** Reverse-video sequences with default foreground/background colours now render a visible background, so `/` and `?` matches in `less` are highlighted correctly.
+
+## [0.5.4] - 2026-07-04
+
+### 新增 / Added
+
+- **SSH 跳板机（堡垒机）支持 (#211)。** 会话可指定另一个已保存的 SSH 会话作为跳板机（类似 OpenSSH 的 ProxyJump）：先连上跳板并认证，在其上开一条 direct-tcpip 通道到目标机，再完成目标机的 SSH 握手。终端与 SFTP 两条连接都经跳板走，跳板连接在整个会话期间保活、会话关闭时一并断开。跳板复用被引用会话自身的主机/账号/密钥/keyboard-interactive 认证，未存凭据时沿用原有登录弹窗；自动忽略指向自己或已删除会话的无效引用；当前仅支持单级跳板。会话对话框「高级」区（仅 SSH）新增「跳板机（可选）」下拉。
+
+### 修复 / Fixed
+
+- **修复多会话大量输出导致界面卡死 (#209)。** 将 VT100 解析移出 UI 线程、按约 30fps 节流渲染、合并输出块并改用按标签页独立的缓冲锁，某台服务器解压大量文件时不再拖垮其它会话与整个界面。
+- **修复欢迎页会话面板首次建会话时高度跳变 (#214)。** 快速连接卡片现在始终撑满剩余高度、空状态占位区随之拉伸，建会话前后面板高度保持一致、不再跳动。
+
+---
+
+### Added
+
+- **SSH jump host (bastion) support (#211).** A session can tunnel through another saved SSH session as a jump host (like OpenSSH's ProxyJump): connect and authenticate to the jump, open a direct-tcpip channel to the target, and run the target's SSH handshake over it. Both the shell and SFTP connections go through the jump, which is kept alive for the whole session and torn down when it closes. The jump reuses the referenced session's own host/user/key/keyboard-interactive auth, falling back to the usual login prompt when no credentials are stored; dangling or self references are ignored; single hop only for now. The session dialog's Advanced section (SSH only) gains an optional "Jump host" dropdown.
+
+### Fixed
+
+- **Fix UI freeze on heavy output across multiple sessions (#209).** VT100 parsing moved off the UI thread, rendering throttled to ~30fps, output chunks coalesced, and per-tab buffer locks adopted, so unzipping many files on one server no longer stalls other sessions or the whole UI.
+- **Stop the welcome session panel height jump on the first session (#214).** The quick-connect card now always fills the remaining height and the empty-state placeholder stretches to match, keeping the panel height stable before and after adding a session.
+
+
+## [0.5.3] - 2026-07-04
+
+### 新增 / Added
+
+- **欢迎页侧栏支持四向停靠与持久化。** “欢迎页为侧栏”开启后，快速连接面板现在可以拖到左/右/上/下任一侧，并记住停靠位置、宽度和收起状态。
+- **资源面板收起状态持久化。** 资源面板的展开/收起会按最后一次用户操作恢复；只有老配置里没有该状态时，才回退读取“设置 - 界面 - 侧栏”的默认收起设置。
+- **同边收起图标栏合并与外侧停靠。** 快速连接和资源面板在同一侧时，只允许一个面板展开；两个都收起时图标位于同一列/同一行；一个展开一个收起时，收起图标栏始终贴在该侧最外侧。
+- **资源面板新增内部浅色内容底。** 资源面板现在和快速连接一样有 inset 的圆角浅色/磨砂内容底，视觉层级更统一。
+- **开发构建提速配置。** dev profile 下本 crate 取消优化、依赖保持轻度优化，并在 Windows MSVC 下使用 `rust-lld.exe`，提升日常增量 build/check 速度。
+
+### 修复 / Fixed
+
+- **修复欢迎页为侧栏时 tab 栏仍显示“+”的问题。** 开启欢迎页侧栏后，tab 栏不再显示新建欢迎页入口，避免无法切回欢迎页的误导。
+- **修复启动时同边双面板同时展开的兜底问题。** 如果配置恢复后快速连接和资源面板同边且都处于展开状态，启动时会自动收起资源面板，保持“一侧只展开一个面板”。
+- **修复不同停靠方向下收起箭头位置和图标不一致。** 收起按钮按停靠方向放到合适一侧，并统一使用 Material Icons 箭头。
+
+---
+
+### Added
+
+- **Four-edge docking and persistence for the welcome sidebar.** When “Welcome page as sidebar” is enabled, the quick-connect panel can now dock to the left, right, top, or bottom, and remembers its dock edge, size, and collapsed state.
+- **Persistent resource-panel collapse state.** The resource panel now restores the user’s last expanded/collapsed state; older configs without this state still fall back to the Interface sidebar default.
+- **Merged outer collapse strips for same-edge panels.** When quick connect and the resource panel share an edge, only one panel expands at a time; collapsed icons share one column/row, and a collapsed strip stays on the outer edge when the other panel is expanded.
+- **Inset light content surface for the resource panel.** The resource panel now matches quick connect with an inset rounded frosted content surface.
+- **Faster development builds.** The dev profile now leaves the local crate unoptimized, keeps dependencies lightly optimized, and uses `rust-lld.exe` on Windows MSVC for faster incremental build/check cycles.
+
+### Fixed
+
+- **Hide the tab “+” button when the welcome page is a sidebar.** This avoids a misleading new-welcome-tab entry when the welcome page already lives in the sidebar.
+- **Prevent same-edge double-expanded panels on startup.** If restored config would expand both quick connect and the resource panel on the same edge, the resource panel is collapsed at startup.
+- **Normalize collapse arrow placement and icons across dock edges.** Collapse buttons now use Material Icons and move according to the current dock edge.
+
 
 ## [0.5.1] - 2026-07-01
 

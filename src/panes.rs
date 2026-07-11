@@ -209,6 +209,36 @@ impl Layout {
         self.prune();
     }
 
+    /// Move every tab from `leaf_id` into another existing pane, then collapse
+    /// the emptied pane. Returns the destination leaf id.
+    pub fn merge_leaf_into_other(&mut self, leaf_id: u64) -> Option<u64> {
+        let target = first_leaf_id_except(&self.root, leaf_id)?;
+        let (tabs, active) = {
+            let src = self.leaf(leaf_id)?;
+            if src.tabs.is_empty() {
+                return None;
+            }
+            (src.tabs.clone(), src.active.clone())
+        };
+        if let Some(src) = self.leaf_mut(leaf_id) {
+            src.tabs.clear();
+            src.active.clear();
+        }
+        if let Some(dst) = self.leaf_mut(target) {
+            for tab in tabs {
+                if !dst.tabs.iter().any(|t| t == &tab) {
+                    dst.tabs.push(tab);
+                }
+            }
+            if !active.is_empty() {
+                dst.active = active;
+            }
+        }
+        self.focused = target;
+        self.prune();
+        Some(target)
+    }
+
     /// Remove `tab_id` from whatever pane holds it (tab closed). Collapses the pane
     /// if it becomes empty.
     pub fn remove_tab(&mut self, tab_id: &str) {
@@ -260,7 +290,6 @@ impl Layout {
 
 // --- tree walks ------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn layout_node(
     node: &Node,
     x: f32,
@@ -365,6 +394,16 @@ fn first_leaf_id(node: &Node) -> u64 {
     match node {
         Node::Leaf(l) => l.id,
         Node::Split { first, .. } => first_leaf_id(first),
+    }
+}
+
+fn first_leaf_id_except(node: &Node, except: u64) -> Option<u64> {
+    match node {
+        Node::Leaf(l) if l.id != except => Some(l.id),
+        Node::Leaf(_) => None,
+        Node::Split { first, second, .. } => {
+            first_leaf_id_except(first, except).or_else(|| first_leaf_id_except(second, except))
+        }
     }
 }
 
@@ -509,6 +548,23 @@ mod tests {
         rtabs.sort();
         assert_eq!(rtabs, vec!["b".to_string(), "c".to_string()]);
         assert_eq!(ids(&l.flatten(0.0, 0.0, 800.0, 600.0).0).len(), 2);
+    }
+
+    #[test]
+    fn merge_leaf_moves_tabs_and_collapses_split() {
+        let mut l = Layout::new(vec!["a".into(), "b".into(), "c".into()], "a".into());
+        let right = l.split(1, Dir::Horizontal, "c", false).unwrap();
+        let dest = l.merge_leaf_into_other(right).unwrap();
+        let (panes, splits) = l.flatten(0.0, 0.0, 800.0, 600.0);
+        assert_eq!(panes.len(), 1);
+        assert!(splits.is_empty());
+        assert_eq!(dest, 1);
+        assert_eq!(
+            l.leaf(1).unwrap().tabs,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(l.leaf(1).unwrap().active, "c");
+        assert_eq!(l.focused, 1);
     }
 
     #[test]

@@ -63,6 +63,9 @@ msgstr "Open source · MIT / Apache-2.0"
 msgid "Open-source libraries used"
 msgstr "Open-source libraries used"
 
+msgid "Open source"
+msgstr "Open source"
+
 msgid "Edit session"
 msgstr "Edit session"
 
@@ -72,8 +75,14 @@ msgstr "New session"
 msgid "Name"
 msgstr "Name"
 
+msgid "Name (optional)"
+msgstr "Name (optional)"
+
 msgid "e.g. production web-01"
 msgstr "e.g. production web-01"
+
+msgid "e.g. Production / Database"
+msgstr "e.g. Production / Database"
 
 msgid "Host / IP"
 msgstr "Host / IP"
@@ -84,6 +93,9 @@ msgstr "Port"
 msgid "Username"
 msgstr "Username"
 
+msgid "Prompted on connect if blank"
+msgstr "Prompted on connect if blank"
+
 msgid "Authentication"
 msgstr "Authentication"
 
@@ -92,6 +104,15 @@ msgstr "Password"
 
 msgid "Private key"
 msgstr "Private key"
+
+msgid "Keyboard-interactive"
+msgstr "Keyboard-interactive"
+
+msgid "Password / first answer"
+msgstr "Password / first answer"
+
+msgid "Server prompts are shown during login; MFA / OTP prompts will ask again."
+msgstr "Server prompts are shown during login; MFA / OTP prompts will ask again."
 
 msgid "Leave blank to keep the current password"
 msgstr "Leave blank to keep the current password"
@@ -108,11 +129,29 @@ msgstr "Leave blank to keep the current passphrase"
 msgid "Private key file"
 msgstr "Private key file"
 
+msgid "Paste private key"
+msgstr "Paste private key"
+
+msgid "Private key content is encrypted before saving."
+msgstr "Private key content is encrypted before saving."
+
 msgid "Browse…"
 msgstr "Browse…"
 
 msgid "Pick the private key itself (not the .pub public key)"
 msgstr "Pick the private key itself (not the .pub public key)"
+
+msgid "Login"
+msgstr "Login"
+
+msgid "Remember for this session"
+msgstr "Remember for this session"
+
+msgid "Please enter a host / IP address."
+msgstr "Please enter a host / IP address."
+
+msgid "Please enter a serial port."
+msgstr "Please enter a serial port."
 
 msgid "Cancel"
 msgstr "Cancel"
@@ -122,6 +161,24 @@ msgstr "Save"
 
 msgid "Create"
 msgstr "Create"
+
+msgid "Connect"
+msgstr "Connect"
+
+msgid "Test connection"
+msgstr "Test connection"
+
+msgid "Testing..."
+msgstr "Testing..."
+
+msgid "Connection OK"
+msgstr "Connection OK"
+
+msgid "Connection failed"
+msgstr "Connection failed"
+
+msgid "Connection timed out"
+msgstr "Connection timed out"
 
 msgid "SFTP not connected"
 msgstr "SFTP not connected"
@@ -164,6 +221,9 @@ msgstr "Permissions"
 
 msgid "Copy path"
 msgstr "Copy path"
+
+msgid "Copy to session..."
+msgstr "Copy to session..."
 
 msgid "Refresh"
 msgstr "Refresh"
@@ -273,6 +333,15 @@ msgstr "Send"
 msgid "No quick commands yet"
 msgstr "No quick commands yet"
 
+msgid "Group (optional)"
+msgstr "Group (optional)"
+
+msgid "Rename group"
+msgstr "Rename group"
+
+msgid "leave empty → default"
+msgstr "leave empty → default"
+
 msgid "Manage…"
 msgstr "Manage…"
 
@@ -281,6 +350,9 @@ msgstr "No history yet"
 
 msgid "e.g. tail log"
 msgstr "e.g. tail log"
+
+msgid "Search history"
+msgstr "Search history"
 
 msgid "Port forwarding"
 msgstr "Port forwarding"
@@ -339,8 +411,23 @@ msgstr "Import ~/.ssh/config"
 msgid "Proxy (optional)"
 msgstr "Proxy (optional)"
 
+msgid "No proxy — use $ALL_PROXY or connect directly"
+msgstr "No proxy — use $ALL_PROXY or connect directly"
+
 msgid "Leave blank to use $ALL_PROXY or connect directly"
 msgstr "Leave blank to use $ALL_PROXY or connect directly"
+
+msgid "Proxy address"
+msgstr "Proxy address"
+
+msgid "Format: host:port  (with auth: user:pass@host:port)"
+msgstr "Format: host:port  (with auth: user:pass@host:port)"
+
+msgid "Jump host (optional)"
+msgstr "Jump host (optional)"
+
+msgid "Tunnel this connection through another saved SSH session."
+msgstr "Tunnel this connection through another saved SSH session."
 
 msgid "Connection type"
 msgstr "Connection type"
@@ -363,6 +450,12 @@ msgstr "Flow control"
 msgid "None"
 msgstr "None"
 
+msgid "Note (optional)"
+msgstr "Note (optional)"
+
+msgid "Anything to remember about this host"
+msgstr "Anything to remember about this host"
+
 msgid "Hardware"
 msgstr "Hardware"
 
@@ -381,6 +474,12 @@ msgstr "Please confirm"
 msgid "Confirm"
 msgstr "Confirm"
 
+msgid "Disable shell integration (Windows / pwsh server)"
+msgstr "Disable shell integration (Windows / pwsh server)"
+
+msgid "Turn on for Windows servers: skips the cwd-follow hook and monitor that assume a POSIX shell and otherwise break the shell."
+msgstr "Turn on for Windows servers: skips the cwd-follow hook and monitor that assume a POSIX shell and otherwise break the shell."
+
 msgid "Split right"
 msgstr "Split right"
 
@@ -395,3 +494,6 @@ msgstr "Duplicate connection"
 
 msgid "Copied"
 msgstr "Copied"
+
+msgid "Clear sort"
+msgstr "Clear sort"

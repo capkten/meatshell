@@ -1,5 +1,5 @@
 import { Theme } from "theme.slint";
-import { IconButton, PrimaryButton, GhostButton } from "widgets.slint";
+import { PrimaryButton, GhostButton } from "widgets.slint";
 import { ScrollView } from "std-widgets.slint";
 
 export struct SessionInfo {
@@ -13,7 +13,6 @@ export struct SessionInfo {
     group: string,        // folder/group name ("" = ungrouped)
     group-header: string, // set on the first row of each group → render a header
     collapsed: bool,      // group is collapsed → this session row is hidden
-    notes: string,        // user-defined notes/memo
 }
 
 // --- SessionRow ------------------------------------------------------------
@@ -197,17 +196,29 @@ component SessionRow inherits Rectangle {
             color: Theme.text-secondary;
             font-size: Theme.fs-sm;
             vertical-alignment: center;
-            width: 100px;
-            overflow: elide;
-        }
-        if session.notes != "" : Text {
-            text: session.notes;
-            color: Theme.text-muted;
-            font-size: Theme.fs-xs;
-            vertical-alignment: center;
             horizontal-stretch: 1;
-            overflow: elide;
         }
+    }
+}
+
+component CollapseButton inherits Rectangle {
+    in property <string> glyph;
+    callback clicked();
+    width: 24px;
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: ta.has-hover ? Theme.bg-hover : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.glyph;
+        font-family: "Material Icons";
+        color: Theme.text-secondary;
+        font-size: 16px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 }
 
@@ -229,8 +240,12 @@ export component Welcome inherits Rectangle {
     // Compact mode (welcome-as-sidebar): drop the big title/tagline header and
     // tighten padding so the session list fits a narrow docked panel (#v0.5).
     in property <bool> compact;
+    in property <string> dock-edge: "left";
+    property <bool> dock-horizontal: root.dock-edge == "left" || root.dock-edge == "right";
     // Collapse the sidebar to the edge icon strip (compact mode only) (#v0.5 M5).
     callback collapse();
+    callback dock-drag-move(length, length);
+    callback dock-drag-end();
 
     background: Theme.bg-root;
 
@@ -260,12 +275,11 @@ export component Welcome inherits Rectangle {
             }
         }
 
-        // Quick Connect card — fills the remaining height *when there are
-        // sessions* so the list can scroll (#116); when empty it stays at its
-        // natural height right under the header (a spacer below soaks up the rest)
-        // so the empty placeholder doesn't get stranded at the bottom (#131-ux).
+        // Quick Connect card — always fills the remaining height so the panel
+        // doesn't jump when the first session is added (the empty placeholder
+        // stretches to fill just like the session list does) (#214).
         Rectangle {
-            vertical-stretch: root.sessions.length > 0 ? 1 : 0;
+            vertical-stretch: 1;
             background: Theme.bg-panel;
             border-radius: Theme.radius-md;
             border-width: 1px;
@@ -275,46 +289,58 @@ export component Welcome inherits Rectangle {
                 padding: 16px;
                 spacing: 12px;
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text {
-                        text: @tr("Quick connect");
-                        color: Theme.text-primary;
-                        font-size: Theme.fs-lg;
-                        font-weight: 600;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
+                Rectangle {
+                    height: header-row.preferred-height;
+                    TouchArea {
+                        enabled: root.compact;
+                        mouse-cursor: move;
+                        moved => {
+                            root.dock-drag-move(self.absolute-position.x + self.mouse-x,
+                                                self.absolute-position.y + self.mouse-y);
+                        }
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.up) { root.dock-drag-end(); }
+                        }
                     }
-                    // Collapse the sidebar into the edge icon strip (compact only).
-                    if root.compact : IconButton {
-                        glyph: "‹";   // collapse to the edge strip
-                        size: 24px;
-                        clicked => { root.collapse(); }
-                    }
-                    // Result of the last "Import ~/.ssh/config" (triggered from
-                    // the settings menu), e.g. "imported 3".
-                    Text {
-                        text: root.import-hint;
-                        color: Theme.text-muted;
-                        font-size: Theme.fs-sm;
-                        vertical-alignment: center;
-                    }
-                    // Full page (wide) → the button sits inline on the header row.
-                    if !root.compact : PrimaryButton {
-                        text: @tr("+ New session");
-                        clicked => { root.new-session(); }
+                    header-row := HorizontalLayout {
+                        spacing: 8px;
+                        if root.compact && root.dock-edge != "left" : CollapseButton {
+                            glyph: root.dock-edge == "right" ? "\u{E5CC}"
+                                 : root.dock-edge == "top" ? "\u{E5CE}"
+                                 : "\u{E5CF}";
+                            clicked => { root.collapse(); }
+                        }
+                        Text {
+                            text: @tr("Quick connect");
+                            color: Theme.text-primary;
+                            font-size: Theme.fs-lg;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        if root.compact && root.dock-edge == "left" : CollapseButton {
+                            glyph: "\u{E5CB}";
+                            clicked => { root.collapse(); }
+                        }
+                        Text {
+                            text: root.import-hint;
+                            color: Theme.text-muted;
+                            font-size: Theme.fs-sm;
+                            vertical-alignment: center;
+                        }
+                        if !root.compact : PrimaryButton {
+                            text: @tr("+ New session");
+                            clicked => { root.new-session(); }
+                        }
                     }
                 }
-                // Sidebar (compact) → the New-session button gets its own
-                // full-width row, so it never overflows the narrow sidebar and
-                // its label stays centred without resizing (#187-1).
                 if root.compact : PrimaryButton {
                     text: @tr("+ New session");
                     clicked => { root.new-session(); }
                 }
 
                 if sessions.length == 0 : Rectangle {
-                    height: 120px;
+                    vertical-stretch: 1;
                     background: Theme.bg-root;
                     border-radius: Theme.radius-sm;
                     border-width: 1px;
@@ -467,9 +493,5 @@ export component Welcome inherits Rectangle {
                 }
             }
         }
-
-        // No sessions → soak up the leftover height below the natural-height card
-        // so it sits right under the header instead of stranded at the bottom.
-        if root.sessions.length == 0 : Rectangle { vertical-stretch: 1; }
     }
 }

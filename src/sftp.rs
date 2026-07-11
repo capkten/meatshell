@@ -10,7 +10,7 @@
 //! terminal tab.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,7 +22,6 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client::{self, Handler};
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::load_secret_key;
 use russh::Disconnect;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::{RawSftpSession, SftpSession};
@@ -64,7 +63,17 @@ pub enum SftpCommand {
     /// (and any remote temp archive) are cleaned up.
     CancelTransfer(String),
     /// Upload a local file into a remote directory.
-    Upload { local: String, remote_dir: String },
+    Upload {
+        local: PathBuf,
+        remote_dir: String,
+        cleanup_after: Option<PathBuf>,
+    },
+    /// Copy remote entries from this session into another SFTP session.
+    CopyTo {
+        remotes: Vec<String>,
+        target: UnboundedSender<SftpCommand>,
+        target_dir: String,
+    },
     /// Delete a remote file (falls back to removing an empty directory).
     Delete(String),
     /// Download a file to a temp dir and open it with the OS default app
@@ -116,10 +125,24 @@ impl SftpHandle {
     pub fn cancel_transfer(&self, id: String) {
         let _ = self.commands.send(SftpCommand::CancelTransfer(id));
     }
-    pub fn upload(&self, local: String, remote_dir: String) {
-        let _ = self
-            .commands
-            .send(SftpCommand::Upload { local, remote_dir });
+    pub fn upload(&self, local: PathBuf, remote_dir: String) {
+        let _ = self.commands.send(SftpCommand::Upload {
+            local,
+            remote_dir,
+            cleanup_after: None,
+        });
+    }
+    pub fn copy_to(
+        &self,
+        remotes: Vec<String>,
+        target: UnboundedSender<SftpCommand>,
+        target_dir: String,
+    ) {
+        let _ = self.commands.send(SftpCommand::CopyTo {
+            remotes,
+            target,
+            target_dir,
+        });
     }
     pub fn toggle_tree_node(&self, path: String) {
         let _ = self.commands.send(SftpCommand::ToggleTreeNode(path));
@@ -204,13 +227,14 @@ fn friendly_sftp_error(err: &anyhow::Error) -> String {
 pub fn spawn_sftp(
     runtime: &tokio::runtime::Handle,
     session: Session,
+    jump: Option<Session>,
     events: UnboundedSender<SessionEvent>,
 ) -> SftpHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let self_tx = cmd_tx.clone();
     let events_err = events.clone();
     let join = runtime.spawn(async move {
-        if let Err(err) = run_sftp(session, cmd_rx, self_tx, events).await {
+        if let Err(err) = run_sftp(session, jump, cmd_rx, self_tx, events).await {
             let _ = events_err.send(SessionEvent::SftpStatus(friendly_sftp_error(&err)));
         }
     });
@@ -293,6 +317,7 @@ async fn sync_tree_dir(
 
 async fn run_sftp(
     session: Session,
+    jump: Option<Session>,
     mut commands: UnboundedReceiver<SftpCommand>,
     self_tx: UnboundedSender<SftpCommand>,
     events: UnboundedSender<SessionEvent>,
@@ -321,19 +346,47 @@ async fn run_sftp(
     });
 
     let addr = format!("{}:{}", session.host, session.port);
-    // Tunnel through the same proxy as the shell session, if configured.
-    let mut handle = match crate::proxy::resolve(&session.proxy) {
-        Some(p) => {
-            let stream = crate::proxy::connect(&p, &session.host, session.port)
-                .await
-                .with_context(|| format!("sftp proxy connect {} failed", addr))?;
-            client::connect_stream(config, stream, sftp_handler(&session, &events))
-                .await
-                .with_context(|| format!("sftp connect {} failed", addr))?
-        }
-        None => client::connect(config, addr.as_str(), sftp_handler(&session, &events))
+    // Keep the jump-host connection alive for the whole SFTP session — the
+    // direct-tcpip tunnel rides on it (#211). Declared here so it lives to the
+    // end of the function; `_`-prefixed so it isn't flagged unused.
+    let mut _jump_keepalive;
+    // Tunnel through an SSH jump host (#211), the same proxy as the shell (#7),
+    // or connect directly.
+    let mut handle = match &jump {
+        Some(j) => {
+            let (h, jh) = crate::ssh::connect_target_via_jump(
+                j,
+                &session.host,
+                session.port,
+                config.clone(),
+                sftp_handler(&session, &events),
+                &events,
+            )
             .await
-            .with_context(|| format!("sftp connect {} failed", addr))?,
+            .with_context(|| format!("sftp connect {} via jump failed", addr))?;
+            _jump_keepalive = Some(jh);
+            h
+        }
+        None => {
+            _jump_keepalive = None;
+            match crate::proxy::resolve(&session.proxy) {
+                Some(p) => {
+                    let stream = crate::proxy::connect(&p, &session.host, session.port)
+                        .await
+                        .with_context(|| format!("sftp proxy connect {} failed", addr))?;
+                    client::connect_stream(config.clone(), stream, sftp_handler(&session, &events))
+                        .await
+                        .with_context(|| format!("sftp connect {} failed", addr))?
+                }
+                None => client::connect(
+                    config.clone(),
+                    addr.as_str(),
+                    sftp_handler(&session, &events),
+                )
+                .await
+                .with_context(|| format!("sftp connect {} failed", addr))?,
+            }
+        }
     };
 
     // Resolve missing username/password (shares the shell's prompt; the UI
@@ -345,30 +398,88 @@ async fn run_sftp(
 
     // --- Authenticate (same method as the shell session) -------------------
     let authed = match session.auth {
-        AuthMethod::Password => handle
-            .authenticate_password(&user, password.as_str())
-            .await
-            .context("sftp password auth failed")?,
-        AuthMethod::Key => {
-            let raw = session.private_key_path.trim();
-            if raw.is_empty() {
-                return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
+        AuthMethod::Password => {
+            let mut ok = handle
+                .authenticate_password(&user, password.as_str())
+                .await
+                .context("sftp password auth failed")?;
+            if !ok {
+                // Match the shell session's fallback: russh can hang if a second
+                // auth method is attempted on the same failed handle, so reconnect
+                // before trying keyboard-interactive (#86, #186).
+                let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                handle = match &jump {
+                    Some(j) => {
+                        let (h, jh) = crate::ssh::connect_target_via_jump(
+                            j,
+                            &session.host,
+                            session.port,
+                            config.clone(),
+                            sftp_handler(&session, &events),
+                            &events,
+                        )
+                        .await
+                        .with_context(|| format!("sftp reconnect {} via jump failed", addr))?;
+                        _jump_keepalive = Some(jh);
+                        h
+                    }
+                    None => {
+                        _jump_keepalive = None;
+                        match crate::proxy::resolve(&session.proxy) {
+                            Some(p) => {
+                                let stream = crate::proxy::connect(&p, &session.host, session.port)
+                                    .await
+                                    .with_context(|| {
+                                        format!("sftp proxy reconnect {} failed", addr)
+                                    })?;
+                                client::connect_stream(
+                                    config.clone(),
+                                    stream,
+                                    sftp_handler(&session, &events),
+                                )
+                                .await
+                                .with_context(|| format!("sftp reconnect {} failed", addr))?
+                            }
+                            None => client::connect(
+                                config.clone(),
+                                addr.as_str(),
+                                sftp_handler(&session, &events),
+                            )
+                            .await
+                            .with_context(|| format!("sftp reconnect {} failed", addr))?,
+                        }
+                    }
+                };
+                ok = crate::ssh::keyboard_interactive_auth(
+                    &mut handle,
+                    &user,
+                    password.as_str(),
+                    &session.id,
+                    &session.host,
+                    &events,
+                )
+                .await
+                .context("sftp keyboard-interactive auth failed")?;
             }
-            let normalised = raw.replace('\\', "/");
-            let key_path = normalised
-                .strip_suffix(".pub")
-                .map(str::to_string)
-                .unwrap_or(normalised);
+            ok
+        }
+        AuthMethod::KeyboardInteractive => crate::ssh::keyboard_interactive_auth(
+            &mut handle,
+            &user,
+            password.as_str(),
+            &session.id,
+            &session.host,
+            &events,
+        )
+        .await
+        .context("sftp keyboard-interactive auth failed")?,
+        AuthMethod::Key => {
             // An encrypted private key needs its passphrase; reuse the session's
             // password field for it (empty = unencrypted), exactly like the shell
             // session does — otherwise a passphrase-protected key authenticates the
             // shell but fails SFTP with "the key is encrypted" (#133).
             let pass = password.as_str();
-            let keypair = load_secret_key(
-                Path::new(&key_path),
-                if pass.is_empty() { None } else { Some(pass) },
-            )
-            .with_context(|| format!("failed to load key {key_path}"))?;
+            let keypair = crate::ssh::load_session_private_key(&session, pass)?;
             // RSA keys need an explicit SHA-2 hash; other key types don't.
             let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
             let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
@@ -759,7 +870,11 @@ async fn run_sftp(
                 }
             }
 
-            SftpCommand::Upload { local, remote_dir } => {
+            SftpCommand::Upload {
+                local,
+                remote_dir,
+                cleanup_after,
+            } => {
                 // Run on its own task so the command loop stays free to list /
                 // switch directories during the transfer (#116-2).
                 let sftp = sftp.clone();
@@ -781,7 +896,20 @@ async fn run_sftp(
                         .map(|m| m.is_dir())
                         .unwrap_or(false);
                     if is_dir {
-                        let dirname = base_name(&local);
+                        let dirname = match local_file_name_utf8(&local) {
+                            Ok(name) => name,
+                            Err(e) => {
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {e}",
+                                    t("上传失败", "Upload failed")
+                                )));
+                                if let Some(path) = cleanup_after.as_deref() {
+                                    cleanup_import_path(path).await;
+                                }
+                                cancels_done.lock().unwrap().remove(&up_id);
+                                return;
+                            }
+                        };
                         let _ = events.send(SessionEvent::SftpStatus(format!(
                             "{} {}/...",
                             t("上传文件夹", "Uploading folder"),
@@ -810,7 +938,20 @@ async fn run_sftp(
                             }
                         }
                     } else {
-                        let filename = base_name(&local);
+                        let filename = match local_file_name_utf8(&local) {
+                            Ok(name) => name,
+                            Err(e) => {
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {e}",
+                                    t("上传失败", "Upload failed")
+                                )));
+                                if let Some(path) = cleanup_after.as_deref() {
+                                    cleanup_import_path(path).await;
+                                }
+                                cancels_done.lock().unwrap().remove(&up_id);
+                                return;
+                            }
+                        };
                         let remote_path =
                             format!("{}/{}", remote_dir.trim_end_matches('/'), filename);
                         let id = up_id.clone();
@@ -875,7 +1016,45 @@ async fn run_sftp(
                             }
                         }
                     }
+                    if let Some(path) = cleanup_after.as_deref() {
+                        cleanup_import_path(path).await;
+                    }
                     cancels_done.lock().unwrap().remove(&up_id);
+                });
+            }
+
+            SftpCommand::CopyTo {
+                remotes,
+                target,
+                target_dir,
+            } => {
+                let sftp = sftp.clone();
+                let handle = handle.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let label = format!("{} {}", remotes.len(), t("项", "items"));
+                    let _ = events.send(SessionEvent::SftpStatus(format!(
+                        "{} {}...",
+                        t("复制到其他会话", "Copying to another session"),
+                        label
+                    )));
+                    for remote in remotes {
+                        match stage_remote_for_copy(&sftp, &handle, &remote, &events).await {
+                            Ok((local, cleanup_root)) => {
+                                let _ = target.send(SftpCommand::Upload {
+                                    local,
+                                    remote_dir: target_dir.clone(),
+                                    cleanup_after: Some(cleanup_root),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {e}",
+                                    t("复制失败", "Copy failed")
+                                )));
+                            }
+                        }
+                    }
                 });
             }
 
@@ -1235,6 +1414,13 @@ fn base_name(path: &str) -> String {
         .to_string()
 }
 
+fn local_file_name_utf8(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("local file name is not valid UTF-8: {}", path.display()))
+}
+
 /// Single-quote a string for safe interpolation into a remote `/bin/sh`
 /// command. Remote names come from the *server's* listing and are therefore
 /// untrusted — without quoting, a crafted name like `; rm -rf ~` would run.
@@ -1405,8 +1591,9 @@ fn spawn_edit_watcher(
             if cur.is_some() && cur != last {
                 last = cur;
                 let _ = self_tx.send(SftpCommand::Upload {
-                    local: local.clone(),
+                    local: PathBuf::from(&local),
                     remote_dir: remote_dir.clone(),
+                    cleanup_after: None,
                 });
                 let _ = events.send(SessionEvent::SftpStatus(format!(
                     "{}: {}",
@@ -1421,6 +1608,60 @@ fn spawn_edit_watcher(
 // ---------------------------------------------------------------------------
 // SFTP helpers
 // ---------------------------------------------------------------------------
+
+async fn cleanup_import_path(path: &Path) {
+    let res = match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(path).await,
+        Ok(_) => tokio::fs::remove_file(path).await,
+        Err(_) => Ok(()),
+    };
+    if let Err(e) = res {
+        tracing::debug!("failed to clean temporary SFTP copy {:?}: {e}", path);
+    }
+}
+
+async fn stage_remote_for_copy(
+    sftp: &SftpSession,
+    handle: &client::Handle<SftpClientHandler>,
+    remote: &str,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<(PathBuf, PathBuf)> {
+    let cleanup_root =
+        std::env::temp_dir().join(format!("meatshell-remote-copy-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&cleanup_root)
+        .await
+        .with_context(|| format!("failed to create temp dir {}", cleanup_root.display()))?;
+
+    let name = sanitize_filename(&base_name(remote));
+    let local_path = cleanup_root.join(&name);
+    let local_parent = cleanup_root.to_string_lossy().to_string();
+    let is_dir = sftp
+        .metadata(remote)
+        .await
+        .ok()
+        .map(|m| (m.permissions.unwrap_or(0) & 0o170_000) == 0o040_000)
+        .unwrap_or(false);
+    let no_cancel = Arc::new(AtomicBool::new(false));
+    let id = Uuid::new_v4().to_string();
+
+    if is_dir {
+        tokio::fs::create_dir_all(&local_path)
+            .await
+            .with_context(|| format!("failed to create temp dir {}", local_path.display()))?;
+        let empty = list_dir_impl(sftp, remote)
+            .await
+            .map(|entries| entries.is_empty())
+            .unwrap_or(false);
+        if !empty {
+            download_dir(sftp, handle, remote, &local_parent, events).await?;
+        }
+    } else {
+        let local = local_path.to_string_lossy().to_string();
+        download_impl(handle, remote, &local, &name, &id, events, &no_cancel).await?;
+    }
+
+    Ok((local_path, cleanup_root))
+}
 
 /// A friendlier message for a failed directory listing, calling out the common
 /// permission-denied case explicitly rather than dumping the raw error (#112).
@@ -1487,7 +1728,6 @@ async fn list_dirs_only_impl(sftp: &SftpSession, path: &str) -> Result<Vec<(Stri
 }
 
 /// Emit a transfer-progress event.
-#[allow(clippy::too_many_arguments)]
 fn emit_transfer(
     events: &UnboundedSender<SessionEvent>,
     id: &str,
@@ -1774,25 +2014,25 @@ async fn remove_dir_recursive(sftp: &SftpSession, root: &str) -> Result<()> {
 async fn upload_dir(
     handle: &client::Handle<SftpClientHandler>,
     sftp: &SftpSession,
-    local_root: &str,
+    local_root: &Path,
     remote_parent: &str,
     events: &UnboundedSender<SessionEvent>,
 ) -> Result<()> {
     // Folder uploads aren't individually cancellable from the UI; a throwaway
     // never-set flag satisfies upload_pipelined's signature.
     let no_cancel = Arc::new(AtomicBool::new(false));
-    let root_name = base_name(local_root);
+    let root_name = local_file_name_utf8(local_root)?;
     let remote_root = format!("{}/{}", remote_parent.trim_end_matches('/'), root_name);
-    let mut stack = vec![(local_root.to_string(), remote_root)];
+    let mut stack = vec![(local_root.to_path_buf(), remote_root)];
     while let Some((ldir, rdir)) = stack.pop() {
         // Best-effort mkdir; an error usually just means the dir already exists.
         let _ = sftp.create_dir(&rdir).await;
         let mut rd = tokio::fs::read_dir(&ldir)
             .await
-            .with_context(|| format!("read local dir {ldir}"))?;
+            .with_context(|| format!("read local dir {}", ldir.display()))?;
         while let Some(entry) = rd.next_entry().await.context("read dir entry")? {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let lpath = entry.path().to_string_lossy().to_string();
+            let lpath = entry.path();
+            let name = local_file_name_utf8(&lpath)?;
             let rchild = format!("{}/{}", rdir, name);
             let ft = entry.file_type().await.context("file type")?;
             if ft.is_dir() {
@@ -1817,7 +2057,7 @@ async fn upload_dir(
 /// native scp.
 async fn upload_pipelined(
     handle: &client::Handle<SftpClientHandler>,
-    local: &str,
+    local: &Path,
     remote: &str,
     name: &str,
     id: &str,
@@ -1835,7 +2075,7 @@ async fn upload_pipelined(
         .unwrap_or(0);
     let mut local_file = tokio::fs::File::open(local)
         .await
-        .with_context(|| format!("open local {local}"))?;
+        .with_context(|| format!("open local {}", local.display()))?;
 
     // Dedicated raw SFTP channel for the transfer (keeps the browse session
     // responsive and lets us issue concurrent WRITE requests).

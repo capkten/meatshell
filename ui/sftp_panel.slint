@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { ScrollView } from "std-widgets.slint";
+import { TabInfo } from "tabs.slint";
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -9,9 +10,10 @@ export struct SftpEntry {
     name: string,
     full-path: string,
     is-dir: bool,
-    is-image: bool,   // image file detected by extension (Rust sets this)
     size: string,
+    size-bytes: float,
     modified: string,
+    modified-ts: float,
     mode: int,        // POSIX permission bits, for the chmod dialog (#84)
     selected: bool,   // multi-select checkbox state (#100)
 }
@@ -58,6 +60,10 @@ export component SftpPanel inherits Rectangle {
     in property <string>  status: @tr("SFTP not connected");
     in property <bool>    loading: false;
     in property <[SftpTreeNode]> tree-nodes: [];
+    in property <string> current-tab-id;
+    in property <[TabInfo]> transfer-targets: [];
+    in property <string> sort-key: "";
+    in property <int> sort-dir: 0; // 0 default / 1 asc / -1 desc
     in property <bool> collapsed: false;   // when true only the toolbar shows
     in property <bool> show-tree: true;    // hide the directory tree when narrow (#dock)
     in property <bool> compact: false;     // side-docked + collapsed → render nothing but a clean strip (#dock)
@@ -81,7 +87,6 @@ export component SftpPanel inherits Rectangle {
     property <string> menu-target;          // "" = whitespace
     property <string> menu-target-name;
     property <bool>   menu-target-is-dir;
-    property <bool>   menu-target-is-image;  // set by Rust from file extension
     property <int>    menu-target-mode;     // permission bits for the chmod dialog
 
     // --- Callbacks ---------------------------------------------------------
@@ -95,11 +100,14 @@ export component SftpPanel inherits Rectangle {
     callback toggle-select(int);    // toggle a row's multi-select checkbox (#100)
     callback download-selected();   // download all checked entries (#100)
     callback delete-selected();     // delete all checked entries (#100)
+    callback copy-to-target(string /* path */, string /* target tab */);
+    callback copy-selected-to-target(string /* target tab */);
     callback view(string);          // open read-only in the built-in viewer
     callback edit(string);          // open writable in the built-in editor
-    callback preview(string);       // open image in the image viewer
     callback open-external(string);     // open with the OS default app (#81)
     callback edit-external(string);     // open externally + watch/re-upload (#81)
+    callback sort-request(string /* name|size|modified */);
+    callback clear-sort();
     // Context-menu extensions (#69). The *-request callbacks open dialogs in
     // the app shell; copy-path goes straight to the system clipboard.
     callback rename-request(string /* path */, string /* current name */);
@@ -142,12 +150,14 @@ export component SftpPanel inherits Rectangle {
 
         // --- Toolbar (full width) ------------------------------------------
         Rectangle {
-            height: 30px;
+            height: 34px;
             background: Theme.bg-panel-alt;
 
             HorizontalLayout {
                 padding-left: 6px;
                 padding-right: 6px;
+                padding-top: 6px;
+                padding-bottom: 6px;
                 spacing: 4px;
 
                 // Dedicated drag handle to re-dock the panel. The toolbar is full
@@ -442,12 +452,51 @@ export component SftpPanel inherits Rectangle {
                         // Spacer matching the rows' checkbox so the header columns
                         // line up with the values below them (#dock).
                         Rectangle { width: 16px; }
-                        Text { text: @tr("Name"); color: Theme.text-muted; font-size: Theme.fs-xs;
-                               horizontal-stretch: 1; vertical-alignment: center; }
-                        if root.show-size-col : Text { text: @tr("Size"); color: Theme.text-muted; font-size: Theme.fs-xs;
-                               width: 72px; horizontal-alignment: right; vertical-alignment: center; }
-                        if root.show-modified-col : Text { text: @tr("Modified"); color: Theme.text-muted; font-size: Theme.fs-xs;
-                               width: 116px; horizontal-alignment: right; vertical-alignment: center; }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            header-name-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.sort-request("name"); }
+                            }
+                            Text {
+                                text: @tr("Name") + (root.sort-key == "name" ? (root.sort-dir > 0 ? " ↑" : " ↓") : "");
+                                color: root.sort-key == "name" ? Theme.accent : Theme.text-muted;
+                                font-size: Theme.fs-xs;
+                                width: parent.width;
+                                horizontal-alignment: left;
+                                vertical-alignment: center;
+                            }
+                        }
+                        if root.show-size-col : Rectangle {
+                            width: 72px;
+                            header-size-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.sort-request("size"); }
+                            }
+                            Text {
+                                text: @tr("Size") + (root.sort-key == "size" ? (root.sort-dir > 0 ? " ↑" : " ↓") : "");
+                                color: root.sort-key == "size" ? Theme.accent : Theme.text-muted;
+                                font-size: Theme.fs-xs;
+                                width: parent.width;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                        }
+                        if root.show-modified-col : Rectangle {
+                            width: 116px;
+                            header-modified-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.sort-request("modified"); }
+                            }
+                            Text {
+                                text: @tr("Modified") + (root.sort-key == "modified" ? (root.sort-dir > 0 ? " ↑" : " ↓") : "");
+                                color: root.sort-key == "modified" ? Theme.accent : Theme.text-muted;
+                                font-size: Theme.fs-xs;
+                                width: parent.width;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
                 Rectangle { height: 1px; background: Theme.border-subtle; }
@@ -506,7 +555,6 @@ export component SftpPanel inherits Rectangle {
                                             root.menu-target = entry.full-path;
                                             root.menu-target-name = entry.name;
                                             root.menu-target-is-dir = entry.is-dir;
-                                            root.menu-target-is-image = entry.is-image;
                                             root.menu-target-mode = entry.mode;
                                             root.menu-x = self.absolute-position.x + self.mouse-x - file-area.absolute-position.x;
                                             root.menu-y = self.absolute-position.y + self.mouse-y - file-area.absolute-position.y;
@@ -587,11 +635,43 @@ export component SftpPanel inherits Rectangle {
                     // One context menu for the whole list (#84). Item actions are
                     // enabled only when an item was right-clicked (menu-target set);
                     // new/refresh are always available.
+                    copy-target-menu := PopupWindow {
+                        x: root.menu-x + 148px;
+                        y: root.menu-y;
+                        width: 148px;
+                        height: max(1, root.transfer-targets.length) * 27px + 8px;
+                        Rectangle {
+                            background: Theme.bg-panel;
+                            border-radius: Theme.radius-sm;
+                            border-width: 1px;
+                            border-color: Theme.border-strong;
+                            drop-shadow-blur: 12px;
+                            drop-shadow-color: #00000060;
+                            VerticalLayout {
+                                padding: 4px;
+                                spacing: 1px;
+                                for target in root.transfer-targets : SftpMenuItem {
+                                    label: target.title;
+                                    enabled: target.kind == "terminal" && target.connected && target.id != root.current-tab-id;
+                                    clicked => {
+                                        if (root.selected-count >= 2) {
+                                            root.copy-selected-to-target(target.id);
+                                        } else if (root.menu-target != "") {
+                                            root.copy-to-target(root.menu-target, target.id);
+                                        } else {
+                                            root.copy-selected-to-target(target.id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     file-menu := PopupWindow {
                         x: root.menu-x;
                         y: root.menu-y;
                         width: 148px;
-                        height: 12 * 27px + 8px;
+                        height: 14 * 27px + 8px;
                         Rectangle {
                             background: Theme.bg-panel;
                             border-radius: Theme.radius-sm;
@@ -606,11 +686,6 @@ export component SftpPanel inherits Rectangle {
                                     label: @tr("Download");
                                     enabled: root.menu-target != "";
                                     clicked => { root.download(root.menu-target); }
-                                }
-                                if root.menu-target-is-image : SftpMenuItem {
-                                    label: @tr("Preview");
-                                    enabled: root.menu-target != "" && !root.menu-target-is-dir;
-                                    clicked => { root.preview(root.menu-target); }
                                 }
                                 SftpMenuItem {
                                     label: @tr("View");
@@ -648,6 +723,11 @@ export component SftpPanel inherits Rectangle {
                                     clicked => { root.copy-path(root.menu-target); }
                                 }
                                 SftpMenuItem {
+                                    label: @tr("Copy to session...");
+                                    enabled: (root.menu-target != "" || root.selected-count > 0) && root.transfer-targets.length > 1;
+                                    clicked => { copy-target-menu.show(); }
+                                }
+                                SftpMenuItem {
                                     label: @tr("Delete");
                                     tint: #d86c6c;
                                     enabled: root.menu-target != "";
@@ -665,6 +745,11 @@ export component SftpPanel inherits Rectangle {
                                 SftpMenuItem {
                                     label: @tr("Refresh");
                                     clicked => { root.refresh(root.current-path); }
+                                }
+                                SftpMenuItem {
+                                    label: @tr("Clear sort");
+                                    enabled: root.sort-dir != 0;
+                                    clicked => { root.clear-sort(); }
                                 }
                             }
                         }

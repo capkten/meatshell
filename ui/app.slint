@@ -15,7 +15,7 @@ import "fonts/MeatshellMono-Bold.ttf";
 import "fonts/MaterialIcons-Regular.ttf";
 
 import { Theme } from "theme.slint";
-import { Sidebar, DiskInfo, GpuInfo } from "sidebar.slint";
+import { Sidebar, DiskInfo } from "sidebar.slint";
 import { TabBar, TabInfo } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
 import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
@@ -25,7 +25,6 @@ import { TerminalView, TermSpan, TermMatch, QuickCmd } from "terminal_view.slint
 import { SftpEntry, SftpTreeNode } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { InterfacePanel } from "interface_panel.slint";
-import { ImageViewer } from "image_viewer.slint";
 // Re-export so `slint::include_modules!` generates the ProcWindow Rust type.
 export { ProcWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
@@ -68,6 +67,8 @@ export struct TerminalState {
     sftp-loading: bool,
     sftp-tree-nodes: [SftpTreeNode],
     sftp-selected-count: int,   // checked entries in the SFTP panel (#100)
+    sftp-sort-key: string,      // ""|"name"|"size"|"modified" (#248)
+    sftp-sort-dir: int,         // 0 default / 1 asc / -1 desc (#248)
     sftp-collapsed: bool,       // SFTP panel minimised — per session (#v0.5)
     sftp-panel-height: length,  // SFTP panel extent (bottom dock) — per session
     sftp-panel-width: length,   // SFTP panel extent (side dock) — per session
@@ -252,7 +253,6 @@ export component AppWindow inherits Window {
     in property <string> net-selected;      // currently selected NIC
     in property <bool> net-show-selector;   // only on a live session tab
     in property <[DiskInfo]> disks;         // active tab's filesystem usage
-    in property <[GpuInfo]> gpus;           // per-GPU stats (empty = no GPU)
     in property <string> app-version;       // from Rust: env!("CARGO_PKG_VERSION")
     callback select-net-iface(string);
 
@@ -277,14 +277,13 @@ export component AppWindow inherits Window {
     callback win-drag();          // start an OS window-move
     callback win-resize(int);     // start an OS resize; arg = direction code
     in-out property <bool> sidebar-collapsed: false; // left panel hidden
+    callback set-sidebar-collapsed(bool);       // apply + persist
     // User-draggable size of the resource sidebar. width is used when docked
     // left/right, height when docked top/bottom. Seeded / persisted via the
     // persist-* callbacks (fired on drag end).
     in-out property <length> sidebar-width: 220px;
     in-out property <length> sidebar-height: 240px;
     property <bool> sidebar-dragging;            // splitter being dragged
-    property <length> sidebar-drag-start-x;      // mouse-x at drag start
-    property <length> sidebar-drag-start-y;      // mouse-y at drag start
     callback persist-sidebar-width(float /* logical px */);
 
     // --- Panel docking (resource sidebar; SFTP follows in a later phase) ----
@@ -307,13 +306,21 @@ export component AppWindow inherits Window {
     // The top-right toolbar icons float over the tab row; when the sidebar docks
     // top/right it covers that corner, so shift the icons to stay over the tabs.
     property <length> toolbar-x-off:
-        (root.sidebar-dock == "right" && !root.sidebar-collapsed) ? root.sidebar-width + 4px
-        // Docked right + collapsed: shift left to leave room for the expand
-        // button at the far-right corner (#dock).
-      : (root.sidebar-dock == "right" && root.sidebar-collapsed) ? 36px
-      : 0px;
+        (root.sidebar-dock == "right"
+            ? (root.sidebar-collapsed ? 36px : root.sidebar-width + 4px)
+            : 0px)
+        + ((root.welcome-as-sidebar && root.welcome-sidebar-dock == "right")
+            ? root.welcome-sidebar-taken
+            : 0px);
     property <length> toolbar-y-off:
-        (root.sidebar-dock == "top" && !root.sidebar-collapsed) ? root.sidebar-height + 4px : 0px;
+        (root.sidebar-dock == "top"
+            ? (root.sidebar-collapsed ? 36px : root.sidebar-height + 4px)
+            : 0px)
+        + ((root.welcome-as-sidebar && root.welcome-sidebar-dock == "top")
+            ? root.welcome-sidebar-taken
+            : 0px);
+    property <length> toolbar-y:
+        (root.custom-titlebar ? 43px : 5px + root.titlebar-inset) + root.toolbar-y-off;
     in-out property <bool> about-open: false;     // centered About dialog
     callback open-repo();                          // open the project's GitHub page
     in-out property <bool> shortcuts-open: false; // centered keyboard-shortcuts dialog (#103)
@@ -388,11 +395,16 @@ export component AppWindow inherits Window {
     // window so it can't leave the parent); init centered.
     // Centred, snapped to whole logical pixels: a half-pixel origin makes the
     // card's text render on subpixel offsets and look blurry (#v0.5).
-    property <length> ifd-x: round((root.width - 720px * Theme.panel-font) / 2 / 1px) * 1px;
-    property <length> ifd-y: round((root.height - 480px * Theme.panel-font) / 2 / 1px) * 1px;
+    property <length> ifd-w: min(root.width - 56px, max(640px, 720px * Theme.panel-font));
+    property <length> ifd-h: min(root.height - 56px, max(420px, 480px * Theme.panel-font));
+    property <length> ifd-x: round((root.width - root.ifd-w) / 2 / 1px) * 1px;
+    property <length> ifd-y: round((root.height - root.ifd-h) / 2 / 1px) * 1px;
     property <bool> ifd-dragging;
+    property <bool> ifd-resizing;
     property <length> ifd-base-x;
     property <length> ifd-base-y;
+    property <length> ifd-base-w;
+    property <length> ifd-base-h;
     property <length> ifd-grab-x;
     property <length> ifd-grab-y;
     callback set-term-font(string);                // apply + persist font family
@@ -421,6 +433,12 @@ export component AppWindow inherits Window {
     // Drag-resizable width of that welcome sidebar (logical px), persisted.
     in-out property <length> welcome-sidebar-width: 240px;
     callback persist-welcome-sidebar-width(float);
+    in-out property <string> welcome-sidebar-dock: "left";
+    property <bool> welcome-sidebar-horizontal:
+        root.welcome-sidebar-dock == "left" || root.welcome-sidebar-dock == "right";
+    property <length> welcome-sidebar-taken:
+        root.welcome-collapsed ? 36px : root.welcome-sidebar-width;
+    callback persist-welcome-sidebar-dock(string);
     // Welcome sidebar collapsed to the edge icon strip (IDEA-style), persisted.
     in-out property <bool> welcome-collapsed: false;
     callback set-welcome-collapsed(bool);          // apply + persist
@@ -438,6 +456,7 @@ export component AppWindow inherits Window {
     // double-click on the title-bar icon / X shouldn't drop active sessions.
     in-out property <bool> confirm-close-open: false;
     callback confirm-close-yes();                  // quit the app for real
+    in-out property <bool> terminal-restore-cover: false;
     // Host-key confirmation (#109-5). Rust opens this when a server presents an
     // unknown / changed host key; the user's answer flows back via the callbacks
     // and Rust closes the dialog.
@@ -483,6 +502,17 @@ export component AppWindow inherits Window {
     // Mirror SFTP uploads to other sessions while sync-input is on (#sync).
     in-out property <bool> sync-upload-enabled: false;
     callback set-sync-upload-enabled(bool);
+    // WebDAV config sync (#185): manual upload/download of portable session JSON.
+    in-out property <bool> webdav-enabled: false;
+    in-out property <string> webdav-url;
+    in-out property <string> webdav-username;
+    in-out property <string> webdav-password;
+    in-out property <string> webdav-remote-path;
+    in-out property <bool> webdav-accept-invalid-certs: false;
+    in-out property <string> webdav-status;
+    callback save-webdav-settings(bool, string, string, string, string, bool);
+    callback webdav-upload();
+    callback webdav-download();
     in-out property <length> sftp-panel-height: 220px; // shared; lets Rust locate the drop zone
     in-out property <length> sftp-panel-width: 380px;  // SFTP extent when docked left/right
     in-out property <string> sftp-dock: "bottom";      // SFTP dock edge, shared across tabs
@@ -526,17 +556,6 @@ export component AppWindow inherits Window {
     property <length> ed-grab-x;
     property <length> ed-grab-y;
 
-    // --- Image viewer --------------------------------------------------------
-    in-out property <bool> image-viewer-open: false;
-    in-out property <string> image-viewer-name;
-    in-out property <int> image-viewer-index;
-    in-out property <int> image-viewer-total;
-    in-out property <image> image-viewer-preview;
-    in-out property <string> image-viewer-error;
-    callback image-viewer-close();
-    callback image-viewer-prev();
-    callback image-viewer-next();
-
     // --- Session list ------------------------------------------------------
     in property <[SessionInfo]> sessions;
 
@@ -559,11 +578,17 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-auth: "password";
     in-out property <string> dialog-password;
     in-out property <string> dialog-key-path;
+    in-out property <string> dialog-key-inline;
+    in-out property <bool> dialog-key-inline-mode: false;
     in-out property <string> dialog-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> dialog-proxy-hostport;
     in-out property <string> dialog-group;
     // Existing group names (from Rust) for the dialog's group dropdown (#179).
     in property <[string]> session-groups;
+    // SSH jump host picker (#211): parallel label/id lists + selected index.
+    in property <[string]> jump-choices;
+    in property <[string]> jump-ids;
+    in-out property <int> dialog-jump-index: 0;
     in-out property <string> dialog-kind: "ssh";
     in-out property <string> dialog-serial-port;
     in-out property <string> dialog-baud: "115200";
@@ -573,6 +598,7 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-flow: "none";
     in-out property <bool> dialog-disable-shell-integration: false;
     in-out property <string> dialog-note;
+    in-out property <string> dialog-test-status;
 
     // Delete-confirmation modal state (#28).
     in-out property <bool> confirm-delete-open: false;
@@ -596,6 +622,7 @@ export component AppWindow inherits Window {
     callback toggle-group(string /* group */);
     callback remove-session(string /* session-id */);
     callback session-dialog-submit(SessionDraft);
+    callback session-dialog-test(SessionDraft);
     callback session-dialog-cancel();
     callback session-dialog-pick-key();
     // Port forwards for the session being edited (#56).
@@ -617,6 +644,7 @@ export component AppWindow inherits Window {
     // Split pane `pane-id`, peeling `tab-id` into a new pane on `dir`
     // ("left"/"right"/"up"/"down").
     callback pane-split(int /* pane-id */, string /* tab-id */, string /* dir */);
+    callback pane-merge(int /* pane-id */);
     // Open another connection to the same session as `tab-id` (a new tab).
     callback tab-duplicate(string /* tab-id */);
     // Drag-to-split (v0.5): cursor moved / dropped while dragging `tab-id`, in
@@ -660,11 +688,14 @@ export component AppWindow inherits Window {
     callback sftp-toggle-select(string /* tab-id */, int /* row */);   // (#100)
     callback sftp-download-selected(string /* tab-id */);              // (#100)
     callback sftp-delete-selected(string /* tab-id */);               // (#100)
+    callback sftp-copy-to-target(string /* tab-id */, string /* remote-path */, string /* target-tab-id */);
+    callback sftp-copy-selected-to-target(string /* tab-id */, string /* target-tab-id */);
     callback sftp-view(string /* tab-id */, string /* path */);
     callback sftp-edit(string /* tab-id */, string /* path */);
     callback sftp-open-external(string /* tab-id */, string /* path */);
     callback sftp-edit-external(string /* tab-id */, string /* path */);
-    callback sftp-preview(string /* tab-id */, string /* path */);
+    callback sftp-sort-request(string /* tab-id */, string /* key */);
+    callback sftp-clear-sort(string /* tab-id */);
     // SFTP context-menu extensions (#69): rename / chmod / mkdir / touch share
     // one single-input prompt dialog; copy-path goes straight to the clipboard.
     in-out property <bool> sftp-prompt-open: false;
@@ -790,36 +821,97 @@ export component AppWindow inherits Window {
         // right in `rest`.
         // Collapsed-only (M5): the icon strip shows only while collapsed; the
         // panel itself (welcome-w) only while expanded — one or the other.
-        property <length> strip-w: (root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
-        property <length> welcome-w: (root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
+        property <bool> sidebar-strip-outside:
+            root.welcome-as-sidebar && !root.welcome-collapsed
+            && root.sidebar-collapsed && root.sidebar-dock == root.welcome-sidebar-dock;
+        property <length> sidebar-outside-strip: dock-area.sidebar-strip-outside ? 36px : 0px;
+        property <length> welcome-strip: (root.welcome-as-sidebar && root.welcome-collapsed) ? 36px : 0px;
+        property <length> welcome-size: (root.welcome-as-sidebar && !root.welcome-collapsed) ? root.welcome-sidebar-width : 0px;
+        property <length> welcome-taken: welcome-strip + welcome-size + sidebar-outside-strip;
+        property <bool> welcome-horizontal: root.welcome-sidebar-horizontal;
         property <bool> welcome-sidebar-dragging;
+        property <bool> combine-collapsed-tools:
+            root.welcome-as-sidebar && root.welcome-collapsed
+            && root.sidebar-collapsed && root.sidebar-dock == root.welcome-sidebar-dock;
 
         // Collapsed welcome → a thin left icon strip (click the icon to re-open).
         if root.welcome-as-sidebar && root.welcome-collapsed : ToolStrip {
-            x: 0; y: 0; width: parent.strip-w; height: parent.height;
-            dock-edge: "left";
+            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.welcome-strip : 0px;
+            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.welcome-strip : 0px;
+            width: parent.welcome-horizontal ? parent.welcome-strip : parent.width;
+            height: parent.welcome-horizontal ? parent.height : parent.welcome-strip;
+            dock-edge: root.welcome-sidebar-dock;
             glyph: "\u{E88A}";   // session list / welcome
+            show-second: parent.combine-collapsed-tools;
+            second-glyph: "\u{E871}";   // dashboard — resource panel
             expand => {
                 root.welcome-collapsed = false;
                 root.set-welcome-collapsed(false);
+                if (root.sidebar-dock == root.welcome-sidebar-dock) {
+                    root.sidebar-collapsed = true;
+                    root.set-sidebar-collapsed(true);
+                }
+            }
+            expand-second => {
+                root.sidebar-collapsed = false;
+                root.set-sidebar-collapsed(false);
+            }
+        }
+
+        if dock-area.sidebar-strip-outside : ToolStrip {
+            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.sidebar-outside-strip : 0px;
+            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.sidebar-outside-strip : 0px;
+            width: parent.welcome-horizontal ? parent.sidebar-outside-strip : parent.width;
+            height: parent.welcome-horizontal ? parent.height : parent.sidebar-outside-strip;
+            dock-edge: root.welcome-sidebar-dock;
+            glyph: "\u{E871}";
+            expand => {
+                root.sidebar-collapsed = false;
+                root.set-sidebar-collapsed(false);
+                root.welcome-collapsed = true;
+                root.set-welcome-collapsed(true);
             }
         }
 
         // Welcome / session list, to the right of the icon strip. Hidden when
         // collapsed — its icon stays in the strip; clicking it re-opens.
         if root.welcome-as-sidebar && !root.welcome-collapsed : Rectangle {
-            x: parent.strip-w; y: 0; width: parent.welcome-w; height: parent.height;
+            x: root.welcome-sidebar-dock == "right" ? parent.width - parent.sidebar-outside-strip - parent.welcome-size
+             : root.welcome-sidebar-dock == "left" ? parent.sidebar-outside-strip
+             : 0px;
+            y: root.welcome-sidebar-dock == "bottom" ? parent.height - parent.sidebar-outside-strip - parent.welcome-size
+             : root.welcome-sidebar-dock == "top" ? parent.sidebar-outside-strip
+             : 0px;
+            width: parent.welcome-horizontal ? parent.welcome-size : parent.width;
+            height: parent.welcome-horizontal ? parent.height : parent.welcome-size;
             background: Theme.bg-panel;
             clip: true;
             Welcome {
                 width: parent.width;
                 height: parent.height;
                 compact: true;
+                dock-edge: root.welcome-sidebar-dock;
                 sessions: root.sessions;
                 import-hint: root.ssh-import-hint;
                 collapse => {
                     root.welcome-collapsed = true;
                     root.set-welcome-collapsed(true);
+                }
+                dock-drag-move(ax, ay) => {
+                    root.panel-dragging = true;
+                    root.drag-nx = (ax - dock-area.absolute-position.x) / dock-area.width;
+                    root.drag-ny = (ay - dock-area.absolute-position.y) / dock-area.height;
+                }
+                dock-drag-end() => {
+                    if (root.dock-target != "") {
+                        root.welcome-sidebar-dock = root.dock-target;
+                        if (root.sidebar-dock == root.dock-target) {
+                            root.sidebar-collapsed = true;
+                            root.set-sidebar-collapsed(true);
+                        }
+                        root.persist-welcome-sidebar-dock(root.welcome-sidebar-dock);
+                    }
+                    root.panel-dragging = false;
                 }
                 new-session => { root.new-session-clicked(); }
                 import-ssh-config => { root.import-ssh-config(); }
@@ -842,19 +934,28 @@ export component AppWindow inherits Window {
                 remove-session(id) => { root.remove-session(id); }
             }
             Rectangle {
-                x: parent.width - 1px; width: 1px; height: parent.height;
+                x: root.welcome-sidebar-dock == "left" ? parent.width - 1px : 0px;
+                y: root.welcome-sidebar-dock == "top" ? parent.height - 1px : 0px;
+                width: root.welcome-sidebar-horizontal ? 1px : parent.width;
+                height: root.welcome-sidebar-horizontal ? parent.height : 1px;
                 background: Theme.border-subtle;
             }
         }
 
         // Drag the welcome sidebar's right edge to resize it (v0.5 M3b).
         if root.welcome-as-sidebar && !root.welcome-collapsed : Rectangle {
-            x: parent.strip-w + parent.welcome-w - 2px; y: 0;
-            width: 4px; height: parent.height;
+            x: root.welcome-sidebar-dock == "left" ? parent.sidebar-outside-strip + parent.welcome-size - 2px
+             : root.welcome-sidebar-dock == "right" ? parent.width - parent.sidebar-outside-strip - parent.welcome-size - 2px
+             : 0px;
+            y: root.welcome-sidebar-dock == "top" ? parent.sidebar-outside-strip + parent.welcome-size - 2px
+             : root.welcome-sidebar-dock == "bottom" ? parent.height - parent.sidebar-outside-strip - parent.welcome-size - 2px
+             : 0px;
+            width: parent.welcome-horizontal ? 4px : parent.width;
+            height: parent.welcome-horizontal ? parent.height : 4px;
             background: ws-split-ta.has-hover || dock-area.welcome-sidebar-dragging
                 ? Theme.accent : transparent;
             ws-split-ta := TouchArea {
-                mouse-cursor: ew-resize;
+                mouse-cursor: dock-area.welcome-horizontal ? ew-resize : ns-resize;
                 pointer-event(ev) => {
                     if (ev.kind == PointerEventKind.down) {
                         dock-area.welcome-sidebar-dragging = true;
@@ -865,10 +966,23 @@ export component AppWindow inherits Window {
                 }
                 moved => {
                     if (dock-area.welcome-sidebar-dragging) {
-                        root.welcome-sidebar-width = clamp(
-                            self.absolute-position.x + self.mouse-x
-                                - dock-area.absolute-position.x - dock-area.strip-w,
-                            160px, 480px);
+                        if (dock-area.welcome-horizontal) {
+                            root.welcome-sidebar-width = clamp(
+                                root.welcome-sidebar-dock == "right"
+                                    ? dock-area.absolute-position.x + dock-area.width
+                                        - (self.absolute-position.x + self.mouse-x)
+                                    : self.absolute-position.x + self.mouse-x
+                                        - dock-area.absolute-position.x,
+                                160px, 480px);
+                        } else {
+                            root.welcome-sidebar-width = clamp(
+                                root.welcome-sidebar-dock == "bottom"
+                                    ? dock-area.absolute-position.y + dock-area.height
+                                        - (self.absolute-position.y + self.mouse-y)
+                                    : self.absolute-position.y + self.mouse-y
+                                        - dock-area.absolute-position.y,
+                                120px, 360px);
+                        }
                     }
                 }
             }
@@ -877,8 +991,10 @@ export component AppWindow inherits Window {
         // Everything except the welcome strip/sidebar — the resource panel,
         // splitter and the central tab/pane content — sits to the right of them.
         rest := Rectangle {
-        x: parent.strip-w + parent.welcome-w; y: 0;
-        width: parent.width - parent.strip-w - parent.welcome-w; height: parent.height;
+        x: root.welcome-sidebar-dock == "left" ? parent.welcome-taken : 0px;
+        y: root.welcome-sidebar-dock == "top" ? parent.welcome-taken : 0px;
+        width: parent.welcome-horizontal ? parent.width - parent.welcome-taken : parent.width;
+        height: parent.welcome-horizontal ? parent.height : parent.height - parent.welcome-taken;
         // Sidebar extent along its docked axis. When collapsed it shrinks to the
         // 36px ToolStrip icon bar (M5) instead of 0 + a floating button; the 4px
         // splitter is gone while collapsed.
@@ -892,7 +1008,7 @@ export component AppWindow inherits Window {
         // Only shown while expanded; collapsing swaps it for the ToolStrip icon
         // bar below (mirrors the welcome sidebar), so no clipped widgets bleed
         // through the 36px strip (#resource-collapse).
-        if !root.sidebar-collapsed : Sidebar {
+        if !root.sidebar-collapsed : Rectangle {
             x: root.sidebar-dock == "right" ? parent.width - parent.sb-w
              : 0px;
             y: root.sidebar-dock == "bottom" ? parent.height - parent.sb-h
@@ -900,6 +1016,9 @@ export component AppWindow inherits Window {
             width: root.sidebar-horizontal ? parent.sb-w : parent.width;
             height: root.sidebar-horizontal ? parent.height : parent.sb-h;
             clip: true;
+            Sidebar {
+            width: parent.width;
+            height: parent.height;
             // Docked top/bottom → lay the resource widgets out in a row.
             lay-horizontal: !root.sidebar-horizontal;
             dock-edge: root.sidebar-dock;
@@ -923,7 +1042,6 @@ export component AppWindow inherits Window {
             net-selected: root.net-selected;
             net-show-selector: root.net-show-selector;
             disks: root.disks;
-            gpus: root.gpus;
             proc-available: root.proc-available;
             app-version: root.app-version;
             select-net-iface(i) => { root.select-net-iface(i); }
@@ -939,23 +1057,38 @@ export component AppWindow inherits Window {
             dock-drag-end() => {
                 if (root.dock-target != "") {
                     root.sidebar-dock = root.dock-target;
+                    if (root.welcome-as-sidebar && root.welcome-sidebar-dock == root.dock-target) {
+                        root.welcome-collapsed = true;
+                        root.set-welcome-collapsed(true);
+                    }
                     root.persist-sidebar-dock(root.sidebar-dock);
                 }
                 root.panel-dragging = false;
             }
-            toggle-collapse() => { root.sidebar-collapsed = !root.sidebar-collapsed; }
+            toggle-collapse() => {
+                root.sidebar-collapsed = !root.sidebar-collapsed;
+                root.set-sidebar-collapsed(root.sidebar-collapsed);
+            }
+            }
         }
 
         // Collapsed resource panel → a ToolStrip icon bar at the same docked edge
         // (M5), in place of the old floating expand button.
-        if root.sidebar-collapsed : ToolStrip {
+        if root.sidebar-collapsed && !dock-area.combine-collapsed-tools && !dock-area.sidebar-strip-outside : ToolStrip {
             x: root.sidebar-dock == "right" ? parent.width - parent.sb-w : 0px;
             y: root.sidebar-dock == "bottom" ? parent.height - parent.sb-h : 0px;
             width: root.sidebar-horizontal ? parent.sb-w : parent.width;
             height: root.sidebar-horizontal ? parent.height : parent.sb-h;
             dock-edge: root.sidebar-dock;
             glyph: "\u{E871}";   // dashboard — resource panel
-            expand => { root.sidebar-collapsed = false; }
+            expand => {
+                root.sidebar-collapsed = false;
+                root.set-sidebar-collapsed(false);
+                if (root.welcome-as-sidebar && root.welcome-sidebar-dock == root.sidebar-dock) {
+                    root.welcome-collapsed = true;
+                    root.set-welcome-collapsed(true);
+                }
+            }
         }
 
         // Splitter — drag to resize the sidebar. Orientation + which dimension it
@@ -980,8 +1113,6 @@ export component AppWindow inherits Window {
                 pointer-event(ev) => {
                     if (ev.kind == PointerEventKind.down) {
                         root.sidebar-dragging = true;
-                        root.sidebar-drag-start-x = self.mouse-x;
-                        root.sidebar-drag-start-y = self.mouse-y;
                     } else if (ev.kind == PointerEventKind.up) {
                         root.sidebar-dragging = false;
                         root.persist-sidebar-width(root.sidebar-width / 1px);
@@ -990,18 +1121,25 @@ export component AppWindow inherits Window {
                 moved => {
                     if (root.sidebar-dragging) {
                         if (root.sidebar-horizontal) {
-                            // left grows with +dx, right grows with -dx.
+                            // Track the cursor in stable dock-area coordinates.
+                            // The splitter moves while resizing, so adding local
+                            // mouse deltas to the current width feeds the movement
+                            // back into itself and can suddenly widen the panel
+                            // on Win10 (#244).
                             root.sidebar-width = clamp(
-                                root.sidebar-width
-                                    + (root.sidebar-dock == "right" ? -1 : 1)
-                                      * (self.mouse-x - root.sidebar-drag-start-x),
+                                root.sidebar-dock == "right"
+                                    ? dock-area.absolute-position.x + dock-area.width
+                                        - (self.absolute-position.x + self.mouse-x)
+                                    : (self.absolute-position.x + self.mouse-x)
+                                        - dock-area.absolute-position.x,
                                 160px, 520px);
                         } else {
-                            // top grows with +dy, bottom grows with -dy.
                             root.sidebar-height = clamp(
-                                root.sidebar-height
-                                    + (root.sidebar-dock == "bottom" ? -1 : 1)
-                                      * (self.mouse-y - root.sidebar-drag-start-y),
+                                root.sidebar-dock == "bottom"
+                                    ? dock-area.absolute-position.y + dock-area.height
+                                        - (self.absolute-position.y + self.mouse-y)
+                                    : (self.absolute-position.y + self.mouse-y)
+                                        - dock-area.absolute-position.y,
                                 120px, 480px);
                         }
                     }
@@ -1023,8 +1161,10 @@ export component AppWindow inherits Window {
             // tab strip + active terminal / welcome. Rust flattens the split tree
             // into `panes` for the size we report here.
             pane-area := Rectangle {
-            changed width => { root.content-resized(self.width, self.height); }
-            changed height => { root.content-resized(self.width, self.height); }
+                width: parent.width;
+                height: parent.height;
+                changed width => { root.content-resized(self.width, self.height); }
+                changed height => { root.content-resized(self.width, self.height); }
             for pane[pi] in root.panes : Rectangle {
                 x: pane.x; y: pane.y; width: pane.w; height: pane.h;
                 clip: true;
@@ -1040,13 +1180,17 @@ export component AppWindow inherits Window {
                     // Reserve room for the top-right toolbar icons that sit over
                     // this row so tabs don't slide underneath them (#122).
                     reserve-right: pane.reserve-right;
+                    show-new-tab: !root.welcome-as-sidebar;
+                    can-merge-pane: root.panes.length > 1;
                     tabs: pane.tabs;
                     active-id: pane.active-id;
                     tab-selected(id) => { root.pane-tab-selected(pane.id, id); }
                     tab-closed(id) => { root.pane-tab-closed(pane.id, id); }
+                    tab-title-copy(title) => { root.copy-text(title); }
                     new-tab() => { root.pane-new-tab(pane.id); }
                     tab-reorder(from, dir) => { root.pane-tab-reorder(pane.id, from, dir); }
                     tab-split(id, dir) => { root.pane-split(pane.id, id, dir); }
+                    merge-pane() => { root.pane-merge(pane.id); }
                     tab-duplicate(id) => { root.tab-duplicate(id); }
                     tab-drag-move(id, ax, ay) => {
                         root.tab-drag-move(id,
@@ -1066,9 +1210,10 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
                 background: Theme.bg-root;
 
-                // Empty pane (welcome-as-sidebar mode, no session open yet): a
-                // centered hint pointing at the left session list.
-                if pane.tabs.length == 0 : Rectangle {
+                // Empty pane outside welcome-sidebar mode: keep a small hint for
+                // rare empty panes, but do not cover the wallpaper when the
+                // session list is already visible as a sidebar.
+                if pane.tabs.length == 0 && !root.welcome-as-sidebar : Rectangle {
                     width: parent.width;
                     height: parent.height;
                     Text {
@@ -1143,7 +1288,10 @@ export component AppWindow inherits Window {
                     sftp-status: term.sftp-status;
                     sftp-loading: term.sftp-loading;
                     sftp-tree-nodes: term.sftp-tree-nodes;
+                    sftp-transfer-targets: root.tabs;
                     sftp-selected-count: term.sftp-selected-count;
+                    sftp-sort-key: term.sftp-sort-key;
+                    sftp-sort-dir: term.sftp-sort-dir;
                     quick-commands: root.quick-commands;
                     command-history: root.command-history;
                     history-view: root.history-view;
@@ -1176,6 +1324,8 @@ export component AppWindow inherits Window {
                     sftp-tree-expand(path) => { root.sftp-tree-expand(term.id, path); }
                     sftp-toggle-select(i) => { root.sftp-toggle-select(term.id, i); }
                     sftp-download-selected() => { root.sftp-download-selected(term.id); }
+                    sftp-copy-to-target(path, target) => { root.sftp-copy-to-target(term.id, path, target); }
+                    sftp-copy-selected-to-target(target) => { root.sftp-copy-selected-to-target(term.id, target); }
                     // Confirm before deleting the checked entries (#100), reusing
                     // the delete-confirm dialog in batch mode.
                     sftp-delete-selected() => {
@@ -1193,9 +1343,10 @@ export component AppWindow inherits Window {
                     }
                     sftp-view(path) => { root.sftp-view(term.id, path); }
                     sftp-edit(path) => { root.sftp-edit(term.id, path); }
-                    sftp-preview(path) => { root.sftp-preview(term.id, path); }
                     sftp-open-external(path) => { root.sftp-open-external(term.id, path); }
                     sftp-edit-external(path) => { root.sftp-edit-external(term.id, path); }
+                    sftp-sort-request(key) => { root.sftp-sort-request(term.id, key); }
+                    sftp-clear-sort() => { root.sftp-clear-sort(term.id); }
                     // #69 context-menu extensions → shared prompt dialog.
                     sftp-rename-request(path, name) => {
                         root.sftp-prompt-kind = "rename";
@@ -1234,8 +1385,18 @@ export component AppWindow inherits Window {
                     select-end() => { root.term-select-end(term.id); }
                     select-autoscroll(dir) => { root.term-select-autoscroll(term.id, dir); }
                 }
+
+                // Windows may show the terminal model being reconstructed when
+                // restoring from minimize (#183). Briefly cover the terminal area
+                // until the restore repaint settles; the underlying PTY/buffer is
+                // untouched.
+                if root.terminal-restore-cover && pane.active-id != "welcome" && pane.tabs.length > 0 : Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    background: Theme.term-bg;
                 }
-                }
+            }
+            }
             }
 
             // Draggable splitters between panes. Single pane => the model is
@@ -1323,28 +1484,28 @@ export component AppWindow inherits Window {
     // of the tab row — below the custom title bar when frameless (y offset), or
     // at the very top on macOS where the native title bar is separate (#119).
     IconBtn {
-        x: root.width - 34px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 34px - root.toolbar-x-off; y: root.toolbar-y;
         icon: "\u{E8B8}";
         tooltip: root.lang-en ? "Settings" : "设置";
         active: root.settings-open;
         clicked => { root.settings-open = !root.settings-open; root.download-open = false; root.ssh-import-hint = ""; }
     }
     IconBtn {
-        x: root.width - 64px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 64px - root.toolbar-x-off; y: root.toolbar-y;
         icon: "\u{E2C4}";
         tooltip: root.lang-en ? "Download" : "下载";
         active: root.download-open;
         clicked => { root.download-open = !root.download-open; root.settings-open = false; }
     }
     IconBtn {
-        x: root.width - 94px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 94px - root.toolbar-x-off; y: root.toolbar-y;
         icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
         icon-color: Theme.dark ? #f5c542 : #5856d6;
         tooltip: root.lang-en ? "Toggle theme" : "切换主题";
         clicked => { root.toggle-theme(); }
     }
     IconBtn {
-        x: root.width - 124px - root.toolbar-x-off; y: (root.custom-titlebar ? 46px : 8px + root.titlebar-inset) + root.toolbar-y-off;
+        x: root.width - 124px - root.toolbar-x-off; y: root.toolbar-y;
         icon: "\u{E627}";
         icon-color: root.sync-input ? Theme.accent : Theme.text-secondary;
         active: root.sync-input;
@@ -1430,6 +1591,7 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 width: 68px; height: 26px;
+                y: (parent.height - self.height) / 2;
                 border-radius: Theme.radius-sm;
                 background: upd-dl-ta.has-hover ? #ffffff45 : #ffffff28;
                 upd-dl-ta := TouchArea {
@@ -1441,6 +1603,7 @@ export component AppWindow inherits Window {
             }
             Rectangle {
                 width: 26px; height: 26px;
+                y: (parent.height - self.height) / 2;
                 border-radius: Theme.radius-sm;
                 background: upd-cl-ta.has-hover ? #ffffff45 : transparent;
                 upd-cl-ta := TouchArea {
@@ -1654,18 +1817,6 @@ export component AppWindow inherits Window {
             // Focus the text the moment the editor opens.
             init => { edit-input.focus(); }
         }
-    }
-
-    // --- Image viewer overlay -----------------------------------------------
-    if root.image-viewer-open : ImageViewer {
-        file-name: root.image-viewer-name;
-        index: root.image-viewer-index;
-        total: root.image-viewer-total;
-        preview-image: root.image-viewer-preview;
-        error-msg: root.image-viewer-error;
-        close() => { root.image-viewer-close(); }
-        prev() => { root.image-viewer-prev(); }
-        next() => { root.image-viewer-next(); }
     }
 
     // --- Download manager popup -------------------------------------------
@@ -2662,13 +2813,12 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: end;
                     spacing: 8px;
-                    Button {
+                    GhostButton {
                         text: root.lang-en ? "Cancel" : "取消";
                         clicked => { root.confirm-close-open = false; }
                     }
-                    Button {
+                    PrimaryButton {
                         text: root.lang-en ? "Close" : "关闭";
-                        primary: true;
                         clicked => { root.confirm-close-yes(); }
                     }
                 }
@@ -2984,10 +3134,15 @@ export component AppWindow inherits Window {
         draft-auth <=> root.dialog-auth;
         draft-password <=> root.dialog-password;
         draft-key-path <=> root.dialog-key-path;
+        draft-key-inline <=> root.dialog-key-inline;
+        draft-key-inline-mode <=> root.dialog-key-inline-mode;
         draft-proxy-type <=> root.dialog-proxy-type;
         draft-proxy-hostport <=> root.dialog-proxy-hostport;
         draft-group <=> root.dialog-group;
         session-groups: root.session-groups;
+        jump-choices: root.jump-choices;
+        jump-ids: root.jump-ids;
+        draft-jump-index <=> root.dialog-jump-index;
         draft-kind <=> root.dialog-kind;
         draft-serial-port <=> root.dialog-serial-port;
         draft-baud <=> root.dialog-baud;
@@ -2997,8 +3152,10 @@ export component AppWindow inherits Window {
         draft-flow <=> root.dialog-flow;
         draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
         draft-note <=> root.dialog-note;
+        test-status <=> root.dialog-test-status;
         forwards: root.dialog-forwards;
         submit(draft) => { root.session-dialog-submit(draft); }
+        test-connection(draft) => { root.session-dialog-test(draft); }
         cancel => { root.session-dialog-cancel(); }
         pick-key-file => { root.session-dialog-pick-key(); }
         add-forward(n, k, b, p, h, hp) => { root.add-forward(n, k, b, p, h, hp); }
@@ -3294,8 +3451,8 @@ export component AppWindow inherits Window {
             x: root.ifd-x;
             y: root.ifd-y;
             // Bigger base, and scales with the settings font size (#v0.5).
-            width: 720px * Theme.panel-font;
-            height: 480px * Theme.panel-font;
+            width: root.ifd-w;
+            height: root.ifd-h;
             // 20% less transparent than the welcome/resource panels so the dense
             // grey settings labels stay readable at a low overlay (user request).
             background: Theme.bg-panel-strong;
@@ -3333,10 +3490,10 @@ export component AppWindow inherits Window {
                             if (root.ifd-dragging) {
                                 root.ifd-x = clamp(
                                     round((root.ifd-base-x + (self.absolute-position.x + self.mouse-x - root.ifd-grab-x)) / 1px) * 1px,
-                                    0px, max(0px, root.width - 720px * Theme.panel-font));
+                                    0px, max(0px, root.width - root.ifd-w));
                                 root.ifd-y = clamp(
                                     round((root.ifd-base-y + (self.absolute-position.y + self.mouse-y - root.ifd-grab-y)) / 1px) * 1px,
-                                    0px, max(0px, root.height - 480px * Theme.panel-font));
+                                    0px, max(0px, root.height - root.ifd-h));
                             }
                         }
                     }
@@ -3381,6 +3538,13 @@ export component AppWindow inherits Window {
                     collapse-sidebar-default <=> root.collapse-sidebar-default;
                     collapse-sftp-default <=> root.collapse-sftp-default;
                     sync-upload-enabled <=> root.sync-upload-enabled;
+                    webdav-enabled <=> root.webdav-enabled;
+                    webdav-url <=> root.webdav-url;
+                    webdav-username <=> root.webdav-username;
+                    webdav-password <=> root.webdav-password;
+                    webdav-remote-path <=> root.webdav-remote-path;
+                    webdav-accept-invalid-certs <=> root.webdav-accept-invalid-certs;
+                    webdav-status <=> root.webdav-status;
                     download-always-ask <=> root.download-always-ask;
                     welcome-as-sidebar <=> root.welcome-as-sidebar;
                     update-check-enabled <=> root.update-check-enabled;
@@ -3397,10 +3561,54 @@ export component AppWindow inherits Window {
                     set-collapse-sidebar-default(v) => { root.set-collapse-sidebar-default(v); }
                     set-collapse-sftp-default(v) => { root.set-collapse-sftp-default(v); }
                     set-sync-upload-enabled(v) => { root.set-sync-upload-enabled(v); }
+                    save-webdav-settings(enabled, url, username, password, remote-path, accept-invalid-certs) => {
+                        root.save-webdav-settings(enabled, url, username, password, remote-path, accept-invalid-certs);
+                    }
+                    webdav-upload => { root.webdav-upload(); }
+                    webdav-download => { root.webdav-download(); }
                     set-download-always-ask(v) => { root.set-download-always-ask(v); }
                     set-welcome-as-sidebar(v) => { root.set-welcome-as-sidebar(v); }
                     set-update-check-enabled(v) => { root.set-update-check-enabled(v); }
                     persist-wallpaper-overlay(v) => { root.persist-wallpaper-overlay(v); }
+                }
+            }
+            Rectangle {
+                x: parent.width - 18px;
+                y: parent.height - 18px;
+                width: 18px;
+                height: 18px;
+                background: resize-ta.has-hover || root.ifd-resizing ? Theme.bg-hover : transparent;
+                Text {
+                    text: "\u{E3C2}";
+                    font-family: "Material Icons";
+                    color: Theme.text-muted;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                resize-ta := TouchArea {
+                    mouse-cursor: nwse-resize;
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) {
+                            root.ifd-resizing = true;
+                            root.ifd-base-w = root.ifd-w;
+                            root.ifd-base-h = root.ifd-h;
+                            root.ifd-grab-x = self.absolute-position.x + self.mouse-x;
+                            root.ifd-grab-y = self.absolute-position.y + self.mouse-y;
+                        } else if (e.kind == PointerEventKind.up) {
+                            root.ifd-resizing = false;
+                        }
+                    }
+                    moved => {
+                        if (root.ifd-resizing) {
+                            root.ifd-w = clamp(
+                                round((root.ifd-base-w + (self.absolute-position.x + self.mouse-x - root.ifd-grab-x)) / 1px) * 1px,
+                                640px, max(640px, root.width - root.ifd-x));
+                            root.ifd-h = clamp(
+                                round((root.ifd-base-h + (self.absolute-position.y + self.mouse-y - root.ifd-grab-y)) / 1px) * 1px,
+                                420px, max(420px, root.height - root.ifd-y));
+                        }
+                    }
                 }
             }
         }

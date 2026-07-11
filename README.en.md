@@ -44,6 +44,20 @@ chmod +x install-linux.sh && ./install-linux.sh
 > Requires glibc ≥ 2.35 (Ubuntu 22.04+ / Debian 12+). On Wayland you may need to
 > log out/in once after installing the icon.
 
+Building from source with `cargo run` on Linux Mint / Ubuntu / Debian requires
+the Slint/winit/rfd system development packages:
+
+```bash
+sudo apt update
+sudo apt install -y --no-install-recommends \
+  build-essential pkg-config cmake \
+  libfontconfig1-dev libfreetype6-dev \
+  libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+  libgl1-mesa-dev libegl1-mesa-dev libgtk-3-dev \
+  libudev-dev
+```
+
 ### macOS
 
 The download is a `.zip` containing the `meatshell.app` bundle:
@@ -84,12 +98,14 @@ open /Applications/meatshell.app
 - [x] Outbound proxy (SOCKS5 / HTTP)
 - [x] Import `~/.ssh/config`
 - [x] Session passwords encrypted at rest (ChaCha20-Poly1305)
+- [x] Local and remote GPU resource monitoring with multi-GPU support
+- [x] SFTP image preview with zoom, pan, and navigation
+- [x] Known-hosts (`known_hosts`) verification + first-connect confirmation
+- [x] Split panes for tabbed terminals
 
 ### Planned
 
-- [x] Known-hosts (`known_hosts`) verification (with system ~/.ssh/known_hosts fallback)
 - [ ] Store session passwords in the OS keychain
-- [ ] Split panes for tabbed terminals
 
 ## Tech stack
 
@@ -141,6 +157,22 @@ meatshell/
   `cargo check` is the fastest feedback loop.
 - The application event loop is single-threaded (required by Slint); all
   cross-thread UI updates go through `slint::invoke_from_event_loop` callbacks.
+- SSH / SFTP share the `known_hosts` verification path: first contact asks for
+  trust and remembers the host key, while later key changes prompt again.
+
+## Release
+
+Do not bump `Cargo.toml` by hand and then create a tag. Use the release helper
+so the tag points at a commit that already contains the matching Cargo version:
+
+```powershell
+.\scripts\release.ps1 v0.6.0 -Push
+```
+
+The script updates `Cargo.toml` / `Cargo.lock`, runs `cargo check --locked`,
+verifies `meatshell --version`, commits `Release v0.6.0`, creates an annotated
+tag, and pushes the current branch plus the tag. See
+[docs/release.md](docs/release.md) for details.
 
 ## License
 

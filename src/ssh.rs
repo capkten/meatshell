@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use russh::client::{self, Handle, Handler, Msg};
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::load_secret_key;
+use russh::keys::{decode_secret_key, load_secret_key, PrivateKey};
 use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
 use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -19,7 +19,6 @@ use tokio::task::JoinHandle;
 
 use crate::config::{AuthMethod, Session};
 use crate::i18n::t;
-use crate::system::GpuSnapshot;
 
 // ---------------------------------------------------------------------------
 // SFTP-related shared types
@@ -49,6 +48,30 @@ pub struct RemoteTreeNode {
     pub depth: u32,
     pub expanded: bool,
     pub has_children: bool,
+}
+
+pub(crate) fn load_session_private_key(session: &Session, pass: &str) -> Result<PrivateKey> {
+    let pass = if pass.is_empty() { None } else { Some(pass) };
+    let inline = session.private_key_inline.as_str().trim();
+    if !inline.is_empty() {
+        return decode_secret_key(inline, pass).context("failed to parse pasted private key");
+    }
+
+    let raw = session.private_key_path.trim();
+    if raw.is_empty() {
+        return Err(anyhow!(t(
+            "私钥路径或私钥内容为空",
+            "private key path or private key content is empty"
+        )));
+    }
+
+    let normalised = raw.replace('\\', "/");
+    let key_path = normalised
+        .strip_suffix(".pub")
+        .map(str::to_string)
+        .unwrap_or(normalised);
+    load_secret_key(Path::new(&key_path), pass)
+        .with_context(|| format!("failed to load key {key_path}"))
 }
 
 /// Format a byte count as a human-readable string.
@@ -394,9 +417,6 @@ pub enum SessionEvent {
         disks: Vec<(String, u64, u64)>,
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
-        /// Per-GPU stats from nvidia-smi. Empty if no NVIDIA GPU or command failed.
-        #[allow(dead_code)]
-        gpus: Vec<GpuSnapshot>,
     },
 
     /// A command the user ran in the terminal, captured via the shell hook
@@ -438,19 +458,6 @@ pub enum SessionEvent {
         edit: bool,
         error: String,
     },
-    /// A remote image file loaded for the built-in image viewer.
-    /// On failure `error` is non-empty and `data` is empty.
-    #[allow(dead_code)]
-    SftpImageLoaded {
-        path: String,
-        name: String,
-        index: usize,
-        total: usize,
-        width: u32,
-        height: u32,
-        data: Vec<u8>,
-        error: String,
-    },
 }
 
 /// Handle retained by the UI layer to talk to a running session.
@@ -489,6 +496,7 @@ pub fn spawn_session(
     runtime: &tokio::runtime::Handle,
     tab_id: String,
     session: Session,
+    jump: Option<Session>,
     initial_cols: u32,
     initial_rows: u32,
 ) -> (SessionHandle, UnboundedReceiver<SessionEvent>) {
@@ -499,6 +507,7 @@ pub fn spawn_session(
     let join = runtime.spawn(async move {
         if let Err(err) = run_session(
             session,
+            jump,
             cmd_rx,
             evt_tx_for_task.clone(),
             initial_cols,
@@ -528,9 +537,10 @@ pub fn spawn_session(
 /// already failed (#86).
 async fn connect_ssh(
     session: &Session,
+    jump: Option<&Session>,
     config: Arc<client::Config>,
     events: &UnboundedSender<SessionEvent>,
-) -> Result<Handle<ClientHandler>> {
+) -> Result<(Handle<ClientHandler>, Option<Handle<ClientHandler>>)> {
     // Remote (-R) forwards are serviced inside the handler when the server opens
     // channels back, so it needs the bind-port → local-target map up front (the
     // handler is moved into `connect`) (#56).
@@ -547,6 +557,26 @@ async fn connect_ssh(
         events: events.clone(),
     };
     let addr = format!("{}:{}", session.host, session.port);
+
+    // SSH jump host (bastion): connect + authenticate the jump session, then open
+    // a direct-tcpip channel through it to this host and run the SSH handshake
+    // over that tunnel. The returned jump handle must be kept alive for the whole
+    // session (the tunnel lives on it) (#211).
+    if let Some(j) = jump {
+        let _ = events.send(SessionEvent::Status(format!(
+            "{} {}@{} → {}",
+            t("经跳板机连接", "via jump host"),
+            j.user,
+            j.host,
+            addr
+        )));
+        let (handle, jump_handle) =
+            connect_target_via_jump(j, &session.host, session.port, config, handler, events)
+                .await
+                .with_context(|| format!("connect {} via jump failed", addr))?;
+        return Ok((handle, Some(jump_handle)));
+    }
+
     // Connect directly, or tunnel through a SOCKS5 / HTTP proxy (issue #7).
     let handle = match crate::proxy::resolve(&session.proxy) {
         Some(p) => {
@@ -567,7 +597,153 @@ async fn connect_ssh(
             .await
             .with_context(|| format!("connect {} failed", addr))?,
     };
-    Ok(handle)
+    Ok((handle, None))
+}
+
+/// Outcome of authenticating an SSH session, so callers can distinguish a user
+/// cancel from a credential rejection and word the status line accordingly.
+pub(crate) enum AuthResult {
+    Success,
+    Cancelled,
+    Failed,
+}
+
+/// Authenticate an already-connected SSH handle using the session's method,
+/// prompting for missing credentials and supporting explicit / fallback
+/// `keyboard-interactive` auth (#86, #249). Shared by the shell, SFTP and
+/// jump-host paths. On the keyboard-interactive fallback it reconnects, updating
+/// both `handle` and `jump_handle` in place so the caller keeps the live tunnel.
+pub(crate) async fn authenticate_session(
+    handle: &mut Handle<ClientHandler>,
+    jump_handle: &mut Option<Handle<ClientHandler>>,
+    session: &Session,
+    jump: Option<&Session>,
+    config: Arc<client::Config>,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<AuthResult> {
+    let (user, password) = match resolve_credentials(session, events).await {
+        Some(c) => c,
+        None => return Ok(AuthResult::Cancelled),
+    };
+
+    let authed = match session.auth {
+        AuthMethod::Password => {
+            let mut ok = handle
+                .authenticate_password(&user, password.as_str())
+                .await
+                .context("password auth failed")?;
+            if !ok {
+                // russh can't switch auth methods on a handle whose first attempt
+                // already failed (it hangs), so reconnect on a fresh handle before
+                // trying keyboard-interactive (#86).
+                let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
+                let (h, jh) = Box::pin(connect_ssh(session, jump, config.clone(), events)).await?;
+                *handle = h;
+                *jump_handle = jh;
+                ok = keyboard_interactive_auth(
+                    handle,
+                    &user,
+                    password.as_str(),
+                    &session.id,
+                    &session.host,
+                    events,
+                )
+                .await
+                .context("keyboard-interactive auth failed")?;
+            }
+            ok
+        }
+        AuthMethod::KeyboardInteractive => {
+            keyboard_interactive_auth(
+                handle,
+                &user,
+                password.as_str(),
+                &session.id,
+                &session.host,
+                events,
+            )
+            .await
+            .context("keyboard-interactive auth failed")?
+        }
+        AuthMethod::Key => {
+            // An encrypted private key needs its passphrase; we reuse the
+            // session's password field for it (empty = unencrypted key) (#90).
+            let pass = password.as_str();
+            let keypair = load_session_private_key(session, pass)?;
+            // RSA keys must be signed with an explicit SHA-2 hash; every other
+            // key type carries its own algorithm, so no override is needed.
+            let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
+            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
+                .context("invalid private key / hash algorithm combination")?;
+            handle
+                .authenticate_publickey(&user, key_with_hash)
+                .await
+                .context("publickey auth failed")?
+        }
+    };
+
+    if authed {
+        Ok(AuthResult::Success)
+    } else {
+        Ok(AuthResult::Failed)
+    }
+}
+
+/// Connect + authenticate a jump/bastion session, open a `direct-tcpip` channel
+/// to `target_host:target_port`, and run the target's SSH handshake over it.
+/// Returns the target handle plus the jump handle, which the caller MUST keep
+/// alive for as long as the target session lives (the tunnel rides on it) (#211).
+pub(crate) async fn connect_target_via_jump<H>(
+    jump: &Session,
+    target_host: &str,
+    target_port: u16,
+    config: Arc<client::Config>,
+    handler: H,
+    events: &UnboundedSender<SessionEvent>,
+) -> Result<(Handle<H>, Handle<ClientHandler>)>
+where
+    H: client::Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+{
+    // Single hop: the jump session itself never goes through another jump.
+    // `Box::pin` breaks the async recursion (connect_ssh → jump → connect_ssh).
+    let (mut jhandle, mut no_nested) = Box::pin(connect_ssh(jump, None, config.clone(), events))
+        .await
+        .with_context(|| format!("connect jump host {}:{} failed", jump.host, jump.port))?;
+    match authenticate_session(
+        &mut jhandle,
+        &mut no_nested,
+        jump,
+        None,
+        config.clone(),
+        events,
+    )
+    .await?
+    {
+        AuthResult::Success => {}
+        AuthResult::Cancelled => {
+            return Err(anyhow!(t("跳板机登录已取消", "jump host login cancelled")))
+        }
+        AuthResult::Failed => {
+            return Err(anyhow!(t(
+                "跳板机认证失败",
+                "jump host authentication failed"
+            )))
+        }
+    }
+    let channel = jhandle
+        .channel_open_direct_tcpip(
+            target_host.to_string(),
+            target_port as u32,
+            "127.0.0.1".to_string(),
+            0,
+        )
+        .await
+        .with_context(|| format!("open jump tunnel to {target_host}:{target_port}"))?;
+    let handle = client::connect_stream(config, channel.into_stream(), handler)
+        .await
+        .with_context(|| format!("SSH handshake to {target_host}:{target_port} via jump"))?;
+    Ok((handle, jhandle))
 }
 
 // Key-exchange algorithms offered to the server, strongest first. This is the
@@ -610,6 +786,7 @@ pub(crate) const COMPAT_CIPHER: &[russh::cipher::Name] = &[
 
 async fn run_session(
     session: Session,
+    jump: Option<Session>,
     mut commands: UnboundedReceiver<SessionCommand>,
     events: UnboundedSender<SessionEvent>,
     initial_cols: u32,
@@ -642,12 +819,25 @@ async fn run_session(
         ..<_>::default()
     });
 
-    let mut handle = connect_ssh(&session, config.clone(), &events).await?;
+    let (mut handle, mut jump_handle) =
+        connect_ssh(&session, jump.as_ref(), config.clone(), &events).await?;
 
-    // Resolve missing username/password by prompting the user (#110).
-    let (user, password) = match resolve_credentials(&session, &events).await {
-        Some(c) => c,
-        None => {
+    // --- Auth (shared with SFTP + jump-host paths) ---------------------
+    // Try plain `password` first, then `keyboard-interactive` on a fresh handle —
+    // many bastions (JumpServer) disable `password` (#86). Missing credentials
+    // are prompted for (#110).
+    match authenticate_session(
+        &mut handle,
+        &mut jump_handle,
+        &session,
+        jump.as_ref(),
+        config.clone(),
+        &events,
+    )
+    .await?
+    {
+        AuthResult::Success => {}
+        AuthResult::Cancelled => {
             let _ = events.send(SessionEvent::Closed(
                 t("已取消登录", "login cancelled").into(),
             ));
@@ -656,83 +846,25 @@ async fn run_session(
                 .await;
             return Ok(());
         }
-    };
-
-    // --- Auth ----------------------------------------------------------
-    let authed = match session.auth {
-        AuthMethod::Password => {
-            // Try plain `password` auth first; if the server doesn't offer it,
-            // fall back to `keyboard-interactive` and answer each prompt with the
-            // same password. Many bastions (JumpServer especially) disable the
-            // `password` method and only accept keyboard-interactive, which is
-            // why other clients (Xshell / MobaXterm / WindTerm) get in but plain
-            // password auth fails here (#86).
-            let mut ok = handle
-                .authenticate_password(&user, password.as_str())
-                .await
-                .context("password auth failed")?;
-            if !ok {
-                // russh can't switch auth methods on a handle whose first attempt
-                // already failed (it hangs), so reconnect on a fresh handle before
-                // trying keyboard-interactive (#86).
-                let _ = handle.disconnect(Disconnect::ByApplication, "", "").await;
-                handle = connect_ssh(&session, config.clone(), &events).await?;
-                ok = keyboard_interactive_auth(
-                    &mut handle,
-                    &user,
-                    password.as_str(),
-                    &session.id,
-                    &session.host,
-                    &events,
-                )
-                .await
-                .context("keyboard-interactive auth failed")?;
-            }
-            ok
-        }
-        AuthMethod::Key => {
-            let raw = session.private_key_path.trim();
-            if raw.is_empty() {
-                return Err(anyhow!(t("私钥路径为空", "private key path is empty")));
-            }
-            // Normalise separators (we store `/` everywhere) and be forgiving if
-            // the user pointed at the `.pub` *public* key — the private key is the
-            // same path without that suffix.
-            let normalised = raw.replace('\\', "/");
-            let key_path = normalised
-                .strip_suffix(".pub")
-                .map(str::to_string)
-                .unwrap_or(normalised);
-            // An encrypted private key needs its passphrase; we reuse the
-            // session's password field for it (empty = unencrypted key) (#90).
-            let pass = password.as_str();
-            let keypair = load_secret_key(
-                Path::new(&key_path),
-                if pass.is_empty() { None } else { Some(pass) },
-            )
-            .with_context(|| format!("failed to load key {key_path}"))?;
-            // RSA keys must be signed with an explicit SHA-2 hash; every other
-            // key type carries its own algorithm, so no override is needed.
-            let hash = keypair.algorithm().is_rsa().then_some(HashAlg::Sha256);
-            let key_with_hash = PrivateKeyWithHashAlg::new(Arc::new(keypair), hash)
-                .context("invalid private key / hash algorithm combination")?;
-            handle
-                .authenticate_publickey(&user, key_with_hash)
-                .await
-                .context("publickey auth failed")?
+        AuthResult::Failed => {
+            tracing::warn!(
+                "ssh authentication failed for {}@{}",
+                session.user,
+                session.host
+            );
+            let _ = events.send(SessionEvent::Closed(
+                t("认证失败", "authentication failed").into(),
+            ));
+            let _ = handle
+                .disconnect(Disconnect::ByApplication, "auth failed", "")
+                .await;
+            return Ok(());
         }
     };
 
-    if !authed {
-        tracing::warn!("ssh authentication failed for {}@{}", user, session.host);
-        let _ = events.send(SessionEvent::Closed(
-            t("认证失败", "authentication failed").into(),
-        ));
-        let _ = handle
-            .disconnect(Disconnect::ByApplication, "auth failed", "")
-            .await;
-        return Ok(());
-    }
+    // Keep the jump-host connection alive for the whole session — the direct-tcpip
+    // tunnel that carries this session rides on it (#211).
+    let _jump_keepalive = jump_handle;
 
     // --- Shell channel --------------------------------------------------
     let mut channel = handle
@@ -837,10 +969,9 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __GPU__; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __MSTICK__; sleep 2; done
-";
+    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __MSTICK__; sleep 2; done\n";
     // Skip the resource monitor entirely when shell integration is off (a
-    // non-POSIX / Windows server) - the /proc-based loop only spews errors there
+    // non-POSIX / Windows server) — the /proc-based loop only spews errors there
     // (#140).
     let mut mon_channel = if session.disable_shell_integration {
         None
@@ -994,7 +1125,7 @@ async fn run_session(
                                     let _ = events.send(SessionEvent::Output(format!(
                                         "\r\n[meatshell] {}: {e}\r\n",
                                         t("ZMODEM 接收失败,已取消", "ZMODEM receive failed; cancelled")
-                                    )));
+                                    ).into()));
                                 }
                             }
                             continue;
@@ -1201,7 +1332,6 @@ fn parse_monitor_block(
         Top,
         Df,
         Ps,
-        Gpu,
     }
     let mut section = Section::Top;
 
@@ -1210,9 +1340,6 @@ fn parse_monitor_block(
     // (#27). No real machine has anywhere near this many.
     const MAX_MON_ENTRIES: usize = 64;
 
-    // GPU stats from nvidia-smi — per-GPU.
-    let mut gpus: Vec<GpuSnapshot> = Vec::new();
-
     for line in block.lines() {
         if line == "__DF__" {
             section = Section::Df;
@@ -1220,10 +1347,6 @@ fn parse_monitor_block(
         }
         if line == "__PS__" {
             section = Section::Ps;
-            continue;
-        }
-        if line == "__GPU__" {
-            section = Section::Gpu;
             continue;
         }
         match section {
@@ -1249,28 +1372,6 @@ fn parse_monitor_block(
                 continue;
             }
             Section::Top => {}
-            Section::Gpu => {
-                // nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total
-                // --format=csv,noheader,nounits outputs comma-separated values.
-                // e.g. "45, 2048, 16384" (with optional spaces after commas).
-                // One line per GPU.
-                let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-                if parts.len() >= 3 {
-                    if let (Ok(util), Ok(used), Ok(total)) = (
-                        parts[0].parse::<f32>(),
-                        parts[1].parse::<u64>(),
-                        parts[2].parse::<u64>(),
-                    ) {
-                        gpus.push(GpuSnapshot {
-                            index: gpus.len() as u32,
-                            gpu_percent: (util / 100.0).clamp(0.0, 1.0),
-                            vram_used_mib: used,
-                            vram_total_mib: total,
-                        });
-                    }
-                }
-                continue;
-            }
         }
         if let Some(rest) = line.strip_prefix("cpu ") {
             let nums: Vec<u64> = rest
@@ -1318,7 +1419,7 @@ fn parse_monitor_block(
         }
         *prev_net_at = now;
         // Show busiest first so the default-selected NIC is the active one.
-        net.sort_by_key(|b| std::cmp::Reverse(b.1 + b.2));
+        net.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
     }
 
     let cpu_percent = if have_cpu {
@@ -1354,7 +1455,6 @@ fn parse_monitor_block(
         net,
         disks,
         procs,
-        gpus,
     })
 }
 
@@ -1464,14 +1564,18 @@ fn looks_like_mfa(prompt: &str) -> bool {
 /// verification-code prompt — is shown to the user, whose typed answer is sent
 /// back. This is what makes MFA-enabled bastions (JumpServer with MFA forced on)
 /// work (#86-MFA).
-async fn keyboard_interactive_auth(
-    handle: &mut Handle<ClientHandler>,
+pub(crate) async fn keyboard_interactive_auth<H>(
+    handle: &mut Handle<H>,
     user: &str,
     password: &str,
     session_id: &str,
     host: &str,
     events: &UnboundedSender<SessionEvent>,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    H: Handler + 'static,
+    H::Error: std::error::Error + Send + Sync + 'static,
+{
     use russh::client::KeyboardInteractiveAuthResponse as Kb;
     let mut res = handle
         .authenticate_keyboard_interactive_start(user.to_string(), None)

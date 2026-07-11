@@ -61,6 +61,16 @@ export global Theme {
     // grey labels stay legible even at a low wallpaper overlay (user request).
     out property <brush> bg-panel-strong: frost(base-bg-panel, min(1.0, root.panel-alpha + 0.20));
 
+    // Active terminal tab: with wallpaper, pull from the image's average colour
+    // so the strip feels immersed; without wallpaper, make the active tab one
+    // clear step darker/lighter than the surrounding tab bar (#200).
+    out property <brush> tab-active-bg: root.wallpaper-active
+        ? root.wp-tint.mix(root.wp-accent, 0.68).with-alpha(min(1.0, root.panel-alpha + 0.10))
+        : (dark ? #171a20 : #ffffff);
+    out property <brush> tab-active-border: root.wallpaper-active
+        ? root.wp-accent.with-alpha(0.72)
+        : (dark ? #06070a : #c7c7cc);
+
     out property <brush> border-subtle: dark ? #3a3d46 : #e2e2e8;
     out property <brush> border-strong: dark ? #4a4e59 : #c7c7cc;
 

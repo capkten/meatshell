@@ -166,6 +166,54 @@ fn migrate_legacy(legacy: &Path, portable: &Path) {
     }
 }
 
+fn sessions_file_has_connections(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<ConfigFile>(&raw)
+        .map(|cfg| !cfg.sessions.is_empty())
+        .unwrap_or(false)
+}
+
+fn restore_user_backup_if_needed(primary_dir: &Path, backup_dir: &Path) {
+    if primary_dir == backup_dir {
+        return;
+    }
+    let primary_sessions = primary_dir.join("sessions.json");
+    let backup_sessions = backup_dir.join("sessions.json");
+    if sessions_file_has_connections(&primary_sessions)
+        || !sessions_file_has_connections(&backup_sessions)
+    {
+        return;
+    }
+    let _ = fs::create_dir_all(primary_dir);
+    for name in ["sessions.json", "secret.key", "known_hosts"] {
+        let src = backup_dir.join(name);
+        let dst = primary_dir.join(name);
+        if src.exists() {
+            match fs::copy(&src, &dst) {
+                Ok(_) => {
+                    #[cfg(unix)]
+                    if name == "secret.key" {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+                    }
+                    tracing::info!(
+                        "restored {name} from user config backup {}",
+                        backup_dir.display()
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    "failed to restore {} from {} to {}: {e}",
+                    name,
+                    src.display(),
+                    dst.display()
+                ),
+            }
+        }
+    }
+}
+
 /// A secret string (e.g. a session password) whose heap buffer is zeroed when
 /// it is dropped, so plaintext credentials don't survive in freed memory and
 /// turn up in core dumps, a debugger, or `/proc/<pid>/mem`.  `Clone` makes an
@@ -265,24 +313,27 @@ fn default_parity() -> String {
 fn default_wallpaper() -> String {
     // Serde default for the `wallpaper` field: kept at the old "幻想 3048" so an
     // *existing* config that predates the field stays on tech — `migrate_defaults`
-    // then upgrades those still-on-tech users to miku (and leaves real choices
-    // alone). Brand-new installs get miku straight from `fresh_config`.
+    // then advances default-following users through the migration chain. Brand-new
+    // installs get the current default straight from `fresh_config`.
     "builtin:tech".to_string()
 }
 
 /// Bump when `migrate_defaults` gains a new one-time default-layout change.
-pub const DEFAULTS_REV: u32 = 1;
+pub const DEFAULTS_REV: u32 = 2;
+
+const DEFAULT_WALLPAPER_TRANSPARENCY: f32 = 0.38;
+const DEFAULT_WALLPAPER_OVERLAY: f32 = 1.0 - DEFAULT_WALLPAPER_TRANSPARENCY;
 
 /// A brand-new config (no file yet, or the old one was corrupt). Seeds the
-/// new-user default layout (#new-user-defaults): miku wallpaper, welcome page as
-/// a left sidebar, resource panel docked right, a 0.38 wallpaper overlay — and
+/// new-user default layout (#new-user-defaults): ms wallpaper, welcome page as
+/// a left sidebar, resource panel docked right, 38% wallpaper transparency, and
 /// marks the migration done so it isn't re-applied.
 fn fresh_config() -> ConfigFile {
     ConfigFile {
-        wallpaper: "builtin:miku".to_string(),
+        wallpaper: "builtin:ms".to_string(),
         welcome_as_sidebar: true,
         sidebar_dock: "right".to_string(),
-        wallpaper_overlay: 0.38,
+        wallpaper_overlay: DEFAULT_WALLPAPER_OVERLAY,
         defaults_rev: DEFAULTS_REV,
         ..ConfigFile::default()
     }
@@ -296,16 +347,16 @@ fn migrate_defaults(cfg: &mut ConfigFile) -> bool {
     if cfg.defaults_rev >= DEFAULTS_REV {
         return false;
     }
-    // rev 1: miku / welcome-as-sidebar / right-docked resources / 0.38 overlay.
+    // rev 1: miku / welcome-as-sidebar / right-docked resources / wallpaper overlay.
     if cfg.defaults_rev < 1 {
         // Old default wallpaper → miku. A custom path, "none" (""), or any other
         // built-in means the user chose it, so leave it.
         if cfg.wallpaper == "builtin:tech" {
             cfg.wallpaper = "builtin:miku".to_string();
         }
-        // Overlay still unset (0 = "use the 0.86 default") → 0.38.
+        // Overlay still unset (0 = "use the 0.86 default") -> v0.5 default.
         if cfg.wallpaper_overlay <= 0.0 {
-            cfg.wallpaper_overlay = 0.38;
+            cfg.wallpaper_overlay = DEFAULT_WALLPAPER_OVERLAY;
         }
         // Never enabled the welcome sidebar → enable it.
         if !cfg.welcome_as_sidebar {
@@ -315,6 +366,13 @@ fn migrate_defaults(cfg: &mut ConfigFile) -> bool {
         if cfg.sidebar_dock.trim().is_empty() {
             cfg.sidebar_dock = "right".to_string();
         }
+    }
+    // rev 2: settings show wallpaper transparency, while rev 1 accidentally
+    // stored the default as panel alpha 0.38, so it displayed as ~62%.
+    if cfg.defaults_rev < 2
+        && (cfg.wallpaper_overlay - DEFAULT_WALLPAPER_TRANSPARENCY).abs() < 0.005
+    {
+        cfg.wallpaper_overlay = DEFAULT_WALLPAPER_OVERLAY;
     }
     cfg.defaults_rev = DEFAULTS_REV;
     true
@@ -340,6 +398,8 @@ fn default_flow() -> String {
 #[serde(rename_all = "lowercase")]
 pub enum AuthMethod {
     Password,
+    #[serde(rename = "keyboard-interactive")]
+    KeyboardInteractive,
     Key,
 }
 
@@ -347,12 +407,14 @@ impl AuthMethod {
     pub fn as_str(&self) -> &'static str {
         match self {
             AuthMethod::Password => "password",
+            AuthMethod::KeyboardInteractive => "keyboard-interactive",
             AuthMethod::Key => "key",
         }
     }
 
     pub fn from_str(s: &str) -> Self {
         match s {
+            "keyboard-interactive" | "keyboard" | "interactive" => AuthMethod::KeyboardInteractive,
             "key" => AuthMethod::Key,
             _ => AuthMethod::Password,
         }
@@ -372,10 +434,17 @@ pub struct Session {
     pub password: Secret,
     #[serde(default)]
     pub private_key_path: String,
+    #[serde(default)]
+    pub private_key_inline: Secret,
     /// Optional outbound proxy, e.g. "socks5://127.0.0.1:1080" or
     /// "http://user:pass@host:8080". Empty = use $ALL_PROXY, else direct.
     #[serde(default)]
     pub proxy: String,
+    /// Optional SSH jump host (bastion): the id of another saved SSH session to
+    /// tunnel this connection through, like OpenSSH's ProxyJump. Empty = direct.
+    /// Single hop only; the jump session supplies its own host/user/auth (#211).
+    #[serde(default)]
+    pub jump_session_id: String,
     #[serde(default)]
     pub last_used: Option<String>,
     /// Optional folder/group name to organize sessions in the list (#41).
@@ -454,7 +523,9 @@ impl Session {
             auth: AuthMethod::Password,
             password: Secret::default(),
             private_key_path: String::new(),
+            private_key_inline: Secret::default(),
             proxy: String::new(),
+            jump_session_id: String::new(),
             last_used: None,
             group: String::new(),
             kind: SessionKind::Ssh,
@@ -546,6 +617,10 @@ pub struct ConfigFile {
     /// Collapse the left resource sidebar on startup (#78).
     #[serde(default)]
     pub collapse_sidebar_default: bool,
+    /// Last resource-sidebar collapsed state. None means fall back to
+    /// `collapse_sidebar_default` for older configs.
+    #[serde(default)]
+    pub sidebar_collapsed: Option<bool>,
     /// User-adjustable width of the left resource sidebar, in logical pixels.
     /// Persisted across restarts so the drag-resized width sticks.
     #[serde(default = "default_sidebar_width")]
@@ -576,6 +651,20 @@ pub struct ConfigFile {
     /// sessions (same path, falling back to each panel's current dir).
     #[serde(default)]
     pub sync_upload: bool,
+    /// WebDAV sync settings (#185). Password is encrypted at rest like session
+    /// passwords; remote_path is the JSON export object path under the endpoint.
+    #[serde(default)]
+    pub webdav_enabled: bool,
+    #[serde(default)]
+    pub webdav_url: String,
+    #[serde(default)]
+    pub webdav_username: String,
+    #[serde(default)]
+    pub webdav_password: Secret,
+    #[serde(default)]
+    pub webdav_remote_path: String,
+    #[serde(default)]
+    pub webdav_accept_invalid_certs: bool,
     /// Render the welcome page (session list) as a docked left sidebar instead of
     /// a "New tab" tab (v0.5). Persisted so the layout choice sticks.
     #[serde(default)]
@@ -583,9 +672,13 @@ pub struct ConfigFile {
     /// Width (logical px) of the welcome/session sidebar when docked (v0.5).
     #[serde(default)]
     pub welcome_sidebar_width: f32,
-    /// Welcome sidebar collapsed to the edge icon strip (IDEA-style) (v0.5).
+    /// Welcome/session sidebar dock edge (left|right|top|bottom).
     #[serde(default)]
-    pub welcome_collapsed: bool,
+    pub welcome_sidebar_dock: String,
+    /// Welcome sidebar collapsed to the edge icon strip (IDEA-style) (v0.5).
+    /// None means the user has not explicitly collapsed/expanded it yet.
+    #[serde(default)]
+    pub welcome_collapsed: Option<bool>,
     /// Frosted-panel opacity over a wallpaper (0.40–1.00); user-adjustable via the
     /// Interface › Wallpaper opacity slider. 0 = use the 0.86 default (v0.5).
     #[serde(default)]
@@ -600,8 +693,8 @@ pub struct ConfigFile {
     pub update_check_disabled: bool,
     /// One-time default-layout migration marker (#new-user-defaults). 0 = config
     /// predates the migration. `migrate_defaults` bumps it to `DEFAULTS_REV` after
-    /// pushing the new look (miku wallpaper / welcome-as-sidebar / right-docked
-    /// resource panel / 0.38 overlay) to users still sitting on the old defaults.
+    /// pushing the new look (default wallpaper / welcome-as-sidebar / right-docked
+    /// resource panel / wallpaper overlay) to users still sitting on old defaults.
     #[serde(default)]
     pub defaults_rev: u32,
 }
@@ -622,6 +715,7 @@ struct ExportFile {
 
 pub struct ConfigStore {
     path: PathBuf,
+    backup_dir: Option<PathBuf>,
     cache: ConfigFile,
     /// ChaCha20-Poly1305 key loaded from (or freshly generated into)
     /// `secret.key` in the same directory as `sessions.json`.
@@ -711,7 +805,7 @@ impl ConfigStore {
 
         let mut key = [0u8; 32];
         OsRng.fill_bytes(&mut key);
-        fs::write(&key_path, key)
+        fs::write(&key_path, &key)
             .with_context(|| format!("failed to write {}", key_path.display()))?;
         #[cfg(unix)]
         {
@@ -738,6 +832,11 @@ impl ConfigStore {
         fs::create_dir_all(&config_dir)
             .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
 
+        let backup_dir = legacy_data_dir().filter(|dir| dir != &config_dir);
+        if let Some(ref backup) = backup_dir {
+            restore_user_backup_if_needed(&config_dir, backup);
+        }
+
         let key = Self::load_or_create_key(&config_dir)?;
 
         let mut migrated = false;
@@ -752,6 +851,14 @@ impl ConfigStore {
                         if let Some(plain) = Self::try_decrypt(&key, session.password.as_str()) {
                             session.password = Secret::new(plain);
                         }
+                        if let Some(plain) =
+                            Self::try_decrypt(&key, session.private_key_inline.as_str())
+                        {
+                            session.private_key_inline = Secret::new(plain);
+                        }
+                    }
+                    if let Some(plain) = Self::try_decrypt(&key, cfg.webdav_password.as_str()) {
+                        cfg.webdav_password = Secret::new(plain);
                     }
                     // Clean up any duplicate history accumulated before #113,
                     // keeping the last (most recent) occurrence of each command.
@@ -775,7 +882,12 @@ impl ConfigStore {
             fresh_config()
         };
 
-        let store = Self { path, cache, key };
+        let store = Self {
+            path,
+            backup_dir,
+            cache,
+            key,
+        };
         // Persist the migration so it runs exactly once (and so a later opt-out —
         // e.g. turning the welcome sidebar back off — isn't reverted next launch).
         if migrated {
@@ -1045,6 +1157,12 @@ impl ConfigStore {
     pub fn set_sidebar_dock(&mut self, v: String) {
         self.cache.sidebar_dock = v;
     }
+    pub fn sidebar_collapsed(&self) -> Option<bool> {
+        self.cache.sidebar_collapsed
+    }
+    pub fn set_sidebar_collapsed(&mut self, v: bool) {
+        self.cache.sidebar_collapsed = Some(v);
+    }
     pub fn welcome_as_sidebar(&self) -> bool {
         self.cache.welcome_as_sidebar
     }
@@ -1062,11 +1180,22 @@ impl ConfigStore {
     pub fn set_welcome_sidebar_width(&mut self, v: f32) {
         self.cache.welcome_sidebar_width = v;
     }
-    pub fn welcome_collapsed(&self) -> bool {
+    pub fn welcome_sidebar_dock(&self) -> String {
+        let d = self.cache.welcome_sidebar_dock.trim();
+        if d.is_empty() {
+            "left".into()
+        } else {
+            d.to_string()
+        }
+    }
+    pub fn set_welcome_sidebar_dock(&mut self, v: String) {
+        self.cache.welcome_sidebar_dock = v;
+    }
+    pub fn welcome_collapsed(&self) -> Option<bool> {
         self.cache.welcome_collapsed
     }
     pub fn set_welcome_collapsed(&mut self, v: bool) {
-        self.cache.welcome_collapsed = v;
+        self.cache.welcome_collapsed = Some(v);
     }
     /// Whether the startup new-version check is enabled (#184).
     pub fn update_check_enabled(&self) -> bool {
@@ -1077,8 +1206,7 @@ impl ConfigStore {
     }
     pub fn wallpaper_overlay(&self) -> f32 {
         let a = self.cache.wallpaper_overlay;
-        // Floor lowered 0.40 → 0.30 so the new 0.38 default (and more see-through
-        // panels) is reachable (#new-user-defaults).
+        // Floor lowered 0.40 -> 0.30 so more see-through panels are reachable.
         if a <= 0.0 {
             0.86
         } else {
@@ -1159,6 +1287,55 @@ impl ConfigStore {
         self.cache.sync_upload = v;
     }
 
+    pub fn webdav_enabled(&self) -> bool {
+        self.cache.webdav_enabled
+    }
+
+    pub fn webdav_url(&self) -> &str {
+        &self.cache.webdav_url
+    }
+
+    pub fn webdav_username(&self) -> &str {
+        &self.cache.webdav_username
+    }
+
+    pub fn webdav_password(&self) -> &str {
+        self.cache.webdav_password.as_str()
+    }
+
+    pub fn webdav_remote_path(&self) -> &str {
+        if self.cache.webdav_remote_path.trim().is_empty() {
+            "meatshell-connections.json"
+        } else {
+            &self.cache.webdav_remote_path
+        }
+    }
+
+    pub fn webdav_accept_invalid_certs(&self) -> bool {
+        self.cache.webdav_accept_invalid_certs
+    }
+
+    pub fn set_webdav_settings(
+        &mut self,
+        enabled: bool,
+        url: String,
+        username: String,
+        password: String,
+        remote_path: String,
+        accept_invalid_certs: bool,
+    ) {
+        self.cache.webdav_enabled = enabled;
+        self.cache.webdav_url = url.trim().trim_end_matches('/').to_string();
+        self.cache.webdav_username = username.trim().to_string();
+        self.cache.webdav_password = Secret::new(password);
+        self.cache.webdav_remote_path = if remote_path.trim().is_empty() {
+            "meatshell-connections.json".to_string()
+        } else {
+            remote_path.trim().trim_start_matches('/').to_string()
+        };
+        self.cache.webdav_accept_invalid_certs = accept_invalid_certs;
+    }
+
     /// Whether each download prompts for a save location (default false) (#87).
     pub fn download_always_ask(&self) -> bool {
         self.cache.download_always_ask
@@ -1228,6 +1405,21 @@ impl ConfigStore {
                 let enc = Self::encrypt(&self.key, session.password.as_str())?;
                 session.password = Secret::new(enc);
             }
+            if !session.private_key_inline.is_empty()
+                && !session
+                    .private_key_inline
+                    .as_str()
+                    .starts_with(Self::ENC_PREFIX)
+            {
+                let enc = Self::encrypt(&self.key, session.private_key_inline.as_str())?;
+                session.private_key_inline = Secret::new(enc);
+            }
+        }
+        if !disk.webdav_password.is_empty()
+            && !disk.webdav_password.as_str().starts_with(Self::ENC_PREFIX)
+        {
+            let enc = Self::encrypt(&self.key, disk.webdav_password.as_str())?;
+            disk.webdav_password = Secret::new(enc);
         }
         let raw = serde_json::to_string_pretty(&disk)?;
         // Write to a sibling temp file then rename — cheap atomicity.
@@ -1245,7 +1437,57 @@ impl ConfigStore {
         }
         fs::rename(&tmp, &self.path)
             .with_context(|| format!("failed to finalise {}", self.path.display()))?;
+        self.sync_backup(&raw);
         Ok(())
+    }
+
+    fn sync_backup(&self, raw: &str) {
+        let Some(backup_dir) = &self.backup_dir else {
+            return;
+        };
+        if let Err(e) = fs::create_dir_all(backup_dir) {
+            tracing::warn!(
+                "failed to create user config backup dir {}: {e}",
+                backup_dir.display()
+            );
+            return;
+        }
+
+        let backup_sessions = backup_dir.join("sessions.json");
+        let tmp = backup_sessions.with_extension("json.tmp");
+        if let Err(e) = fs::write(&tmp, raw) {
+            tracing::warn!("failed to write {}: {e}", tmp.display());
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = fs::rename(&tmp, &backup_sessions) {
+            tracing::warn!("failed to finalise {}: {e}", backup_sessions.display());
+        }
+
+        if let Some(config_dir) = self.path.parent() {
+            for name in ["secret.key", "known_hosts"] {
+                let src = config_dir.join(name);
+                let dst = backup_dir.join(name);
+                if src.exists() {
+                    if let Err(e) = fs::copy(&src, &dst) {
+                        tracing::warn!(
+                            "failed to sync {} to user config backup {}: {e}",
+                            src.display(),
+                            dst.display()
+                        );
+                    }
+                    #[cfg(unix)]
+                    if name == "secret.key" {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&dst, fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+        }
     }
 
     // ── Portable export / import (issue #46) ──────────────────────────────
@@ -1283,7 +1525,7 @@ impl ConfigStore {
     /// Export all sessions to a portable JSON file. Passwords are re-encrypted
     /// with the built-in export key; everything else stays plaintext so the
     /// file is human-readable and editable. Returns the number of sessions.
-    pub fn export_to(&self, path: &Path) -> Result<usize> {
+    pub fn export_json(&self) -> Result<(String, usize)> {
         let mut out = ExportFile {
             meatshell_export: 1,
             sessions: self.cache.sessions.clone(),
@@ -1294,20 +1536,29 @@ impl ConfigStore {
                 let enc = Self::encrypt_export(s.password.as_str())?;
                 s.password = Secret::new(enc);
             }
+            if !s.private_key_inline.is_empty() {
+                let enc = Self::encrypt_export(s.private_key_inline.as_str())?;
+                s.private_key_inline = Secret::new(enc);
+            }
             // `last_used` is machine-local noise — don't carry it across.
             s.last_used = None;
         }
-        let raw = serde_json::to_string_pretty(&out)?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(out.sessions.len())
+        Ok((serde_json::to_string_pretty(&out)?, out.sessions.len()))
     }
 
-    /// Import sessions from a file produced by [`Self::export_to`]. New sessions
+    /// Export all sessions to a portable JSON file. Passwords are re-encrypted
+    /// with the built-in export key; everything else stays plaintext so the
+    /// file is human-readable and editable. Returns the number of sessions.
+    pub fn export_to(&self, path: &Path) -> Result<usize> {
+        let (raw, count) = self.export_json()?;
+        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(count)
+    }
+
+    /// Import sessions from a string produced by [`Self::export_json`]. New sessions
     /// get fresh ids; duplicates (same host+user+port+kind) are skipped.
     /// Returns `(added, skipped)`. The store is saved if anything was added.
-    pub fn import_from(&mut self, path: &Path) -> Result<(usize, usize)> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+    pub fn import_json(&mut self, raw: &str) -> Result<(usize, usize)> {
         let file: ExportFile =
             serde_json::from_str(&raw).context("not a valid meatshell export file")?;
 
@@ -1320,6 +1571,12 @@ impl ConfigStore {
                 s.password = Secret::new(plain);
             } else if let Some(plain) = Self::try_decrypt(&self.key, s.password.as_str()) {
                 s.password = Secret::new(plain);
+            }
+            if let Some(plain) = Self::decrypt_export(s.private_key_inline.as_str()) {
+                s.private_key_inline = Secret::new(plain);
+            } else if let Some(plain) = Self::try_decrypt(&self.key, s.private_key_inline.as_str())
+            {
+                s.private_key_inline = Secret::new(plain);
             }
             let dup = self.cache.sessions.iter().any(|x| {
                 x.host == s.host && x.user == s.user && x.port == s.port && x.kind == s.kind
@@ -1337,6 +1594,13 @@ impl ConfigStore {
         }
         Ok((added, skipped))
     }
+
+    /// Import sessions from a file produced by [`Self::export_to`].
+    pub fn import_from(&mut self, path: &Path) -> Result<(usize, usize)> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        self.import_json(&raw)
+    }
 }
 
 #[cfg(test)]
@@ -1347,15 +1611,75 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ms-test-{}.json", Uuid::new_v4()));
         ConfigStore {
             path,
+            backup_dir: None,
             cache: ConfigFile::default(),
             key: [7u8; 32],
         }
     }
 
+    fn sample_session(name: &str) -> Session {
+        Session {
+            name: name.into(),
+            host: "192.168.100.2".into(),
+            port: 22,
+            user: "root".into(),
+            ..Session::new_empty()
+        }
+    }
+
     #[test]
-    fn wallpaper_defaults_to_tech_but_keeps_explicit_choice() {
+    fn restores_and_syncs_user_config_backup() {
+        let base = std::env::temp_dir().join(format!("ms-backup-{}", Uuid::new_v4()));
+        let primary = base.join("portable");
+        let backup = base.join("user");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&backup).unwrap();
+
+        let backup_cfg = ConfigFile {
+            sessions: vec![sample_session("saved")],
+            ..ConfigFile::default()
+        };
+        std::fs::write(
+            backup.join("sessions.json"),
+            serde_json::to_string_pretty(&backup_cfg).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(backup.join("secret.key"), [9u8; 32]).unwrap();
+
+        restore_user_backup_if_needed(&primary, &backup);
+        assert!(sessions_file_has_connections(
+            &primary.join("sessions.json")
+        ));
+        assert_eq!(
+            std::fs::read(primary.join("secret.key")).unwrap(),
+            [9u8; 32]
+        );
+
+        let store = ConfigStore {
+            path: primary.join("sessions.json"),
+            backup_dir: Some(backup.clone()),
+            cache: ConfigFile {
+                sessions: vec![sample_session("new")],
+                ..ConfigFile::default()
+            },
+            key: [7u8; 32],
+        };
+        std::fs::write(primary.join("secret.key"), [7u8; 32]).unwrap();
+        store.save().unwrap();
+
+        let raw = std::fs::read_to_string(backup.join("sessions.json")).unwrap();
+        let cfg: ConfigFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(cfg.sessions.len(), 1);
+        assert_eq!(cfg.sessions[0].name, "new");
+        assert_eq!(std::fs::read(backup.join("secret.key")).unwrap(), [7u8; 32]);
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn wallpaper_defaults_to_ms_but_keeps_explicit_choice() {
         // Fresh install (no file).
-        assert_eq!(fresh_config().wallpaper, "builtin:tech");
+        assert_eq!(fresh_config().wallpaper, "builtin:ms");
         // User upgrading from before the feature: JSON without the key.
         let cfg: ConfigFile = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.wallpaper, "builtin:tech");
@@ -1365,6 +1689,14 @@ mod tests {
         // A custom choice is preserved.
         let cfg: ConfigFile = serde_json::from_str(r#"{"wallpaper":"builtin:light"}"#).unwrap();
         assert_eq!(cfg.wallpaper, "builtin:light");
+
+        let mut cfg = ConfigFile {
+            wallpaper: "builtin:miku".to_string(),
+            defaults_rev: DEFAULTS_REV,
+            ..ConfigFile::default()
+        };
+        assert!(!migrate_defaults(&mut cfg));
+        assert_eq!(cfg.wallpaper, "builtin:miku");
     }
 
     #[test]
