@@ -616,7 +616,7 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-parity: "none";
     in-out property <string> dialog-flow: "none";
     in-out property <bool> dialog-disable-shell-integration: false;
-    in-out property <string> dialog-note;
+    in-out property <string> dialog-notes;
     in-out property <string> dialog-test-status;
 
     // Delete-confirmation modal state (#28).
@@ -3204,7 +3204,7 @@ export component AppWindow inherits Window {
         draft-parity <=> root.dialog-parity;
         draft-flow <=> root.dialog-flow;
         draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
-        draft-note <=> root.dialog-note;
+        draft-notes <=> root.dialog-notes;
         test-status <=> root.dialog-test-status;
         forwards: root.dialog-forwards;
         submit(draft) => { root.session-dialog-submit(draft); }

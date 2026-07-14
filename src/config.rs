@@ -492,8 +492,8 @@ pub struct Session {
     /// Free-form note for this session — somewhere to stash extra info (jump-host
     /// details, credentials hints, owner, etc.). Shown only in the edit dialog.
     /// (B站 suggestion)
-    #[serde(default)]
-    pub note: String,
+    #[serde(default, alias = "note")]
+    pub notes: String,
 }
 
 /// One SSH tunnel (#56). `kind` is "local" (-L), "remote" (-R) or
@@ -541,7 +541,7 @@ impl Session {
             flow_control: default_flow(),
             forwards: Vec::new(),
             disable_shell_integration: false,
-            note: String::new(),
+            notes: String::new(),
         }
     }
 }
@@ -1713,6 +1713,33 @@ mod tests {
         };
         assert!(!migrate_defaults(&mut cfg));
         assert_eq!(cfg.wallpaper, "builtin:miku");
+    }
+
+    #[test]
+    fn session_notes_are_backward_compatible_across_field_rename() {
+        let legacy_json = serde_json::json!({
+            "sessions": [{
+                "id": "legacy", "name": "db", "host": "db.internal",
+                "port": 22, "user": "root", "auth": "password",
+                "notes": "owner: ops\nproduction"
+            }]
+        });
+        let legacy: ConfigFile = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.sessions[0].notes, "owner: ops\nproduction");
+
+        let renamed_json = serde_json::json!({
+            "sessions": [{
+                "id": "renamed", "name": "db", "host": "db.internal",
+                "port": 22, "user": "root", "auth": "password",
+                "note": "temporary migration note"
+            }]
+        });
+        let renamed: ConfigFile = serde_json::from_value(renamed_json).unwrap();
+        assert_eq!(renamed.sessions[0].notes, "temporary migration note");
+
+        let saved = serde_json::to_string(&renamed).unwrap();
+        assert!(saved.contains("\"notes\""));
+        assert!(!saved.contains("\"note\""));
     }
 
     #[test]

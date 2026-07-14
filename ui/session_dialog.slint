@@ -1,5 +1,6 @@
 import { Theme } from "theme.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
+import { TextEdit } from "std-widgets.slint";
 
 // One SSH port-forward row shown in the session dialog (#56). `summary` is a
 // ready-to-display line like "-L 127.0.0.1:8080 → host:80".
@@ -34,7 +35,7 @@ export struct SessionDraft {
     // Windows / pwsh servers where it breaks the shell (#140).
     disable-shell-integration: bool,
     // Free-form note (B站 suggestion).
-    note: string,
+    notes: string,
     // Id of another saved SSH session to use as a jump host / bastion, or "" for
     // a direct connection (#211).
     jump-session-id: string,
@@ -323,7 +324,7 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-parity: "none";
     in-out property <string> draft-flow: "none";
     in-out property <bool> draft-disable-shell-integration: false;
-    in-out property <string> draft-note;
+    in-out property <string> draft-notes;
     in-out property <string> test-status;
 
     // Port forwards / tunnels (#56). `forwards` is the current list (fed from
@@ -483,12 +484,19 @@ export component SessionDialog inherits Rectangle {
             }
 
             // Free-form note — extra info to keep with the session (B站 suggestion).
-            LabeledInput {
-                input-background: Theme.bg-elevated;
-                idle-border: Theme.border-strong;
-                label: @tr("Note (optional)");
-                placeholder: @tr("Anything to remember about this host");
-                value <=> root.draft-note;
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Notes (optional)");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                TextEdit {
+                    height: 80px;
+                    text <=> root.draft-notes;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
             }
 
             // ── SSH / Telnet share host + port ──────────────────────────────
@@ -991,7 +999,7 @@ export component SessionDialog inherits Rectangle {
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
                             disable-shell-integration: root.draft-disable-shell-integration,
-                            note: root.draft-note,
+                            notes: root.draft-notes,
                             jump-session-id: (root.draft-jump-index > 0 && root.draft-jump-index < root.jump-ids.length)
                                 ? root.jump-ids[root.draft-jump-index] : "",
                         });
@@ -1042,7 +1050,7 @@ export component SessionDialog inherits Rectangle {
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
                             disable-shell-integration: root.draft-disable-shell-integration,
-                            note: root.draft-note,
+                            notes: root.draft-notes,
                             jump-session-id: (root.draft-jump-index > 0 && root.draft-jump-index < root.jump-ids.length)
                                 ? root.jump-ids[root.draft-jump-index] : "",
                         });

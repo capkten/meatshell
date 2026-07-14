@@ -2618,6 +2618,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
         group: group.into(),
         group_header: group.into(),
         collapsed: false,
+        notes: "".into(),
     };
 
     let mut rows: Vec<SessionInfo> = Vec::new();
@@ -2633,6 +2634,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
             group: "system".into(),
             group_header: if i == 0 { "system".into() } else { "".into() },
             collapsed: true,
+            notes: "".into(),
         });
     }
     for group in &display_groups {
@@ -2666,6 +2668,7 @@ fn sync_sessions_to_model(store: &ConfigStore, model: &VecModel<SessionInfo>) {
                         "".into()
                     },
                     collapsed: false,
+                    notes: s.notes.lines().next().unwrap_or("").into(),
                 });
             }
         }
@@ -2801,7 +2804,7 @@ fn wire_session_callbacks(
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
             w.set_dialog_disable_shell_integration(false);
-            w.set_dialog_note("".into());
+            w.set_dialog_notes("".into());
             w.set_dialog_editing(false);
             w.set_dialog_open(true);
         }
@@ -3012,7 +3015,7 @@ fn wire_session_callbacks(
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
-                w.set_dialog_note(session.note.clone().into());
+                w.set_dialog_notes(session.notes.clone().into());
                 w.set_dialog_editing(true);
                 w.set_dialog_open(true);
             }
@@ -3261,7 +3264,7 @@ fn wire_session_callbacks(
                 flow_control: draft.flow_control.to_string(),
                 forwards: edit_forwards.borrow().clone(),
                 disable_shell_integration: draft.disable_shell_integration,
-                note: draft.note.to_string(),
+                notes: draft.notes.to_string(),
                 jump_session_id: draft.jump_session_id.to_string(),
             };
             {
