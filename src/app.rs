@@ -4361,6 +4361,8 @@ fn local_hardware_info() -> &'static LocalHardwareInfo {
 
 #[cfg(target_os = "windows")]
 fn fill_local_gpu_info(info: &mut LocalHardwareInfo) {
+    use std::os::windows::process::CommandExt;
+
     let output = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
@@ -4369,6 +4371,7 @@ fn fill_local_gpu_info(info: &mut LocalHardwareInfo) {
             "-Command",
             "$controllers = @(Get-CimInstance Win32_VideoController | Select-Object Name,AdapterCompatibility,DriverVersion,AdapterRAM); $regs = @(Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-ItemProperty $_.PsPath -ErrorAction SilentlyContinue; if ($p.DriverDesc) { [pscustomobject]@{ Name=$p.DriverDesc; Vendor=$p.ProviderName; Driver=$p.DriverVersion; Memory=$p.'HardwareInformation.qwMemorySize' } } }); [pscustomobject]@{ Controllers=$controllers; Registry=$regs } | ConvertTo-Json -Compress -Depth 4",
         ])
+        .creation_flags(0x08000000)
         .output();
     let Ok(output) = output else {
         return;
