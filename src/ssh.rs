@@ -655,6 +655,57 @@ struct RuntimeForward {
     task: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardKind {
+    Local,
+    Dynamic,
+    Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardShutdownAction {
+    AbortTask,
+    CancelRemote,
+}
+
+fn forward_shutdown_action(kind: ForwardKind) -> ForwardShutdownAction {
+    match kind {
+        ForwardKind::Local | ForwardKind::Dynamic => ForwardShutdownAction::AbortTask,
+        ForwardKind::Remote => ForwardShutdownAction::CancelRemote,
+    }
+}
+
+fn forward_kind(kind: &str) -> Option<ForwardKind> {
+    match kind {
+        "local" => Some(ForwardKind::Local),
+        "dynamic" => Some(ForwardKind::Dynamic),
+        "remote" => Some(ForwardKind::Remote),
+        _ => None,
+    }
+}
+
+async fn stop_runtime_forward(
+    forward: &mut RuntimeForward,
+    handle: &Arc<Handle<ClientHandler>>,
+) -> Result<()> {
+    match forward_kind(&forward.info.kind).map(forward_shutdown_action) {
+        Some(ForwardShutdownAction::AbortTask) => {
+            if let Some(task) = forward.task.take() {
+                task.abort();
+            }
+            Ok(())
+        }
+        Some(ForwardShutdownAction::CancelRemote) => handle
+            .cancel_tcpip_forward(
+                forward.info.bind_addr.clone(),
+                forward.info.bind_port as u32,
+            )
+            .await
+            .context("cancel remote port forward"),
+        None => Ok(()),
+    }
+}
+
 fn normalized_bind_addr(f: &PortForward) -> String {
     let bind = f.bind_addr.trim();
     if bind.is_empty() {
@@ -1268,6 +1319,9 @@ async fn run_session(
                         let _ = channel.window_change(cols, rows, 0, 0).await;
                     }
                     Some(SessionCommand::AddTunnel { id, forward }) => {
+                        if let Some(mut old) = runtime_forwards.remove(&id) {
+                            let _ = stop_runtime_forward(&mut old, &handle).await;
+                        }
                         if forward.kind == "local" || forward.kind == "dynamic" {
                             runtime_forwards.insert(
                                 id.clone(),
@@ -1282,12 +1336,14 @@ async fn run_session(
                         }
                     }
                     Some(SessionCommand::StopTunnel(id)) => {
-                        if let Some(f) = runtime_forwards.get_mut(&id) {
-                            if let Some(task) = f.task.take() {
-                                task.abort();
-                            }
-                            f.info.active = false;
-                            f.info.status = t("已停止", "stopped").to_string();
+                        if let Some(mut f) = runtime_forwards.remove(&id) {
+                            let stop_result = stop_runtime_forward(&mut f, &handle).await;
+                            f.info.active = stop_result.is_err();
+                            f.info.status = if stop_result.is_ok() {
+                                t("已停止", "stopped").to_string()
+                            } else {
+                                t("停止失败", "stop failed").to_string()
+                            };
                             emit_tunnel_update(&runtime_forwards, &events);
                         }
                     }
@@ -1507,10 +1563,8 @@ async fn run_session(
 
     // Tear down any port-forward listeners (#56); -R forwards die with the
     // session's disconnect below.
-    for f in runtime_forwards.into_values() {
-        if let Some(task) = f.task {
-            task.abort();
-        }
+    for mut f in runtime_forwards.into_values() {
+        let _ = stop_runtime_forward(&mut f, &handle).await;
     }
 
     let _ = handle
@@ -2409,5 +2463,30 @@ mod mfa_tests {
         ] {
             assert!(looks_like_mfa(p), "missed an MFA prompt: {p:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_forward_tests {
+    use super::{forward_shutdown_action, ForwardKind, ForwardShutdownAction};
+
+    #[test]
+    fn local_and_dynamic_forwards_abort_their_listener() {
+        assert_eq!(
+            forward_shutdown_action(ForwardKind::Local),
+            ForwardShutdownAction::AbortTask
+        );
+        assert_eq!(
+            forward_shutdown_action(ForwardKind::Dynamic),
+            ForwardShutdownAction::AbortTask
+        );
+    }
+
+    #[test]
+    fn remote_forwards_cancel_on_the_server() {
+        assert_eq!(
+            forward_shutdown_action(ForwardKind::Remote),
+            ForwardShutdownAction::CancelRemote
+        );
     }
 }

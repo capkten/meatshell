@@ -12,6 +12,23 @@ use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalExitState {
+    Running,
+    Stopping,
+}
+
+impl LocalExitState {
+    fn request_exit(&mut self) -> bool {
+        if *self == Self::Stopping {
+            false
+        } else {
+            *self = Self::Stopping;
+            true
+        }
+    }
+}
+
 use crate::config::Session;
 use crate::i18n::t;
 use crate::ssh::{SessionCommand, SessionEvent, SessionHandle};
@@ -96,6 +113,7 @@ async fn run_local(
     let writer = pair.master.take_writer().context("local pty writer")?;
     let writer = Arc::new(Mutex::new(writer));
     let child = Arc::new(Mutex::new(child));
+    let (reader_exit_tx, mut reader_exit_rx) = mpsc::unbounded_channel::<()>();
 
     let _ = events.send(SessionEvent::Connected);
     let _ = events.send(SessionEvent::Status(format!(
@@ -106,11 +124,13 @@ async fn run_local(
 
     {
         let reader_events = events.clone();
+        let reader_exit_tx = reader_exit_tx.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
+                        let _ = reader_exit_tx.send(());
                         let _ = reader_events.send(SessionEvent::Closed(
                             t("本地终端已退出", "local terminal exited").into(),
                         ));
@@ -123,6 +143,7 @@ async fn run_local(
                         }
                     }
                     Err(e) => {
+                        let _ = reader_exit_tx.send(());
                         let _ = reader_events.send(SessionEvent::Closed(format!(
                             "{}: {e}",
                             t("本地终端读取失败", "local terminal read failed")
@@ -134,7 +155,13 @@ async fn run_local(
         });
     }
 
-    while let Some(cmd) = commands.recv().await {
+    let mut exit_state = LocalExitState::Running;
+    loop {
+        let cmd = tokio::select! {
+            cmd = commands.recv() => cmd,
+            _ = reader_exit_rx.recv() => break,
+        };
+        let Some(cmd) = cmd else { break };
         match cmd {
             SessionCommand::RawInput(bytes) => {
                 tracing::debug!("local pty write len={} bytes", bytes.len());
@@ -154,11 +181,15 @@ async fn run_local(
             }
             SessionCommand::AddTunnel { .. } | SessionCommand::StopTunnel(_) => {}
             SessionCommand::Close => {
-                let _ = child.lock().unwrap().kill();
+                exit_state.request_exit();
                 break;
             }
         }
     }
+    let _ = exit_state.request_exit();
+    let mut guard = child.lock().unwrap();
+    let _ = guard.kill();
+    let _ = guard.wait();
     Ok(())
 }
 
@@ -204,7 +235,7 @@ fn local_program(kind: &str) -> (String, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::local_program;
+    use super::{local_program, LocalExitState};
 
     #[cfg(windows)]
     #[test]
@@ -215,5 +246,14 @@ mod tests {
 
         let (_, cmd_args) = local_program("cmd");
         assert!(cmd_args.iter().any(|arg| arg.contains("chcp 65001")));
+    }
+
+    #[test]
+    fn local_exit_state_is_idempotent() {
+        let mut state = LocalExitState::Running;
+        assert!(state.request_exit());
+        assert_eq!(state, LocalExitState::Stopping);
+        assert!(!state.request_exit());
+        assert_eq!(state, LocalExitState::Stopping);
     }
 }

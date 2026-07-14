@@ -1038,8 +1038,14 @@ export component AppWindow inherits Window {
         // Sidebar extent along its docked axis. When collapsed it shrinks to the
         // 36px ToolStrip icon bar (M5) instead of 0 + a floating button; the 4px
         // splitter is gone while collapsed.
-        property <length> sb-w: root.sidebar-collapsed ? 36px : root.sidebar-width;
-        property <length> sb-h: root.sidebar-collapsed ? 36px : root.sidebar-height;
+        // When the collapsed resource strip sits outside the central layout,
+        // alongside the welcome sidebar, its 36px slot is already consumed.
+        property <length> sb-w: root.sidebar-collapsed
+            ? (dock-area.sidebar-strip-outside ? 0px : 36px)
+            : root.sidebar-width;
+        property <length> sb-h: root.sidebar-collapsed
+            ? (dock-area.sidebar-strip-outside ? 0px : 36px)
+            : root.sidebar-height;
         property <length> sp: root.sidebar-collapsed ? 0px : 4px;
         // The collapsed bar (sb-h) already reserves the bottom strip now.
         property <length> bottom-strip-h: 0px;

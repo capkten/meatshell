@@ -716,11 +716,22 @@ async fn run_sftp(
                             t("下载文件夹", "Downloading folder"),
                             dirname
                         )));
-                        match download_dir(&sftp, &handle, &remote, &local_dir, &events).await {
-                            Ok(_) => {
+                        match download_dir(
+                            &sftp, &handle, &remote, &local_dir, &events, &cancel, &file_id,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
                                 let _ = events.send(SessionEvent::SftpStatus(format!(
                                     "{}: {}",
                                     t("下载完成", "Downloaded"),
+                                    dirname
+                                )));
+                            }
+                            Ok(false) => {
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {}",
+                                    t("已取消", "Cancelled"),
                                     dirname
                                 )));
                             }
@@ -932,7 +943,16 @@ async fn run_sftp(
                             t("上传文件夹", "Uploading folder"),
                             dirname
                         )));
-                        let res = upload_dir(&handle, &sftp, &local, &remote_dir, &events).await;
+                        let res = upload_dir(
+                            &handle,
+                            &sftp,
+                            &local,
+                            &remote_dir,
+                            &events,
+                            &cancel,
+                            &up_id,
+                        )
+                        .await;
                         if let Ok(entries) = list_dir_impl(&sftp, &remote_dir).await {
                             let _ = events.send(SessionEvent::SftpEntries {
                                 path: remote_dir.clone(),
@@ -940,10 +960,17 @@ async fn run_sftp(
                             });
                         }
                         match res {
-                            Ok(_) => {
+                            Ok(true) => {
                                 let _ = events.send(SessionEvent::SftpStatus(format!(
                                     "{}: {}",
                                     t("上传完成", "Uploaded"),
+                                    dirname
+                                )));
+                            }
+                            Ok(false) => {
+                                let _ = events.send(SessionEvent::SftpStatus(format!(
+                                    "{}: {}",
+                                    t("已取消", "Cancelled"),
                                     dirname
                                 )));
                             }
@@ -1601,6 +1628,14 @@ fn open_with_os(path: &str) {
 /// and neutralises reserved device names (CON, NUL, COM1…).  Normal names
 /// (letters, digits, `.`, `-`, `_`, Unicode) pass through; Unix dotfiles keep
 /// their leading dot.  Falls back to `file` when nothing usable remains.
+fn directory_transfer_id<'a>(parent_id: &'a str, _path: &str) -> &'a str {
+    parent_id
+}
+
+fn cancellation_requested(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
+
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -1740,7 +1775,8 @@ async fn stage_remote_for_copy(
             .map(|entries| entries.is_empty())
             .unwrap_or(false);
         if !empty {
-            download_dir(sftp, handle, remote, &local_parent, events).await?;
+            let cancel = Arc::new(AtomicBool::new(false));
+            download_dir(sftp, handle, remote, &local_parent, events, &cancel, &id).await?;
         }
     } else {
         let local = local_path.to_string_lossy().to_string();
@@ -2028,40 +2064,44 @@ async fn download_dir(
     remote_root: &str,
     local_parent: &str,
     events: &UnboundedSender<SessionEvent>,
-) -> Result<()> {
-    // Folder transfers aren't individually cancellable from the UI; a throwaway
-    // never-set flag satisfies download_impl's signature.
-    let no_cancel = Arc::new(AtomicBool::new(false));
+    cancel: &Arc<AtomicBool>,
+    transfer_id: &str,
+) -> Result<bool> {
     let root_name = sanitize_filename(&base_name(remote_root));
     let root_local = format!("{}/{}", local_parent.trim_end_matches('/'), root_name);
     // (remote_dir, local_dir) pairs still to mirror.
     let mut stack = vec![(remote_root.trim_end_matches('/').to_string(), root_local)];
     while let Some((rdir, ldir)) = stack.pop() {
+        if cancellation_requested(cancel) {
+            return Ok(false);
+        }
         tokio::fs::create_dir_all(&ldir)
             .await
             .with_context(|| format!("create local dir {ldir}"))?;
         for entry in list_dir_impl(sftp, &rdir).await? {
+            if cancellation_requested(cancel) {
+                return Ok(false);
+            }
             if entry.is_dir {
                 let child_local = format!("{}/{}", ldir, sanitize_filename(&entry.name));
                 stack.push((entry.full_path, child_local));
             } else {
                 let fname = sanitize_filename(&entry.name);
                 let lpath = format!("{}/{}", ldir, fname);
-                let id = Uuid::new_v4().to_string();
                 download_impl(
                     handle,
                     &entry.full_path,
                     &lpath,
                     &fname,
-                    &id,
+                    directory_transfer_id(transfer_id, &entry.full_path),
                     events,
-                    &no_cancel,
+                    cancel,
                 )
                 .await?;
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Recursively remove a remote directory tree (#50 follow-up).
@@ -2105,20 +2145,25 @@ async fn upload_dir(
     local_root: &Path,
     remote_parent: &str,
     events: &UnboundedSender<SessionEvent>,
-) -> Result<()> {
-    // Folder uploads aren't individually cancellable from the UI; a throwaway
-    // never-set flag satisfies upload_pipelined's signature.
-    let no_cancel = Arc::new(AtomicBool::new(false));
+    cancel: &Arc<AtomicBool>,
+    transfer_id: &str,
+) -> Result<bool> {
     let root_name = local_file_name_utf8(local_root)?;
     let remote_root = format!("{}/{}", remote_parent.trim_end_matches('/'), root_name);
     let mut stack = vec![(local_root.to_path_buf(), remote_root)];
     while let Some((ldir, rdir)) = stack.pop() {
+        if cancellation_requested(cancel) {
+            return Ok(false);
+        }
         // Best-effort mkdir; an error usually just means the dir already exists.
         let _ = sftp.create_dir(&rdir).await;
         let mut rd = tokio::fs::read_dir(&ldir)
             .await
             .with_context(|| format!("read local dir {}", ldir.display()))?;
         while let Some(entry) = rd.next_entry().await.context("read dir entry")? {
+            if cancellation_requested(cancel) {
+                return Ok(false);
+            }
             let lpath = entry.path();
             let name = local_file_name_utf8(&lpath)?;
             let rchild = format!("{}/{}", rdir, name);
@@ -2126,12 +2171,20 @@ async fn upload_dir(
             if ft.is_dir() {
                 stack.push((lpath, rchild));
             } else if ft.is_file() {
-                let id = Uuid::new_v4().to_string();
-                upload_pipelined(handle, &lpath, &rchild, &name, &id, events, &no_cancel).await?;
+                upload_pipelined(
+                    handle,
+                    &lpath,
+                    &rchild,
+                    &name,
+                    directory_transfer_id(transfer_id, &rchild),
+                    events,
+                    cancel,
+                )
+                .await?;
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Pipelined SFTP upload (#16).
@@ -2374,5 +2427,28 @@ mod sanitize_tests {
         assert_eq!(sanitize_filename(""), "file");
         assert_eq!(sanitize_filename("   "), "file");
         assert_eq!(sanitize_filename("..."), "file");
+    }
+}
+
+#[cfg(test)]
+mod transfer_lifecycle_tests {
+    use super::{cancellation_requested, directory_transfer_id};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn directory_children_keep_the_parent_transfer_id() {
+        assert_eq!(directory_transfer_id("transfer-1", "a.txt"), "transfer-1");
+        assert_eq!(
+            directory_transfer_id("transfer-1", "nested/b.txt"),
+            "transfer-1"
+        );
+    }
+
+    #[test]
+    fn directory_cancellation_reads_the_registered_flag() {
+        let flag = AtomicBool::new(false);
+        assert!(!cancellation_requested(&flag));
+        flag.store(true, Ordering::Relaxed);
+        assert!(cancellation_requested(&flag));
     }
 }
