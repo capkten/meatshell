@@ -10280,6 +10280,45 @@ impl TermBuffer {
     }
 }
 
+/// 判断按键是否可预测
+#[allow(dead_code)]
+fn is_predictable(key: &str, ctrl: bool, alt: bool) -> Option<PredictionAction> {
+    // Ctrl/Alt组合键不可预测
+    if ctrl || alt {
+        return None;
+    }
+
+    // 空字符串（单独修饰键）不可预测
+    if key.is_empty() {
+        return None;
+    }
+
+    // 检查是否为退格键
+    if key == "\u{0008}" || key == "\u{007F}" {
+        return Some(PredictionAction::Backspace);
+    }
+
+    // 检查是否为方向键（Slint PUA编码）
+    match key {
+        "\u{F700}" => return Some(PredictionAction::MoveCursor(Direction::Up)),
+        "\u{F701}" => return Some(PredictionAction::MoveCursor(Direction::Down)),
+        "\u{F702}" => return Some(PredictionAction::MoveCursor(Direction::Left)),
+        "\u{F703}" => return Some(PredictionAction::MoveCursor(Direction::Right)),
+        _ => {}
+    }
+
+    // 检查是否为普通可打印字符（单个字符，ASCII 32-126）
+    if key.chars().count() == 1 {
+        let ch = key.chars().next().unwrap();
+        let cp = ch as u32;
+        if (32..=126).contains(&cp) {
+            return Some(PredictionAction::Insert(ch));
+        }
+    }
+
+    None
+}
+
 /// True if a terminal span contains any CJK character — ideograph, kana, or
 /// (crucially) CJK punctuation like 、。，. The mono terminal font has no CJK
 /// glyphs and Slint's per-script fallback tofu's *isolated* CJK punctuation
@@ -10957,5 +10996,132 @@ mod selection_tests {
         assert!(hit.inverse);
         assert!(matches!(hit.fg, vt100::Color::Default));
         assert!(matches!(hit.bg, vt100::Color::Default));
+    }
+}
+
+#[cfg(test)]
+mod prediction_tests {
+    use super::*;
+
+    // ---- is_predictable: modifier key combos ----
+
+    #[test]
+    fn ctrl_combo_is_not_predictable() {
+        assert!(is_predictable("a", true, false).is_none());
+    }
+
+    #[test]
+    fn alt_combo_is_not_predictable() {
+        assert!(is_predictable("a", false, true).is_none());
+    }
+
+    #[test]
+    fn ctrl_alt_combo_is_not_predictable() {
+        assert!(is_predictable("a", true, true).is_none());
+    }
+
+    // ---- is_predictable: empty / modifier-only ----
+
+    #[test]
+    fn empty_key_is_not_predictable() {
+        assert!(is_predictable("", false, false).is_none());
+    }
+
+    // ---- is_predictable: backspace ----
+
+    #[test]
+    fn bs_char_is_backspace() {
+        let result = is_predictable("\u{0008}", false, false);
+        assert!(matches!(result, Some(PredictionAction::Backspace)));
+    }
+
+    #[test]
+    fn del_char_is_backspace() {
+        let result = is_predictable("\u{007F}", false, false);
+        assert!(matches!(result, Some(PredictionAction::Backspace)));
+    }
+
+    // ---- is_predictable: arrow keys (Slint PUA) ----
+
+    #[test]
+    fn arrow_up_is_move_cursor_up() {
+        let result = is_predictable("\u{F700}", false, false);
+        assert!(matches!(
+            result,
+            Some(PredictionAction::MoveCursor(Direction::Up))
+        ));
+    }
+
+    #[test]
+    fn arrow_down_is_move_cursor_down() {
+        let result = is_predictable("\u{F701}", false, false);
+        assert!(matches!(
+            result,
+            Some(PredictionAction::MoveCursor(Direction::Down))
+        ));
+    }
+
+    #[test]
+    fn arrow_left_is_move_cursor_left() {
+        let result = is_predictable("\u{F702}", false, false);
+        assert!(matches!(
+            result,
+            Some(PredictionAction::MoveCursor(Direction::Left))
+        ));
+    }
+
+    #[test]
+    fn arrow_right_is_move_cursor_right() {
+        let result = is_predictable("\u{F703}", false, false);
+        assert!(matches!(
+            result,
+            Some(PredictionAction::MoveCursor(Direction::Right))
+        ));
+    }
+
+    // ---- is_predictable: printable ASCII ----
+
+    #[test]
+    fn space_is_insertable() {
+        let result = is_predictable(" ", false, false);
+        assert!(matches!(result, Some(PredictionAction::Insert(' '))));
+    }
+
+    #[test]
+    fn lowercase_letter_is_insertable() {
+        let result = is_predictable("a", false, false);
+        assert!(matches!(result, Some(PredictionAction::Insert('a'))));
+    }
+
+    #[test]
+    fn digit_is_insertable() {
+        let result = is_predictable("5", false, false);
+        assert!(matches!(result, Some(PredictionAction::Insert('5'))));
+    }
+
+    #[test]
+    fn tilde_is_insertable() {
+        // '~' is ASCII 126, upper bound of printable range
+        let result = is_predictable("~", false, false);
+        assert!(matches!(result, Some(PredictionAction::Insert('~'))));
+    }
+
+    // ---- is_predictable: non-predictable keys ----
+
+    #[test]
+    fn control_char_below_printable_range_is_not_predictable() {
+        // ASCII 31 (unit separator) is below printable range
+        assert!(is_predictable("\u{001F}", false, false).is_none());
+    }
+
+    #[test]
+    fn multi_char_string_is_not_predictable() {
+        assert!(is_predictable("abc", false, false).is_none());
+    }
+
+    #[test]
+    fn non_ascii_unicode_is_not_predictable() {
+        assert!(is_predictable("é", false, false).is_none());
+        assert!(is_predictable("中", false, false).is_none());
     }
 }
