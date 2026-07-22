@@ -8387,6 +8387,13 @@ fn wire_key_input(
             }
 
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
+            // 本地echo预测：立即应用预测
+            if let Some(predictable_action) = is_predictable(key.as_str(), ctrl, alt) {
+                if let Some(h) = term_buf(&bufs, tab_id.as_str()) {
+                    let mut buf = h.lock().unwrap();
+                    buf.apply_prediction(predictable_action);
+                }
+            }
             // Log only the length — never the keystroke bytes, which can be
             // password characters (#15).
             tracing::debug!(
