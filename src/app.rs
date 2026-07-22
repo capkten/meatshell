@@ -10014,6 +10014,9 @@ impl TermBuffer {
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
     fn ingest(&mut self, input: &[u8]) {
+        // 处理服务器echo，匹配/修正预测
+        self.process_server_echo(input);
+
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
         let bytes = self.rewrite_hvp(input);
@@ -10367,7 +10370,6 @@ impl TermBuffer {
     }
 
     /// 检查并标记超时的预测
-    #[allow(dead_code)]
     fn check_prediction_timeouts(&mut self) {
         let now = std::time::Instant::now();
         for pred in &mut self.predictions {
@@ -10379,7 +10381,6 @@ impl TermBuffer {
     }
 
     /// 处理服务器echo，匹配/修正预测
-    #[allow(dead_code)]
     fn process_server_echo(&mut self, bytes: &[u8]) {
         // 先检查超时
         self.check_prediction_timeouts();
@@ -10414,7 +10415,6 @@ impl TermBuffer {
     /// 对于 Insert，比较字符是否相同；对于 Backspace，检查 BS/DEL 控制字符。
     /// MoveCursor 始终返回 false——方向键的服务器 echo 是多字节转义序列，
     /// 无法与单个 char 匹配。
-    #[allow(dead_code)]
     fn match_prediction(&self, pred: &Prediction, ch: char) -> bool {
         match &pred.action {
             PredictionAction::Insert(c) => *c == ch,
@@ -10432,7 +10432,6 @@ impl TermBuffer {
     }
 
     /// 修正预测错误
-    #[allow(dead_code)]
     fn correct_prediction(&mut self, pred: &Prediction, ch: char) {
         match &pred.action {
             PredictionAction::Insert(_) => {
@@ -10453,7 +10452,6 @@ impl TermBuffer {
     /// 在指定位置覆盖字符
     ///
     /// 通过 vt100 parser 的转义序列实现：保存光标 → CUP 定位 → 写入字符 → 恢复光标。
-    #[allow(dead_code)]
     fn overwrite_char_at(&mut self, position: (u16, u16), ch: char) {
         let (row, col) = position;
         // DECSC: 保存光标位置和属性
@@ -10493,7 +10491,6 @@ impl TermBuffer {
     ///
     /// 直接调用 parser.process() 而非 ingest()，避免未来 ingest 中
     /// process_server_echo 集成后产生无限递归。
-    #[allow(dead_code)]
     fn apply_char_to_screen(&mut self, ch: char) {
         let bytes = ch.to_string().into_bytes();
         self.parser.process(&bytes);
