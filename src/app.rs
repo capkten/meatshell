@@ -11340,6 +11340,18 @@ mod prediction_tests {
         assert!(is_predictable("中", false, false).is_none());
     }
 
+    #[test]
+    fn test_tab_enter_escape_not_predictable() {
+        // Tab
+        assert!(is_predictable("\t", false, false).is_none());
+        // Enter (LF)
+        assert!(is_predictable("\n", false, false).is_none());
+        // Enter (CR)
+        assert!(is_predictable("\r", false, false).is_none());
+        // Escape
+        assert!(is_predictable("\u{001B}", false, false).is_none());
+    }
+
     // ---- helpers for apply_prediction / get_char_at / get_line_end_col ----
 
     /// Create a TermBuffer with the given text fed to the vt100 parser.
