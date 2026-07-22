@@ -10370,6 +10370,131 @@ impl TermBuffer {
             }
         }
     }
+
+    /// 处理服务器echo，匹配/修正预测
+    #[allow(dead_code)]
+    fn process_server_echo(&mut self, bytes: &[u8]) {
+        // 先检查超时
+        self.check_prediction_timeouts();
+
+        // 将bytes解析为字符
+        let text = String::from_utf8_lossy(bytes);
+
+        for ch in text.chars() {
+            if let Some(pred) = self.predictions.front() {
+                if pred.expired {
+                    // 已过期，直接移除，正常处理
+                    self.predictions.pop_front();
+                    self.apply_char_to_screen(ch);
+                } else if self.match_prediction(pred, ch) {
+                    // 匹配成功，跳过预测，移除条目
+                    self.predictions.pop_front();
+                    // 不需要更新屏幕（预测已经显示了）
+                } else {
+                    // 不匹配，用服务器数据修正
+                    let pred = self.predictions.pop_front().unwrap();
+                    self.correct_prediction(&pred, ch);
+                }
+            } else {
+                // 没有预测，正常处理
+                self.apply_char_to_screen(ch);
+            }
+        }
+    }
+
+    /// 检查服务器字符是否匹配预测
+    ///
+    /// 对于 Insert，比较字符是否相同；对于 Backspace，检查 BS/DEL 控制字符。
+    /// MoveCursor 始终返回 false——方向键的服务器 echo 是多字节转义序列，
+    /// 无法与单个 char 匹配。
+    #[allow(dead_code)]
+    fn match_prediction(&self, pred: &Prediction, ch: char) -> bool {
+        match &pred.action {
+            PredictionAction::Insert(c) => *c == ch,
+            PredictionAction::Backspace => {
+                // 退格键：服务器echo可能是BS (0x08) 或 DEL (0x7F)
+                ch == '\u{0008}' || ch == '\u{007F}'
+            }
+            PredictionAction::MoveCursor(_) => {
+                // 方向键echo是多字节转义序列（如 ESC [ A），
+                // 无法通过单个char匹配，始终不匹配。
+                // correct_prediction会将服务器数据正常应用到parser。
+                false
+            }
+        }
+    }
+
+    /// 修正预测错误
+    #[allow(dead_code)]
+    fn correct_prediction(&mut self, pred: &Prediction, ch: char) {
+        match &pred.action {
+            PredictionAction::Insert(_) => {
+                // 字符插入预测错误：用服务器字符覆盖
+                self.overwrite_char_at(pred.position, ch);
+            }
+            PredictionAction::Backspace => {
+                // 退格预测错误：恢复被删除的字符
+                if let Some(deleted) = pred.deleted_char {
+                    self.restore_deleted_char(pred.position, deleted);
+                }
+                self.apply_char_to_screen(ch);
+            }
+            PredictionAction::MoveCursor(_) => {
+                // 方向键预测错误：将服务器字符正常应用到parser
+                // （服务器会自己设置正确的光标位置）
+                self.apply_char_to_screen(ch);
+            }
+        }
+    }
+
+    /// 在指定位置覆盖字符
+    ///
+    /// 通过 vt100 parser 的转义序列实现：保存光标 → CUP 定位 → 写入字符 → 恢复光标。
+    #[allow(dead_code)]
+    fn overwrite_char_at(&mut self, position: (u16, u16), ch: char) {
+        let (row, col) = position;
+        // DECSC: 保存光标位置和属性
+        self.parser.process(b"\x1b7");
+        // CUP: 移动到目标位置（1-indexed）
+        let cup = format!("\x1b[{};{}H", row + 1, col + 1);
+        self.parser.process(cup.as_bytes());
+        // 写入新字符
+        let ch_bytes = ch.to_string();
+        self.parser.process(ch_bytes.as_bytes());
+        // DECRC: 恢复光标位置和属性
+        self.parser.process(b"\x1b8");
+    }
+
+    /// 恢复被删除的字符
+    ///
+    /// 在指定位置插入一个字符，将原有内容右移。
+    /// 通过 ICH（Insert Character）转义序列实现。
+    #[allow(dead_code)]
+    fn restore_deleted_char(&mut self, position: (u16, u16), ch: char) {
+        let (row, col) = position;
+        // DECSC: 保存光标位置和属性
+        self.parser.process(b"\x1b7");
+        // CUP: 移动到目标位置（1-indexed）
+        let cup = format!("\x1b[{};{}H", row + 1, col + 1);
+        self.parser.process(cup.as_bytes());
+        // ICH: 插入一个空白字符，将右侧内容右移
+        self.parser.process(b"\x1b[@");
+        // 写入恢复的字符（覆盖ICH插入的空白）
+        let ch_bytes = ch.to_string();
+        self.parser.process(ch_bytes.as_bytes());
+        // DECRC: 恢复光标位置和属性
+        self.parser.process(b"\x1b8");
+    }
+
+    /// 应用字符到屏幕（正常处理）
+    ///
+    /// 直接调用 parser.process() 而非 ingest()，避免未来 ingest 中
+    /// process_server_echo 集成后产生无限递归。
+    #[allow(dead_code)]
+    fn apply_char_to_screen(&mut self, ch: char) {
+        let bytes = ch.to_string().into_bytes();
+        self.parser.process(&bytes);
+    }
 }
 
 /// 判断按键是否可预测
@@ -11439,5 +11564,269 @@ mod prediction_tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         buf.check_prediction_timeouts();
         assert!(buf.predictions[0].expired);
+    }
+
+    // ---- match_prediction ----
+
+    #[test]
+    fn match_prediction_insert_matches_same_char() {
+        let buf = buf_with(b"hello");
+        let pred = Prediction {
+            action: PredictionAction::Insert('x'),
+            position: (0, 5),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: None,
+        };
+        assert!(buf.match_prediction(&pred, 'x'));
+    }
+
+    #[test]
+    fn match_prediction_insert_rejects_different_char() {
+        let buf = buf_with(b"hello");
+        let pred = Prediction {
+            action: PredictionAction::Insert('x'),
+            position: (0, 5),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: None,
+        };
+        assert!(!buf.match_prediction(&pred, 'y'));
+    }
+
+    #[test]
+    fn match_prediction_backspace_matches_bs() {
+        let buf = buf_with(b"hello");
+        let pred = Prediction {
+            action: PredictionAction::Backspace,
+            position: (0, 5),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: Some('o'),
+        };
+        assert!(buf.match_prediction(&pred, '\u{0008}'));
+    }
+
+    #[test]
+    fn match_prediction_backspace_matches_del() {
+        let buf = buf_with(b"hello");
+        let pred = Prediction {
+            action: PredictionAction::Backspace,
+            position: (0, 5),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: Some('o'),
+        };
+        assert!(buf.match_prediction(&pred, '\u{007F}'));
+    }
+
+    #[test]
+    fn match_prediction_backspace_rejects_regular_char() {
+        let buf = buf_with(b"hello");
+        let pred = Prediction {
+            action: PredictionAction::Backspace,
+            position: (0, 5),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: Some('o'),
+        };
+        assert!(!buf.match_prediction(&pred, 'a'));
+    }
+
+    #[test]
+    fn match_prediction_move_cursor_always_returns_false() {
+        // Escape sequences are multi-byte and can't be matched against single chars.
+        let buf = buf_with(b"test");
+        let pred = Prediction {
+            action: PredictionAction::MoveCursor(Direction::Left),
+            position: (0, 4),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: None,
+        };
+        assert!(!buf.match_prediction(&pred, '\x1b'));
+        assert!(!buf.match_prediction(&pred, '['));
+        assert!(!buf.match_prediction(&pred, 'D'));
+    }
+
+    // ---- overwrite_char_at ----
+
+    #[test]
+    fn overwrite_char_at_replaces_character() {
+        let mut buf = buf_with(b"hello");
+        // Screen has "hello" at row 0. Overwrite col 2 ('l') with 'X'.
+        buf.overwrite_char_at((0, 2), 'X');
+        assert_eq!(buf.get_char_at(0, 2), 'X');
+        // Other chars unchanged.
+        assert_eq!(buf.get_char_at(0, 0), 'h');
+        assert_eq!(buf.get_char_at(0, 1), 'e');
+        assert_eq!(buf.get_char_at(0, 3), 'l');
+        assert_eq!(buf.get_char_at(0, 4), 'o');
+    }
+
+    #[test]
+    fn overwrite_char_at_preserves_cursor_position() {
+        let mut buf = buf_with(b"hello");
+        // Cursor at (0, 5). Overwrite at (0, 0).
+        buf.overwrite_char_at((0, 0), 'Y');
+        let (row, col) = buf.parser.screen().cursor_position();
+        assert_eq!((row, col), (0, 5), "cursor should stay at (0,5)");
+    }
+
+    // ---- restore_deleted_char ----
+
+    #[test]
+    fn restore_deleted_char_inserts_at_position() {
+        let mut buf = buf_with(b"helo");
+        // Insert 'l' at col 2 to make "hello".
+        buf.restore_deleted_char((0, 2), 'l');
+        assert_eq!(buf.get_char_at(0, 0), 'h');
+        assert_eq!(buf.get_char_at(0, 1), 'e');
+        assert_eq!(buf.get_char_at(0, 2), 'l');
+        // The original 'l' at col 2 should have shifted right to col 3.
+        assert_eq!(buf.get_char_at(0, 3), 'l');
+        // 'o' shifted right to col 4.
+        assert_eq!(buf.get_char_at(0, 4), 'o');
+    }
+
+    // ---- correct_prediction ----
+
+    #[test]
+    fn correct_insert_overwrites_at_prediction_position() {
+        let mut buf = buf_with(b"hello");
+        // Predict 'x' at (0,5), server actually sends 'y'.
+        let pred = Prediction {
+            action: PredictionAction::Insert('x'),
+            position: (0, 5),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: None,
+        };
+        buf.correct_prediction(&pred, 'y');
+        // 'y' should be written at (0,5) — overwriting whatever was there.
+        assert_eq!(buf.get_char_at(0, 5), 'y');
+    }
+
+    #[test]
+    fn correct_backspace_restores_deleted_char_and_applies_server_char() {
+        let mut buf = buf_with(b"hello");
+        // Predicted backspace at (0,5) which "deleted" 'o' (col 4).
+        // Server sends 'z' instead (not a backspace).
+        let pred = Prediction {
+            action: PredictionAction::Backspace,
+            position: (0, 5),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: Some('o'),
+        };
+        buf.correct_prediction(&pred, 'z');
+        // 'o' should still be at col 4 (was never actually deleted by parser).
+        // 'z' should be applied to screen at cursor.
+        assert_eq!(buf.get_char_at(0, 4), 'o');
+        assert_eq!(buf.get_char_at(0, 5), 'z');
+    }
+
+    #[test]
+    fn correct_move_cursor_applies_server_char() {
+        let mut buf = buf_with(b"test");
+        let pred = Prediction {
+            action: PredictionAction::MoveCursor(Direction::Left),
+            position: (0, 4),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char: None,
+        };
+        buf.correct_prediction(&pred, 'x');
+        // The server char 'x' should be applied at current cursor position.
+        assert_eq!(buf.get_char_at(0, 4), 'x');
+    }
+
+    // ---- process_server_echo ----
+
+    #[test]
+    fn echo_matching_insert_removes_prediction_and_skips_parser() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Insert('x'));
+        // Server echoes 'x' — matches the prediction.
+        buf.process_server_echo(b"x");
+        assert!(buf.predictions.is_empty(), "prediction should be consumed");
+        // Parser state: "hello" (unchanged — prediction match skips parser).
+        assert_eq!(buf.get_char_at(0, 0), 'h');
+        assert_eq!(buf.get_char_at(0, 4), 'o');
+    }
+
+    #[test]
+    fn echo_mismatching_insert_corrects_and_applies() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Insert('x'));
+        // Server echoes 'y' — mismatch.
+        buf.process_server_echo(b"y");
+        assert!(buf.predictions.is_empty());
+        // 'y' should be written at prediction position (0,5).
+        assert_eq!(buf.get_char_at(0, 5), 'y');
+    }
+
+    #[test]
+    fn echo_expired_prediction_applies_char_normally() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Insert('x'));
+        // Force-expire the prediction.
+        buf.predictions[0].expired = true;
+        buf.process_server_echo(b"z");
+        assert!(buf.predictions.is_empty());
+        // 'z' should be applied to screen normally at cursor.
+        assert_eq!(buf.get_char_at(0, 5), 'z');
+    }
+
+    #[test]
+    fn echo_without_predictions_applies_normally() {
+        let mut buf = buf_with(b"hi");
+        buf.process_server_echo(b"x");
+        // 'x' should appear at (0, 2) after "hi".
+        assert_eq!(buf.get_char_at(0, 2), 'x');
+    }
+
+    #[test]
+    fn echo_matching_backspace_removes_prediction() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Backspace);
+        // Server echoes BS.
+        buf.process_server_echo(b"\x08");
+        assert!(buf.predictions.is_empty());
+    }
+
+    #[test]
+    fn echo_processes_multiple_chars() {
+        let mut buf = buf_with(b"");
+        buf.process_server_echo(b"abc");
+        assert_eq!(buf.get_char_at(0, 0), 'a');
+        assert_eq!(buf.get_char_at(0, 1), 'b');
+        assert_eq!(buf.get_char_at(0, 2), 'c');
+    }
+
+    #[test]
+    fn echo_multiple_predictions_consumed_in_order() {
+        let mut buf = buf_with(b"");
+        buf.apply_prediction(PredictionAction::Insert('a'));
+        buf.apply_prediction(PredictionAction::Insert('b'));
+        // Server echoes 'a', 'b' — both match in order.
+        buf.process_server_echo(b"ab");
+        assert!(buf.predictions.is_empty());
+    }
+
+    #[test]
+    fn echo_partial_match_then_mismatch() {
+        let mut buf = buf_with(b"");
+        buf.apply_prediction(PredictionAction::Insert('a'));
+        buf.apply_prediction(PredictionAction::Insert('b'));
+        // Server echoes 'a' (match) then 'c' (mismatch for 'b').
+        buf.process_server_echo(b"ac");
+        assert!(buf.predictions.is_empty());
+        // 'a' was matched — consumed without feeding to parser (prediction
+        // overlay already displays it). Both predictions recorded position
+        // (0,0) because apply_prediction doesn't move the parser cursor.
+        // 'c' corrects the second prediction via overwrite_char_at(0,0).
+        // So only 'c' is in the parser state at (0,0).
+        assert_eq!(buf.get_char_at(0, 0), 'c');
     }
 }
