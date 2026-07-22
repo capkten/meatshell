@@ -10391,21 +10391,19 @@ impl TermBuffer {
         for ch in text.chars() {
             if let Some(pred) = self.predictions.front() {
                 if pred.expired {
-                    // 已过期，直接移除，正常处理
+                    // 已过期，移除预测，字符由 feed_batched 统一送入 parser
                     self.predictions.pop_front();
-                    self.apply_char_to_screen(ch);
                 } else if self.match_prediction(pred, ch) {
-                    // 匹配成功，跳过预测，移除条目
+                    // 匹配成功，移除预测，字符由 feed_batched 统一送入 parser
                     self.predictions.pop_front();
-                    self.apply_char_to_screen(ch);
                 } else {
-                    // 不匹配，用服务器数据修正
+                    // 不匹配，用服务器数据修正（correct_prediction 内部
+                    // 会调用 apply_char_to_screen / overwrite_char_at 来修正覆盖层）
                     let pred = self.predictions.pop_front().unwrap();
                     self.correct_prediction(&pred, ch);
                 }
             } else {
-                // 没有预测，正常处理
-                self.apply_char_to_screen(ch);
+                // 没有预测，字符由 feed_batched 统一送入 parser
             }
         }
     }
@@ -11750,7 +11748,8 @@ mod prediction_tests {
         // Server echoes 'x' — matches the prediction.
         buf.process_server_echo(b"x");
         assert!(buf.predictions.is_empty(), "prediction should be consumed");
-        // Parser state: "hello" (prediction overlay matched, char still fed to parser).
+        // process_server_echo only consumes the prediction; matching chars
+        // are NOT fed to the parser (feed_batched handles that in ingest).
         assert_eq!(buf.get_char_at(0, 0), 'h');
         assert_eq!(buf.get_char_at(0, 4), 'o');
     }
@@ -11774,6 +11773,9 @@ mod prediction_tests {
         buf.predictions[0].expired = true;
         buf.process_server_echo(b"z");
         assert!(buf.predictions.is_empty());
+        // process_server_echo only consumes the expired prediction; the
+        // character is applied later by feed_batched in the real ingest path.
+        buf.feed_batched(b"z");
         // 'z' should be applied to screen normally at cursor.
         assert_eq!(buf.get_char_at(0, 5), 'z');
     }
@@ -11781,7 +11783,10 @@ mod prediction_tests {
     #[test]
     fn echo_without_predictions_applies_normally() {
         let mut buf = buf_with(b"hi");
+        // process_server_echo only does prediction bookkeeping; the actual
+        // character application is done by feed_batched in the real ingest path.
         buf.process_server_echo(b"x");
+        buf.feed_batched(b"x");
         // 'x' should appear at (0, 2) after "hi".
         assert_eq!(buf.get_char_at(0, 2), 'x');
     }
@@ -11798,7 +11803,10 @@ mod prediction_tests {
     #[test]
     fn echo_processes_multiple_chars() {
         let mut buf = buf_with(b"");
+        // process_server_echo only does prediction bookkeeping; the actual
+        // character application is done by feed_batched in the real ingest path.
         buf.process_server_echo(b"abc");
+        buf.feed_batched(b"abc");
         assert_eq!(buf.get_char_at(0, 0), 'a');
         assert_eq!(buf.get_char_at(0, 1), 'b');
         assert_eq!(buf.get_char_at(0, 2), 'c');
@@ -11822,11 +11830,13 @@ mod prediction_tests {
         // Server echoes 'a' (match) then 'c' (mismatch for 'b').
         buf.process_server_echo(b"ac");
         assert!(buf.predictions.is_empty());
-        // 'a' was matched — consumed without feeding to parser (prediction
-        // overlay already displays it). Both predictions recorded position
-        // (0,0) because apply_prediction doesn't move the parser cursor.
+        // 'a' was matched — consumed by process_server_echo without applying
+        // to the parser (process_server_echo only does prediction bookkeeping;
+        // feed_batched applies chars to the parser in the real ingest path).
+        // Both predictions recorded position (0,0) because apply_prediction
+        // doesn't move the parser cursor.
         // 'c' corrects the second prediction via overwrite_char_at(0,0).
-        // So only 'c' is in the parser state at (0,0).
+        // So only 'c' appears in the parser state at (0,0).
         assert_eq!(buf.get_char_at(0, 0), 'c');
     }
 }
