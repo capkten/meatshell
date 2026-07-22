@@ -58,6 +58,12 @@ struct TermBuffer {
     /// match — the way FinalShell rewraps on resize (#169). Only the most recent
     /// `RAW_CAP` bytes are kept; scrollback older than that won't reflow.
     raw: std::collections::VecDeque<u8>,
+    /// 预测队列
+    #[allow(dead_code)]
+    predictions: std::collections::VecDeque<Prediction>,
+    /// 预测超时时间
+    #[allow(dead_code)]
+    prediction_timeout: std::time::Duration,
 }
 
 /// How much of the byte stream we retain per tab for resize-reflow (#169).
@@ -66,6 +72,47 @@ const RAW_CAP: usize = 2 * 1024 * 1024;
 /// Max bytes merged into one Output event before starting a fresh chunk (#209).
 /// Keeps a single UI callback from spending hundreds of ms in vt100 ingest.
 const OUTPUT_MERGE_BYTE_CAP: usize = 64 * 1024;
+
+/// 预测超时时间（毫秒）
+const PREDICTION_TIMEOUT_MS: u64 = 100;
+
+/// 预测操作类型
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum PredictionAction {
+    /// 插入字符
+    Insert(char),
+    /// 退格删除（删除光标前的字符）
+    Backspace,
+    /// 方向键移动光标
+    MoveCursor(Direction),
+}
+
+/// 方向
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// 预测条目
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct Prediction {
+    /// 预测的操作
+    action: PredictionAction,
+    /// 预测时的光标位置 (row, col)
+    position: (u16, u16),
+    /// 创建时间（用于超时检测）
+    created_at: std::time::Instant,
+    /// 是否已过期（超时后标记）
+    expired: bool,
+    /// 退格操作：被删除的字符（用于恢复）
+    deleted_char: Option<char>,
+}
 
 /// Minimal CSI-final-byte rewriter state (persists across read chunks).
 #[derive(Clone, Copy, PartialEq)]
@@ -3566,6 +3613,8 @@ fn wire_session_callbacks(
                     displayed_text: Vec::new(),
                     csi_state: CsiState::Normal,
                     raw: std::collections::VecDeque::new(),
+                    predictions: std::collections::VecDeque::new(),
+                    prediction_timeout: std::time::Duration::from_millis(PREDICTION_TIMEOUT_MS),
                 })),
             );
             render_gates
@@ -10754,6 +10803,8 @@ mod selection_tests {
             displayed_text: Vec::new(),
             csi_state: CsiState::Normal,
             raw: std::collections::VecDeque::new(),
+            predictions: std::collections::VecDeque::new(),
+            prediction_timeout: std::time::Duration::from_millis(PREDICTION_TIMEOUT_MS),
         }
     }
 
