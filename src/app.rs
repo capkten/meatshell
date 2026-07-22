@@ -10358,6 +10358,18 @@ impl TermBuffer {
         }
         0
     }
+
+    /// 检查并标记超时的预测
+    #[allow(dead_code)]
+    fn check_prediction_timeouts(&mut self) {
+        let now = std::time::Instant::now();
+        for pred in &mut self.predictions {
+            if !pred.expired && now.duration_since(pred.created_at) > self.prediction_timeout {
+                pred.expired = true;
+                tracing::debug!("prediction expired: {:?}", pred.action);
+            }
+        }
+    }
 }
 
 /// 判断按键是否可预测
@@ -11358,5 +11370,74 @@ mod prediction_tests {
         assert_eq!(buf.predictions[2].position, (0, 2));
         // Backspace at (0, 2) deletes the char at col 1 = 'b'.
         assert_eq!(buf.predictions[2].deleted_char, Some('b'));
+    }
+
+    // ---- check_prediction_timeouts ----
+
+    #[test]
+    fn fresh_predictions_are_not_expired() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Insert('x'));
+        buf.check_prediction_timeouts();
+        assert!(!buf.predictions[0].expired);
+    }
+
+    #[test]
+    fn old_predictions_are_marked_expired() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Insert('x'));
+        // Artificially age the prediction past the timeout.
+        let timeout = buf.prediction_timeout;
+        buf.predictions[0].created_at =
+            std::time::Instant::now() - timeout - std::time::Duration::from_millis(1);
+        buf.check_prediction_timeouts();
+        assert!(buf.predictions[0].expired);
+    }
+
+    #[test]
+    fn already_expired_predictions_stay_expired() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Backspace);
+        // Manually mark as expired.
+        buf.predictions[0].expired = true;
+        // Store the original created_at to verify it is not re-touched.
+        let original_created = buf.predictions[0].created_at;
+        buf.check_prediction_timeouts();
+        assert!(buf.predictions[0].expired);
+        assert_eq!(buf.predictions[0].created_at, original_created);
+    }
+
+    #[test]
+    fn mixed_predictions_only_timeout_old_ones() {
+        let mut buf = buf_with(b"hello");
+        buf.apply_prediction(PredictionAction::Insert('a'));
+        buf.apply_prediction(PredictionAction::Insert('b'));
+        // Age only the first prediction.
+        let timeout = buf.prediction_timeout;
+        buf.predictions[0].created_at =
+            std::time::Instant::now() - timeout - std::time::Duration::from_millis(1);
+        buf.check_prediction_timeouts();
+        assert!(buf.predictions[0].expired);
+        assert!(!buf.predictions[1].expired);
+    }
+
+    #[test]
+    fn no_predictions_is_a_noop() {
+        let mut buf = buf_with(b"hello");
+        assert!(buf.predictions.is_empty());
+        buf.check_prediction_timeouts();
+        assert!(buf.predictions.is_empty());
+    }
+
+    #[test]
+    fn custom_short_timeout_expires_quickly() {
+        let mut buf = buf_with(b"hello");
+        // Use a very short timeout (0ms) so any prediction expires immediately.
+        buf.prediction_timeout = std::time::Duration::from_millis(0);
+        buf.apply_prediction(PredictionAction::Insert('z'));
+        // Sleep a tiny bit so duration_since > 0.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        buf.check_prediction_timeouts();
+        assert!(buf.predictions[0].expired);
     }
 }
