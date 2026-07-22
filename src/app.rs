@@ -10278,6 +10278,86 @@ impl TermBuffer {
             scroll_offset: self.view_offset as i32,
         }
     }
+
+    /// 应用预测到本地屏幕（立即显示）
+    #[allow(dead_code)]
+    fn apply_prediction(&mut self, action: PredictionAction) {
+        let screen = self.parser.screen();
+        let (row, col) = screen.cursor_position();
+
+        let deleted_char = match &action {
+            PredictionAction::Insert(_ch) => {
+                // 在光标位置插入字符，光标右移
+                // vt100 parser 不支持直接插入，只记录预测，
+                // 实际显示更新在 render 时处理
+                None
+            }
+            PredictionAction::Backspace => {
+                // 删除光标前的字符，光标左移
+                if col > 0 {
+                    // 获取被删除的字符（用于恢复）
+                    let deleted = self.get_char_at(row, col - 1);
+                    Some(deleted)
+                } else if row > 0 {
+                    // 行首退格：跳到上一行末尾
+                    let prev_row = row - 1;
+                    let prev_col = self.get_line_end_col(prev_row);
+                    let deleted = self.get_char_at(prev_row, prev_col);
+                    Some(deleted)
+                } else {
+                    None
+                }
+            }
+            PredictionAction::MoveCursor(_dir) => {
+                // 移动光标
+                None
+            }
+        };
+
+        // 记录预测条目
+        let prediction = Prediction {
+            action,
+            position: (row, col),
+            created_at: std::time::Instant::now(),
+            expired: false,
+            deleted_char,
+        };
+        self.predictions.push_back(prediction);
+    }
+
+    /// 获取指定位置的字符
+    ///
+    /// 使用 vt100 `Screen::cell()` API 读取单元格文本内容。
+    /// 如果位置无效或单元格为空，返回空格。
+    #[allow(dead_code)]
+    fn get_char_at(&self, row: u16, col: u16) -> char {
+        self.parser
+            .screen()
+            .cell(row, col)
+            .and_then(|c| {
+                let s = c.contents();
+                s.chars().next()
+            })
+            .unwrap_or(' ')
+    }
+
+    /// 获取行尾列位置（最后一个有内容的单元格的列号）
+    ///
+    /// 从行尾向前扫描，找到最后一个非空单元格。
+    /// 如果该行全空，返回 0。
+    #[allow(dead_code)]
+    fn get_line_end_col(&self, row: u16) -> u16 {
+        let (_, cols) = self.parser.screen().size();
+        let screen = self.parser.screen();
+        for col in (0..cols).rev() {
+            if let Some(cell) = screen.cell(row, col) {
+                if cell.has_contents() && !cell.is_wide_continuation() {
+                    return col;
+                }
+            }
+        }
+        0
+    }
 }
 
 /// 判断按键是否可预测
@@ -11123,5 +11203,160 @@ mod prediction_tests {
     fn non_ascii_unicode_is_not_predictable() {
         assert!(is_predictable("é", false, false).is_none());
         assert!(is_predictable("中", false, false).is_none());
+    }
+
+    // ---- helpers for apply_prediction / get_char_at / get_line_end_col ----
+
+    /// Create a TermBuffer with the given text fed to the vt100 parser.
+    /// The cursor ends up where the parser leaves it after processing `input`.
+    fn buf_with(input: &[u8]) -> TermBuffer {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(input);
+        TermBuffer {
+            parser,
+            find_query: String::new(),
+            is_dark: false,
+            sel_anchor: None,
+            sel_focus: None,
+            sel_ranges: Vec::new(),
+            history: Vec::new(),
+            prev: Vec::new(),
+            view_offset: 0,
+            displayed_text: Vec::new(),
+            csi_state: CsiState::Normal,
+            raw: std::collections::VecDeque::new(),
+            predictions: std::collections::VecDeque::new(),
+            prediction_timeout: std::time::Duration::from_millis(PREDICTION_TIMEOUT_MS),
+        }
+    }
+
+    // ---- get_char_at ----
+
+    #[test]
+    fn get_char_at_returns_character_at_position() {
+        // Feed "hello" — cursor at (0, 5) after processing.
+        let buf = buf_with(b"hello");
+        assert_eq!(buf.get_char_at(0, 0), 'h');
+        assert_eq!(buf.get_char_at(0, 1), 'e');
+        assert_eq!(buf.get_char_at(0, 4), 'o');
+    }
+
+    #[test]
+    fn get_char_at_returns_space_for_empty_cell() {
+        let buf = buf_with(b"hi");
+        // Column 50 is well past the text — should be empty.
+        assert_eq!(buf.get_char_at(0, 50), ' ');
+    }
+
+    #[test]
+    fn get_char_at_returns_space_for_out_of_bounds() {
+        let buf = buf_with(b"test");
+        // Row 100 doesn't exist on a 24-row screen — cell() returns None.
+        assert_eq!(buf.get_char_at(100, 0), ' ');
+    }
+
+    // ---- get_line_end_col ----
+
+    #[test]
+    fn get_line_end_col_finds_last_content() {
+        let buf = buf_with(b"hello");
+        // "hello" occupies columns 0-4.
+        assert_eq!(buf.get_line_end_col(0), 4);
+    }
+
+    #[test]
+    fn get_line_end_col_returns_0_for_empty_line() {
+        // Row 5 has never been written to — should be all empty.
+        let buf = buf_with(b"test");
+        assert_eq!(buf.get_line_end_col(5), 0);
+    }
+
+    #[test]
+    fn get_line_end_col_after_cursor_move() {
+        // Write "abc", then CR+LF to go to next line, then "xy".
+        let buf = buf_with(b"abc\r\nxy");
+        assert_eq!(buf.get_line_end_col(0), 2, "col of 'c' in 'abc'");
+        assert_eq!(buf.get_line_end_col(1), 1, "col of 'y' in 'xy'");
+    }
+
+    // ---- apply_prediction ----
+
+    #[test]
+    fn apply_insert_records_prediction() {
+        let mut buf = buf_with(b"hello");
+        // Cursor is at (0, 5) after "hello".
+        buf.apply_prediction(PredictionAction::Insert('x'));
+        assert_eq!(buf.predictions.len(), 1);
+        let p = &buf.predictions[0];
+        assert_eq!(p.position, (0, 5));
+        assert!(p.deleted_char.is_none());
+        assert!(!p.expired);
+        assert!(matches!(&p.action, PredictionAction::Insert('x')));
+    }
+
+    #[test]
+    fn apply_backspace_mid_line_records_deleted_char() {
+        let mut buf = buf_with(b"hello");
+        // Cursor is at (0, 5). Backspace should delete 'o' at col 4.
+        buf.apply_prediction(PredictionAction::Backspace);
+        assert_eq!(buf.predictions.len(), 1);
+        let p = &buf.predictions[0];
+        assert_eq!(p.position, (0, 5));
+        assert_eq!(p.deleted_char, Some('o'));
+    }
+
+    #[test]
+    fn apply_backspace_at_col0_records_none() {
+        // Write a single char, then CR to go back to col 0.
+        let mut buf = buf_with(b"a\r");
+        // Cursor should be at (0, 0).
+        buf.apply_prediction(PredictionAction::Backspace);
+        let p = &buf.predictions[0];
+        assert_eq!(p.position, (0, 0));
+        // At col 0, row 0: nothing to delete.
+        assert_eq!(p.deleted_char, None);
+    }
+
+    #[test]
+    fn apply_move_cursor_records_no_deleted_char() {
+        let mut buf = buf_with(b"test");
+        buf.apply_prediction(PredictionAction::MoveCursor(Direction::Left));
+        assert_eq!(buf.predictions.len(), 1);
+        let p = &buf.predictions[0];
+        assert!(p.deleted_char.is_none());
+        assert!(matches!(
+            &p.action,
+            PredictionAction::MoveCursor(Direction::Left)
+        ));
+    }
+
+    #[test]
+    fn multiple_predictions_are_queued() {
+        let mut buf = buf_with(b"ab");
+        buf.apply_prediction(PredictionAction::Insert('c'));
+        buf.apply_prediction(PredictionAction::Insert('d'));
+        buf.apply_prediction(PredictionAction::Backspace);
+        assert_eq!(buf.predictions.len(), 3);
+        // First is Insert('c'), second is Insert('d'), third is Backspace.
+        assert!(matches!(
+            &buf.predictions[0].action,
+            PredictionAction::Insert('c')
+        ));
+        assert!(matches!(
+            &buf.predictions[1].action,
+            PredictionAction::Insert('d')
+        ));
+        assert!(matches!(
+            &buf.predictions[2].action,
+            PredictionAction::Backspace
+        ));
+        // All predictions record the same cursor position (0, 2) because
+        // apply_prediction only records — it does not move the vt100 cursor.
+        // The actual screen update happens during rendering (future task).
+        assert_eq!(buf.predictions[0].position, (0, 2));
+        assert_eq!(buf.predictions[1].position, (0, 2));
+        assert_eq!(buf.predictions[2].position, (0, 2));
+        // Backspace at (0, 2) deletes the char at col 1 = 'b'.
+        assert_eq!(buf.predictions[2].deleted_char, Some('b'));
     }
 }
