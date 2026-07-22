@@ -10389,7 +10389,7 @@ impl TermBuffer {
                 } else if self.match_prediction(pred, ch) {
                     // 匹配成功，跳过预测，移除条目
                     self.predictions.pop_front();
-                    // 不需要更新屏幕（预测已经显示了）
+                    self.apply_char_to_screen(ch);
                 } else {
                     // 不匹配，用服务器数据修正
                     let pred = self.predictions.pop_front().unwrap();
@@ -10433,10 +10433,6 @@ impl TermBuffer {
                 self.overwrite_char_at(pred.position, ch);
             }
             PredictionAction::Backspace => {
-                // 退格预测错误：恢复被删除的字符
-                if let Some(deleted) = pred.deleted_char {
-                    self.restore_deleted_char(pred.position, deleted);
-                }
                 self.apply_char_to_screen(ch);
             }
             PredictionAction::MoveCursor(_) => {
@@ -11750,7 +11746,7 @@ mod prediction_tests {
         // Server echoes 'x' — matches the prediction.
         buf.process_server_echo(b"x");
         assert!(buf.predictions.is_empty(), "prediction should be consumed");
-        // Parser state: "hello" (unchanged — prediction match skips parser).
+        // Parser state: "hello" (prediction overlay matched, char still fed to parser).
         assert_eq!(buf.get_char_at(0, 0), 'h');
         assert_eq!(buf.get_char_at(0, 4), 'o');
     }
