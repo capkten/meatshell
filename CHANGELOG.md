@@ -3,6 +3,28 @@
 All notable changes are documented here. 本文件记录所有重要变更。
 中英对照（中文在前，English after）.
 
+## [0.6.3] - 2026-07-23
+
+### 新增 / Added
+
+- **本地 echo 预测。** 输入普通字符（a-z、0-9、符号等）和退格键时，本地立即显示，减少输入延迟感。预测在 100ms 超时后自动失效，服务器 echo 到达时自动验证/修正。方向键不预测（上/下是历史命令，左/右边界检查困难）。
+
+### 修复 / Fixed
+
+- **修复退格键边界检查。** 退格键在光标位于 (0,0) 位置时不再预测，避免无内容可删时的异常行为。
+- **修复方向键预测问题。** 移除方向键预测，避免上键移动光标而非取历史命令、左键移动到命令提示符位置等问题。
+
+---
+
+### Added
+
+- **Local echo prediction.** Printable characters (a-z, 0-9, symbols) and backspace now display locally immediately, reducing perceived input latency. Predictions expire after 100ms timeout and are automatically validated/corrected when server echo arrives. Arrow keys are not predicted (up/down are history commands, left/right boundary checking is complex).
+
+### Fixed
+
+- **Fix backspace boundary checking.** Backspace prediction is now skipped when the cursor is at position (0,0), preventing abnormal behavior when there's nothing to delete.
+- **Fix arrow key prediction issues.** Removed arrow key prediction to avoid issues where up key moves cursor instead of retrieving history commands, and left key moves to command prompt position.
+
 ## [0.6.2]
 
 ### 新增 / Added
