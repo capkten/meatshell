@@ -120,7 +120,7 @@ fn init_tracing() {
             fmt::layer()
                 .with_ansi(false)
                 .with_writer(errlog::CappedWriter::new(cf))
-                .with_filter(quiet_noise(EnvFilter::new("warn")))
+                .with_filter(quiet_noise(EnvFilter::new("info")))
         });
 
     tracing_subscriber::registry()

@@ -8389,9 +8389,17 @@ fn wire_key_input(
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
             // 本地echo预测：立即应用预测
             if let Some(predictable_action) = is_predictable(key.as_str(), ctrl, alt) {
+                let t0 = std::time::Instant::now();
                 if let Some(h) = term_buf(&bufs, tab_id.as_str()) {
                     let mut buf = h.lock().unwrap();
                     buf.apply_prediction(predictable_action);
+                    let elapsed = t0.elapsed();
+                    tracing::info!(
+                        "[ECHO_PRED] apply_prediction elapsed={}µs action={:?} queue_len={}",
+                        elapsed.as_micros(),
+                        buf.predictions.back().map(|p| &p.action),
+                        buf.predictions.len()
+                    );
                 }
             }
             // Log only the length — never the keystroke bytes, which can be
@@ -10014,11 +10022,13 @@ impl TermBuffer {
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
     fn ingest(&mut self, input: &[u8]) {
+        let t0 = std::time::Instant::now();
         // 处理服务器echo，匹配/修正预测。  Returns how many leading bytes
         // were consumed (matched / corrected / expired) and must NOT be
         // re-processed by feed_batched, because apply_prediction already
         // applied them to the vt100 screen.
         let consumed = self.process_server_echo(input);
+        let t_echo = t0.elapsed();
 
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
@@ -10030,6 +10040,18 @@ impl TermBuffer {
         // Skip bytes that were already applied to the screen by predictions.
         let feed_start = consumed.min(bytes.len());
         self.feed_batched(&bytes[feed_start..]);
+        let t_total = t0.elapsed();
+
+        if consumed > 0 || !self.predictions.is_empty() {
+            tracing::info!(
+                "[ECHO_PRED] ingest total={}µs echo={}µs input_len={} consumed={} predictions_remaining={}",
+                t_total.as_micros(),
+                t_echo.as_micros(),
+                input.len(),
+                consumed,
+                self.predictions.len()
+            );
+        }
     }
 
     /// Feed a (already HVP-rewritten) byte slice to vt100 in newline-bounded
@@ -10299,6 +10321,51 @@ impl TermBuffer {
     fn apply_prediction(&mut self, action: PredictionAction) {
         let screen = self.parser.screen();
         let (row, col) = screen.cursor_position();
+        let (rows, cols) = screen.size();
+
+        // 边界检查：退格和方向键需要检查是否可以执行
+        let can_apply = match &action {
+            PredictionAction::Insert(_) => true,
+            PredictionAction::Backspace => {
+                // 退格：检查光标是否已经在行首
+                // 如果在(0,0)位置，无法退格
+                if row == 0 && col == 0 {
+                    tracing::info!("[ECHO_PRED] backspace skipped: at (0,0)");
+                    false
+                } else {
+                    true
+                }
+            }
+            PredictionAction::MoveCursor(dir) => {
+                // 方向键：检查光标是否已经在边界
+                match dir {
+                    Direction::Up => row > 0,
+                    Direction::Down => row < rows - 1,
+                    Direction::Left => {
+                        // 左键：如果在行首，不能左移
+                        if col == 0 {
+                            tracing::info!("[ECHO_PRED] left arrow skipped: at col 0");
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Direction::Right => {
+                        // 右键：如果在行尾，不能右移
+                        if col >= cols - 1 {
+                            tracing::info!("[ECHO_PRED] right arrow skipped: at col end");
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                }
+            }
+        };
+
+        if !can_apply {
+            return;
+        }
 
         let deleted_char = match &action {
             PredictionAction::Insert(_ch) => {
@@ -10426,16 +10493,31 @@ impl TermBuffer {
                     // avoid double-processing in `feed_batched`.
                     self.predictions.pop_front();
                     consumed_bytes += ch.len_utf8();
+                    tracing::debug!(
+                        "[ECHO_PRED] expired prediction removed, remaining={}",
+                        self.predictions.len()
+                    );
                 } else if self.match_prediction(pred, ch) {
                     // 匹配成功，移除预测。  Already on screen → skip.
                     self.predictions.pop_front();
                     consumed_bytes += ch.len_utf8();
+                    tracing::info!(
+                        "[ECHO_PRED] matched prediction: ch={:?} remaining={}",
+                        ch,
+                        self.predictions.len()
+                    );
                 } else {
                     // 不匹配，用服务器数据修正（correct_prediction 内部
                     // 会调用 overwrite_char_at 来修正覆盖层）→ skip.
                     let pred = self.predictions.pop_front().unwrap();
                     self.correct_prediction(&pred, ch);
                     consumed_bytes += ch.len_utf8();
+                    tracing::info!(
+                        "[ECHO_PRED] mismatch: expected={:?} got={:?} remaining={}",
+                        pred.action,
+                        ch,
+                        self.predictions.len()
+                    );
                 }
             } else {
                 // 没有预测，剩余字节由 feed_batched 统一送入 parser
@@ -10550,14 +10632,8 @@ fn is_predictable(key: &str, ctrl: bool, alt: bool) -> Option<PredictionAction> 
         return Some(PredictionAction::Backspace);
     }
 
-    // 检查是否为方向键（Slint PUA编码）
-    match key {
-        "\u{F700}" => return Some(PredictionAction::MoveCursor(Direction::Up)),
-        "\u{F701}" => return Some(PredictionAction::MoveCursor(Direction::Down)),
-        "\u{F702}" => return Some(PredictionAction::MoveCursor(Direction::Left)),
-        "\u{F703}" => return Some(PredictionAction::MoveCursor(Direction::Right)),
-        _ => {}
-    }
+    // 方向键不预测（上/下是历史命令，左/右边界检查困难）
+    // 直接返回None，让服务器处理
 
     // 检查是否为普通可打印字符（单个字符，ASCII 32-126）
     if key.chars().count() == 1 {
