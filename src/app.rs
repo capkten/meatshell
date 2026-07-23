@@ -6,7 +6,7 @@
 //!   * Manage the tab list + per-tab `SessionHandle` map.
 //!   * Route Slint callbacks to the right domain module.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,10 @@ struct TermBuffer {
     /// Stored here so the event-pump threads can render new output with the
     /// correct palette without needing a window reference.
     is_dark: bool,
+    /// Client-side highlighting for plain output. Stored per buffer so render
+    /// workers do not need to borrow the UI/config state.
+    output_highlight: OutputHighlightPreset,
+    custom_highlight_rules: Vec<CompiledOutputRule>,
     /// Drag selection in ABSOLUTE scrollback coordinates: each endpoint is a
     /// `(combined_row, col)` where `combined_row` indexes the virtual buffer of
     /// `history` lines followed by the live screen rows.  Absolute (rather than
@@ -125,6 +129,66 @@ enum CsiState {
     Csi,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputHighlightPreset {
+    Off,
+    Log,
+    DevOps,
+}
+
+impl OutputHighlightPreset {
+    fn from_settings(enabled: bool, preset: &str) -> Self {
+        if !enabled {
+            Self::Off
+        } else if preset == "devops" {
+            Self::DevOps
+        } else {
+            Self::Log
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CompiledOutputRule {
+    matcher: regex::Regex,
+    whole_line: bool,
+    ansi_index: u8,
+}
+
+fn compile_output_rules(rules: &[OutputHighlightRule]) -> Vec<CompiledOutputRule> {
+    rules
+        .iter()
+        .filter(|rule| rule.enabled && !rule.pattern.trim().is_empty())
+        .filter_map(|rule| {
+            let pattern = if rule.regex {
+                rule.pattern.clone()
+            } else {
+                regex::escape(&rule.pattern)
+            };
+            let matcher = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(!rule.case_sensitive)
+                .build()
+                .ok()?;
+            Some(CompiledOutputRule {
+                matcher,
+                whole_line: rule.whole_line,
+                ansi_index: highlight_color_index(&rule.color),
+            })
+        })
+        .collect()
+}
+
+fn highlight_color_index(color: &str) -> u8 {
+    match color {
+        "yellow" => 11,
+        "green" => 10,
+        "cyan" => 14,
+        "magenta" => 13,
+        "gray" => 8,
+        _ => 9,
+    }
+}
+
 /// Max UI renders per second for a tab under sustained output (#209).
 const RENDER_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
 
@@ -179,12 +243,14 @@ use i_slint_backend_winit::WinitWindowAccessor;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Runtime;
 
-use crate::config::{AuthMethod, ConfigStore, Secret, Session, SessionKind};
+use crate::config::{
+    AuthMethod, ConfigStore, OutputHighlightRule, Secret, Session, SessionKind,
+};
 use crate::i18n::t;
 use crate::sftp::{spawn_sftp, SftpHandle};
 use crate::ssh::{
-    format_mtime, format_size, spawn_session, ProcInfo, SessionCommand, SessionEvent,
-    SessionHandle, SystemDetails,
+    format_mtime, format_size, spawn_session, test_session_auth, ProcInfo, SessionCommand,
+    SessionEvent, SessionHandle, SystemDetails,
 };
 use crate::system::{format_bytes_per_sec, format_mem, GpuSnapshot, SystemSampler, SystemSnapshot};
 
@@ -234,6 +300,7 @@ type SftpLastCwd = Arc<Mutex<HashMap<String, String>>>;
 #[derive(Clone, Default)]
 struct TabStatus {
     host: String,       // "root@192.168.100.2"
+    user: String,       // effective SSH login user, for process ownership checks
     session_id: String, // saved-session id, used to reconnect in place (#79)
     state: u8,          // 0 = connecting, 1 = connected, 2 = disconnected
     cpu: f32,           // 0.0..1.0
@@ -258,6 +325,10 @@ struct TabStatus {
 type TabStatuses = Arc<Mutex<HashMap<String, TabStatus>>>;
 /// Last local-machine sample (shown on the welcome tab).
 type LocalSnap = Arc<Mutex<SystemSnapshot>>;
+
+fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
+    !exit_confirmed && has_live_sessions
+}
 
 // Slint generates types into this scope.
 slint::include_modules!();
@@ -477,8 +548,24 @@ fn clamp_window_size_to_monitor(
     use i_slint_backend_winit::winit::dpi::{LogicalPosition, LogicalSize};
 
     window.with_winit_window(|ww| {
+        #[cfg(target_os = "linux")]
+        {
+            use i_slint_backend_winit::winit::platform::wayland::WindowExtWayland;
+
+            // Wayland compositors own the final surface size. A
+            // request_inner_size call is only advisory and KWin may configure a
+            // different size, leaving Slint's rendered and input geometries out
+            // of sync (#286). Let the compositor choose the startup size.
+            if ww.xdg_toplevel().is_some() {
+                return None;
+            }
+        }
+
         let scale = ww.scale_factor().max(0.01);
-        let monitor = ww.current_monitor()?;
+        // Before `Window::run()` makes the native window visible, winit often
+        // has no current monitor yet. Falling back to the primary monitor lets
+        // the persisted size actually apply during startup (#278).
+        let monitor = ww.current_monitor().or_else(|| ww.primary_monitor())?;
         let monitor_size = monitor.size();
         let monitor_pos = monitor.position();
         let max_w = (monitor_size.width as f64 / scale - 16.0).max(1.0) as f32;
@@ -512,6 +599,103 @@ fn clamp_window_size_to_monitor(
 
         Some((target_w, target_h))
     })?
+}
+
+#[cfg(target_os = "linux")]
+fn is_wayland_window(window: &slint::Window) -> bool {
+    use i_slint_backend_winit::winit::platform::wayland::WindowExtWayland;
+
+    window
+        .with_winit_window(|ww| ww.xdg_toplevel().is_some())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_wayland_window(_window: &slint::Window) -> bool {
+    false
+}
+
+/// Detect the Windows mixed-DPI failure where the native maximized flag stays
+/// set but the HWND keeps a much smaller geometry from the previous monitor.
+/// Normal maximized work areas may be a little smaller because of the taskbar;
+/// only a large mismatch is considered stale.
+fn maximized_geometry_needs_repair(
+    window_width: u32,
+    window_height: u32,
+    monitor_width: u32,
+    monitor_height: u32,
+) -> bool {
+    window_width.saturating_mul(4) < monitor_width.saturating_mul(3)
+        || window_height.saturating_mul(4) < monitor_height.saturating_mul(3)
+}
+
+/// Ask the renderer to repaint after the window becomes visible again and, on
+/// Windows, repair a stale maximized rectangle caused by crossing monitors with
+/// different DPI scales (#272). The second redraw runs after the window manager
+/// has applied the restore/maximize transition.
+fn refresh_revealed_main_window(weak: slint::Weak<AppWindow>) {
+    let Some(win) = weak.upgrade() else { return };
+    let repair = win
+        .window()
+        .with_winit_window(|ww| {
+            ww.request_redraw();
+            if !cfg!(windows) || !ww.is_maximized() {
+                return false;
+            }
+            let Some(monitor) = ww.current_monitor() else {
+                return false;
+            };
+            let outer = ww.outer_size();
+            let screen = monitor.size();
+            let stale = maximized_geometry_needs_repair(
+                outer.width,
+                outer.height,
+                screen.width,
+                screen.height,
+            );
+            if stale {
+                tracing::warn!(
+                    "repairing stale maximized geometry: window={}x{} monitor={}x{} scale={}",
+                    outer.width,
+                    outer.height,
+                    screen.width,
+                    screen.height,
+                    ww.scale_factor(),
+                );
+                ww.set_maximized(false);
+            }
+            stale
+        })
+        .unwrap_or(false);
+
+    let weak2 = weak.clone();
+    slint::Timer::single_shot(std::time::Duration::from_millis(60), move || {
+        if let Some(win) = weak2.upgrade() {
+            win.window().with_winit_window(|ww| {
+                if repair {
+                    ww.set_maximized(true);
+                }
+                ww.request_redraw();
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+mod mixed_dpi_window_tests {
+    use super::maximized_geometry_needs_repair;
+
+    #[test]
+    fn repairs_large_maximized_geometry_mismatch() {
+        assert!(maximized_geometry_needs_repair(604, 1384, 1080, 1501));
+        assert!(maximized_geometry_needs_repair(1920, 1000, 3840, 2160));
+    }
+
+    #[test]
+    fn accepts_taskbar_sized_maximized_work_area() {
+        assert!(!maximized_geometry_needs_repair(1920, 1040, 1920, 1080));
+        assert!(!maximized_geometry_needs_repair(2560, 1400, 2560, 1440));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -632,6 +816,11 @@ pub fn run() -> Result<()> {
     // Windows the icon comes from the embedded .ico, so this is a no-op there.)
     let _ = slint::set_xdg_app_id("meatshell");
     let window = AppWindow::new().context("failed to build Slint window")?;
+    // Slint applies preferred-width/height while the native window is being
+    // created. Do not treat those startup Resized events as user adjustments;
+    // otherwise they overwrite the persisted size before restoration (#278).
+    let window_size_tracking_ready = Rc::new(Cell::new(false));
+    let pending_window_size_restore = Rc::new(Cell::new(None::<(f32, f32)>));
 
     // Show the crate version (from Cargo.toml at compile time) in the sidebar,
     // so the footer never drifts out of sync with the actual build.
@@ -703,6 +892,12 @@ pub fn run() -> Result<()> {
         });
     }
     {
+        proc_win.on_copy_pid(move |pid: SharedString| {
+            let text = pid.to_string();
+            std::thread::spawn(move || clipboard_set_text(text));
+        });
+    }
+    {
         // Frameless titlebar drag, via winit on the process window's own handle.
         let weak = proc_win.as_weak();
         proc_win.on_win_drag(move || {
@@ -738,6 +933,7 @@ pub fn run() -> Result<()> {
             pw.set_host(main.get_connection_state());
             sync_proc_theme(&main, &pw);
             let _ = pw.show();
+            place_process_window(&main, &pw);
             pw.window().with_winit_window(|ww| ww.focus_window());
         });
     }
@@ -779,6 +975,11 @@ pub fn run() -> Result<()> {
             let (Some(main), Some(sw)) = (win_weak.upgrade(), sys_weak.upgrade()) else {
                 return;
             };
+            // Detailed system information is remote-only. Keep this guard even
+            // though the sidebar hides/disables its affordance when unavailable.
+            if !main.get_system_info_available() {
+                return;
+            }
             sw.set_host(main.get_conn_host());
             sw.set_connection_state(main.get_connection_state());
             sw.set_resource_title(main.get_resource_title());
@@ -817,6 +1018,14 @@ pub fn run() -> Result<()> {
         }
         window.set_term_font_size(s.font_size() as f32);
         window.set_term_font_bold(s.terminal_bold());
+        window.set_term_cursor_style(s.terminal_cursor_style().into());
+        if let Some(color) = parse_hex_color(s.terminal_cursor_color()) {
+            window.set_term_cursor_color_hex(s.terminal_cursor_color().into());
+            window.set_term_cursor_color(color);
+        }
+        window.set_output_highlight_enabled(s.output_highlight_enabled());
+        window.set_output_highlight_preset(s.output_highlight_preset().into());
+        window.set_output_highlight_rules(output_highlight_rule_model(&s));
         window.set_ui_scale(s.ui_scale() as f32 / 100.0); // global UI zoom (#100)
         window.set_panel_font(s.panel_font() as f32 / 100.0); // settings-panel font scale
     }
@@ -890,15 +1099,27 @@ pub fn run() -> Result<()> {
         let collapse_sftp = s.collapse_sftp_default();
         let sidebar_dock = s.sidebar_dock();
         let welcome_as_sidebar = s.welcome_as_sidebar();
+        let quick_commands_as_sidebar = s.quick_commands_as_sidebar();
+        let quick_panel_open = quick_commands_as_sidebar && s.quick_panel_open();
+        let quick_panel_collapsed = s.quick_panel_collapsed();
+        let quick_panel_dock = s.quick_panel_dock();
         let welcome_sidebar_dock = s.welcome_sidebar_dock();
         let mut sidebar_collapsed = s.sidebar_collapsed().unwrap_or(collapse_sidebar);
-        let welcome_collapsed = s.welcome_collapsed().unwrap_or(false);
+        let mut welcome_collapsed = s.welcome_collapsed().unwrap_or(false);
         if welcome_as_sidebar
             && sidebar_dock == welcome_sidebar_dock
             && !sidebar_collapsed
             && !welcome_collapsed
         {
             sidebar_collapsed = true;
+        }
+        if quick_panel_open && !quick_panel_collapsed {
+            if sidebar_dock == quick_panel_dock {
+                sidebar_collapsed = true;
+            }
+            if welcome_as_sidebar && welcome_sidebar_dock == quick_panel_dock {
+                welcome_collapsed = true;
+            }
         }
         window.set_collapse_sidebar_default(collapse_sidebar);
         window.set_collapse_sftp_default(collapse_sftp);
@@ -909,6 +1130,12 @@ pub fn run() -> Result<()> {
         window.set_sftp_panel_width(s.sftp_panel_width());
         window.set_sftp_panel_height(s.sftp_panel_height());
         window.set_sftp_dock(s.sftp_dock().into());
+        window.set_quick_commands_as_sidebar(quick_commands_as_sidebar);
+        window.set_quick_panel_open(quick_panel_open);
+        window.set_quick_panel_collapsed(quick_panel_collapsed);
+        window.set_quick_panel_width(s.quick_panel_width());
+        window.set_quick_panel_height(s.quick_panel_height());
+        window.set_quick_panel_dock(quick_panel_dock.into());
         window.set_welcome_as_sidebar(welcome_as_sidebar);
         window.set_welcome_sidebar_width(s.welcome_sidebar_width());
         window.set_welcome_sidebar_dock(welcome_sidebar_dock.into());
@@ -920,19 +1147,26 @@ pub fn run() -> Result<()> {
             window.set_sftp_collapsed(true);
             window.set_sftp_saved_height(s.sftp_panel_height());
         }
-        // Restore the user's preferred window size, if any (#dock).
+        // Capture the user's preferred size. The first native Resized event
+        // drives restoration below; this is deterministic and avoids guessing
+        // how long Slint/window-manager initialization takes (#278).
         let (ww, wh) = s.window_size();
-        if ww > 0.0 && wh > 0.0 {
-            let _ = clamp_window_size_to_monitor(window.window(), Some((ww, wh)));
-        } else {
-            let _ = clamp_window_size_to_monitor(window.window(), None);
-        }
+        let preferred = (ww > 0.0 && wh > 0.0).then_some((ww, wh));
+        pending_window_size_restore.set(preferred);
     }
     {
         let store = store.clone();
         window.on_set_collapse_sidebar_default(move |v| {
             let mut s = store.borrow_mut();
             s.set_collapse_sidebar_default(v);
+            let _ = s.save();
+        });
+    }
+    {
+        let store = store.clone();
+        window.on_set_quick_commands_as_sidebar(move |v| {
+            let mut s = store.borrow_mut();
+            s.set_quick_commands_as_sidebar(v);
             let _ = s.save();
         });
     }
@@ -1094,6 +1328,97 @@ pub fn run() -> Result<()> {
             w.set_webdav_status(msg.into());
         });
     }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_cursor_color(move |value: SharedString| {
+            let Some(color) = parse_hex_color(value.as_str()) else {
+                return false;
+            };
+            {
+                let mut s = store.borrow_mut();
+                if !s.set_terminal_cursor_color(value.as_str()) {
+                    return false;
+                }
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_color(color);
+            }
+            true
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs = bufs.clone();
+        window.on_add_output_highlight_rule(
+            move |pattern: SharedString,
+                  is_regex,
+                  case_sensitive,
+                  whole_line,
+                  color: SharedString| {
+                let pattern = pattern.trim().to_string();
+                let validation = validate_output_highlight_rule(&pattern, is_regex, case_sensitive);
+                let Some(w) = weak.upgrade() else {
+                    return false;
+                };
+                if let Err(message) = validation {
+                    w.set_output_highlight_rule_status(message.into());
+                    return false;
+                }
+                if store.borrow().output_highlight_rules().len() >= 128 {
+                    w.set_output_highlight_rule_status(
+                        t("自定义规则最多 128 条", "Custom rules are limited to 128").into(),
+                    );
+                    return false;
+                }
+                {
+                    let mut s = store.borrow_mut();
+                    s.add_output_highlight_rule(OutputHighlightRule {
+                        pattern,
+                        regex: is_regex,
+                        case_sensitive,
+                        whole_line,
+                        color: color.to_string(),
+                        enabled: true,
+                    });
+                    let _ = s.save();
+                    w.set_output_highlight_rules(output_highlight_rule_model(&s));
+                    apply_custom_output_rules(&w, &bufs, s.output_highlight_rules());
+                }
+                w.set_output_highlight_rule_status("".into());
+                true
+            },
+        );
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs = bufs.clone();
+        window.on_remove_output_highlight_rule(move |index| {
+            let Some(w) = weak.upgrade() else { return };
+            let mut s = store.borrow_mut();
+            s.remove_output_highlight_rule(index.max(0) as usize);
+            let _ = s.save();
+            w.set_output_highlight_rules(output_highlight_rule_model(&s));
+            apply_custom_output_rules(&w, &bufs, s.output_highlight_rules());
+            w.set_output_highlight_rule_status("".into());
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs = bufs.clone();
+        window.on_set_output_highlight_rule_enabled(move |index, enabled| {
+            let Some(w) = weak.upgrade() else { return };
+            let mut s = store.borrow_mut();
+            s.set_output_highlight_rule_enabled(index.max(0) as usize, enabled);
+            let _ = s.save();
+            w.set_output_highlight_rules(output_highlight_rule_model(&s));
+            apply_custom_output_rules(&w, &bufs, s.output_highlight_rules());
+        });
+    }
     // Interface settings: apply + persist the terminal font family / size.
     {
         let weak = window.as_weak();
@@ -1106,6 +1431,25 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_family(family);
+            }
+        });
+    }
+    // Output highlighting: persist the switch/preset and immediately rebuild
+    // every open terminal, including scrollback captured before the change.
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        let bufs = bufs.clone();
+        window.on_set_output_highlight(move |enabled, preset: SharedString| {
+            let preset = preset.to_string();
+            {
+                let mut s = store.borrow_mut();
+                s.set_output_highlight_enabled(enabled);
+                s.set_output_highlight_preset(preset.clone());
+                let _ = s.save();
+            }
+            if let Some(w) = weak.upgrade() {
+                apply_output_highlight(&w, &bufs, enabled, &preset);
             }
         });
     }
@@ -1134,6 +1478,22 @@ pub fn run() -> Result<()> {
             }
             if let Some(w) = weak.upgrade() {
                 w.set_term_font_bold(bold);
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let store = store.clone();
+        window.on_set_term_cursor_style(move |style: SharedString| {
+            let normalized = {
+                let mut s = store.borrow_mut();
+                s.set_terminal_cursor_style(style.to_string());
+                let normalized = s.terminal_cursor_style().to_string();
+                let _ = s.save();
+                normalized
+            };
+            if let Some(w) = weak.upgrade() {
+                w.set_term_cursor_style(normalized.into());
             }
         });
     }
@@ -1413,6 +1773,69 @@ pub fn run() -> Result<()> {
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
     let image_entries: ImageEntries = Arc::new(Mutex::new(HashMap::new()));
+
+    {
+        let proc_weak = proc_win.as_weak();
+        let handles = handles.clone();
+        let statuses = tab_statuses.clone();
+        let runtime = runtime.clone();
+        proc_win.on_terminate_process(move |tab_id: SharedString, pid: SharedString, password: SharedString| {
+            let tab_id = tab_id.to_string();
+            let Ok(pid) = pid.parse::<u32>() else {
+                set_process_action_error(&proc_weak, t("无效的 PID", "Invalid PID"));
+                return;
+            };
+
+            // Re-check the source tab, PID, and owner against the latest sample;
+            // the main window may have switched tabs since the menu was opened.
+            let ownership = {
+                let states = statuses.lock().unwrap();
+                states.get(&tab_id).map_or_else(
+                    || Err(t("当前会话不可用", "The current session is unavailable")),
+                    |status| status.procs.iter().find(|p| p.pid == pid)
+                        .map(|process| process_needs_root(&status.user, &process.user))
+                        .ok_or_else(|| t("进程已退出", "The process has already exited")),
+                )
+            };
+            let needs_root = match ownership {
+                Ok(value) => value,
+                Err(message) => {
+                    set_process_action_error(&proc_weak, message);
+                    return;
+                }
+            };
+            if needs_root && password.is_empty() {
+                set_process_action_error(
+                    &proc_weak,
+                    t("请输入管理员（sudo）密码", "Enter the administrator (sudo) password"),
+                );
+                return;
+            }
+
+            let root_password = needs_root.then(|| crate::config::Secret::new(password.to_string()));
+            let response = handles.borrow().get(&tab_id)
+                .map(|handle| handle.kill_process(pid, root_password));
+            let Some(response) = response else {
+                set_process_action_error(&proc_weak, t("SSH 会话不可用", "The SSH session is unavailable"));
+                return;
+            };
+
+            let done_weak = proc_weak.clone();
+            runtime.spawn(async move {
+                let result = response.await.unwrap_or_else(|_| crate::ssh::ProcessKillResult {
+                    success: false,
+                    message: t("SSH 会话已关闭", "The SSH session has closed").to_string(),
+                });
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(pw) = done_weak.upgrade() {
+                        pw.set_action_busy(false);
+                        pw.set_action_error(!result.success);
+                        pw.set_action_status(result.message.into());
+                    }
+                });
+            });
+        });
+    }
 
     // --- Wire callbacks --------------------------------------------------
     wire_session_callbacks(
@@ -1827,6 +2250,11 @@ pub fn run() -> Result<()> {
         Hidden,     // minimized / occluded → paused
     }
     let activity = Rc::new(std::cell::Cell::new(WinActivity::Active));
+    // Once the user confirms shutdown, every subsequent native/custom close
+    // request must pass through without reopening the modal. Windows Installer
+    // and Restart Manager may issue more than one close request while replacing
+    // the executable (#267).
+    let exit_confirmed = Rc::new(Cell::new(false));
 
     // --- System sampler (1 Hz) ------------------------------------------
     let sampler = Rc::new(Mutex::new(SystemSampler::new()));
@@ -1888,6 +2316,9 @@ pub fn run() -> Result<()> {
         let close_handles = handles.clone();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
+        let ev_exit_confirmed = exit_confirmed.clone();
+        let ev_window_size_tracking_ready = window_size_tracking_ready.clone();
+        let ev_pending_window_size_restore = pending_window_size_restore.clone();
         let mut last_cursor_logical: Option<(f32, f32)> = None;
         let mut macos_wheel_accum = 0.0_f32;
         // Track the inputs that make up WinActivity; recompute on each change.
@@ -1897,7 +2328,7 @@ pub fn run() -> Result<()> {
         // Apply the Win11 rounded-corner hint once, on the first event (the HWND
         // reliably exists by then, unlike a pre-run timer) (#166).
         let mut chrome_done = false;
-        window.window().on_winit_window_event(move |_w, event| {
+        window.window().on_winit_window_event(move |slint_window, event| {
             if !chrome_done {
                 chrome_done = true;
                 if let Some(win) = weak.upgrade() {
@@ -1933,6 +2364,17 @@ pub fn run() -> Result<()> {
                 }
             };
             match event {
+                #[cfg(target_os = "windows")]
+                WEvent::Ime(i_slint_backend_winit::winit::event::Ime::Disabled) => {
+                    // Windows emits Ime::Disabled when a composition ends, including
+                    // while switching between Chinese and English input methods. The
+                    // Slint winit backend intentionally ignores this notification, so
+                    // after several switches the native input context can remain
+                    // detached and every TextInput appears to stop accepting keys
+                    // (#236). Re-associate the window with its current default IME;
+                    // the focused Slint TextInput keeps owning text input as before.
+                    slint_window.with_winit_window(|window| window.set_ime_allowed(true));
+                }
                 WEvent::DroppedFile(path) => {
                     if let Some(win) = weak.upgrade() {
                         handle_file_drop(&win, &sh, path.clone());
@@ -1976,10 +2418,57 @@ pub fn run() -> Result<()> {
                 WEvent::Focused(f) => {
                     focused = *f;
                     apply_activity(focused, minimized, occluded);
+                    if *f {
+                        #[cfg(target_os = "windows")]
+                        slint_window.with_winit_window(|window| window.set_ime_allowed(true));
+
+                        // Some window managers deliver the first Resized event
+                        // before the native window belongs to a monitor. Focus
+                        // is a reliable second opportunity to seed restoration;
+                        // request_inner_size will produce the Resized event that
+                        // verifies the native window actually reached the target.
+                        if !ev_window_size_tracking_ready.get() {
+                            if let Some(win) = weak.upgrade() {
+                                if is_wayland_window(&win.window()) {
+                                    ev_pending_window_size_restore.set(None);
+                                    ev_window_size_tracking_ready.set(true);
+                                    tracing::info!(
+                                        "[WINDOW_SIZE] skipped persisted-size restore on Wayland"
+                                    );
+                                } else if let Some(preferred) =
+                                    ev_pending_window_size_restore.get()
+                                {
+                                    if let Some(target) = clamp_window_size_to_monitor(
+                                        &win.window(),
+                                        Some(preferred),
+                                    ) {
+                                        tracing::info!(
+                                            "[WINDOW_SIZE] focus retry saved={:.0}x{:.0} \
+                                             target={:.0}x{:.0}",
+                                            preferred.0,
+                                            preferred.1,
+                                            target.0,
+                                            target.1,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        refresh_revealed_main_window(weak.clone());
+                    }
                 }
                 WEvent::Occluded(o) => {
                     occluded = *o;
                     apply_activity(focused, minimized, occluded);
+                    if !*o {
+                        refresh_revealed_main_window(weak.clone());
+                    }
+                }
+                WEvent::ScaleFactorChanged { .. } => {
+                    // Moving a maximized frameless window between mixed-DPI
+                    // monitors can leave Win11 reporting "maximized" while the
+                    // native rectangle/render surface still has the old size.
+                    refresh_revealed_main_window(weak.clone());
                 }
                 WEvent::Resized(size) => {
                     // A 0-sized resize is how Windows reports a minimize; track it
@@ -1994,19 +2483,102 @@ pub fn run() -> Result<()> {
                             .with_winit_window(|ww| ww.is_maximized())
                             .unwrap_or(false);
                         win.set_window_maximized(maxed);
+                        if !ev_window_size_tracking_ready.get()
+                            && is_wayland_window(&win.window())
+                        {
+                            // The configure size in this event is authoritative
+                            // on Wayland. Accept and persist that actual size;
+                            // never chase the advisory saved size (#286).
+                            ev_pending_window_size_restore.set(None);
+                            ev_window_size_tracking_ready.set(true);
+                            tracing::info!(
+                                "[WINDOW_SIZE] accepted compositor size {}x{} on Wayland",
+                                size.width,
+                                size.height
+                            );
+                        }
+                        if !ev_window_size_tracking_ready.get() {
+                            if let Some(preferred) = ev_pending_window_size_restore.get() {
+                                let scale = win.window().scale_factor().max(0.01);
+                                let actual =
+                                    (size.width as f32 / scale, size.height as f32 / scale);
+                                if let Some(target) =
+                                    clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                {
+                                    tracing::info!(
+                                        "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
+                                         target={:.0}x{:.0} actual={:.0}x{:.0} scale={:.2}",
+                                        preferred.0,
+                                        preferred.1,
+                                        target.0,
+                                        target.1,
+                                        actual.0,
+                                        actual.1,
+                                        scale,
+                                    );
+                                    if (actual.0 - target.0).abs() <= 2.0
+                                        && (actual.1 - target.1).abs() <= 2.0
+                                    {
+                                        ev_pending_window_size_restore.set(None);
+                                        ev_window_size_tracking_ready.set(true);
+                                        tracing::info!(
+                                            "[WINDOW_SIZE] restore settled at {:.0}x{:.0}",
+                                            actual.0,
+                                            actual.1
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "[WINDOW_SIZE] restore deferred: no monitor available \
+                                         saved={:.0}x{:.0}",
+                                        preferred.0,
+                                        preferred.1,
+                                    );
+                                }
+                            } else {
+                                // First run: accept the initialized size as the
+                                // baseline, but do not persist this startup event.
+                                ev_window_size_tracking_ready.set(true);
+                            }
+                            return EventResult::Propagate;
+                        }
+                        // Record the last user-adjusted windowed size while the
+                        // resize event still carries authoritative native
+                        // geometry. Persisting only during CloseRequested can
+                        // observe an installer/minimize transition instead
+                        // (#278). Keep writes in memory here; save_layout flushes
+                        // the config on exit.
+                        if ev_window_size_tracking_ready.get() && !maxed && !minimized {
+                            let scale = win.window().scale_factor().max(0.01);
+                            let width = size.width as f32 / scale;
+                            let height = size.height as f32 / scale;
+                            if width > 200.0 && height > 200.0 {
+                                ev_store.borrow_mut().set_window_size(width, height);
+                                tracing::debug!(
+                                    "[WINDOW_SIZE] recorded user size {:.0}x{:.0}",
+                                    width,
+                                    height
+                                );
+                            }
+                        }
                     }
                 }
                 WEvent::CloseRequested => {
                     // Confirm before closing if there are open session tabs (#88),
                     // so a stray double-click on the title-bar icon / X / Alt+F4
-                    // doesn't silently drop live sessions. The confirm dialog's
-                    // "Close" calls quit_event_loop to actually exit.
-                    if !close_handles.borrow().is_empty() {
+                    // doesn't silently drop live sessions. Installer/Restart
+                    // Manager may send repeated requests, so never intercept
+                    // again after the user has confirmed shutdown (#267).
+                    if should_block_close(
+                        ev_exit_confirmed.get(),
+                        !close_handles.borrow().is_empty(),
+                    ) {
                         if let Some(win) = weak.upgrade() {
                             win.set_confirm_close_open(true);
                         }
                         return EventResult::PreventDefault;
                     }
+                    ev_exit_confirmed.set(true);
                     // No sessions → the window is about to close; persist layout.
                     if let Some(win) = weak.upgrade() {
                         save_layout(&win, &ev_store);
@@ -2020,10 +2592,44 @@ pub fn run() -> Result<()> {
     // Confirm-close dialog "Close" → actually quit the event loop (#88).
     {
         let weak = window.as_weak();
+        let proc_weak = proc_win.as_weak();
+        let sys_weak = sys_win.as_weak();
         let cc_store = store.clone();
+        let close_handles = handles.clone();
+        let close_sftp_handles = sftp_handles.clone();
+        let close_exit_confirmed = exit_confirmed.clone();
         window.on_confirm_close_yes(move || {
+            // Guard against a double click and against another close request
+            // arriving from Windows Installer while shutdown is in progress.
+            if close_exit_confirmed.replace(true) {
+                return;
+            }
             if let Some(w) = weak.upgrade() {
+                w.set_confirm_close_open(false);
                 save_layout(&w, &cc_store);
+                let _ = w.hide();
+            }
+            if let Some(w) = proc_weak.upgrade() {
+                let _ = w.hide();
+            }
+            if let Some(w) = sys_weak.upgrade() {
+                let _ = w.hide();
+            }
+            // Ask every worker to stop before the runtime/event loop is torn
+            // down. Clearing the maps also makes any repeated close request see
+            // no live sessions and pass through immediately.
+            {
+                let mut sessions = close_handles.borrow_mut();
+                for handle in sessions.values() {
+                    handle.close();
+                }
+                sessions.clear();
+            }
+            if let Ok(mut sftp) = close_sftp_handles.lock() {
+                for handle in sftp.values() {
+                    handle.close();
+                }
+                sftp.clear();
             }
             let _ = slint::quit_event_loop();
         });
@@ -2057,10 +2663,15 @@ pub fn run() -> Result<()> {
         let weak = window.as_weak();
         let close_handles = handles.clone();
         let wc_store = store.clone();
+        let wc_exit_confirmed = exit_confirmed.clone();
         window.on_win_close(move || {
             if let Some(w) = weak.upgrade() {
                 // Mirror the native-X behaviour: confirm if sessions are open.
-                if close_handles.borrow().is_empty() {
+                if !should_block_close(
+                    wc_exit_confirmed.get(),
+                    !close_handles.borrow().is_empty(),
+                ) {
+                    wc_exit_confirmed.set(true);
                     save_layout(&w, &wc_store);
                     let _ = slint::quit_event_loop();
                 } else {
@@ -2342,6 +2953,32 @@ fn app_content_area(win: &AppWindow) -> LogicalRect {
         &side_dock,
         side_take,
     );
+    if win.get_quick_panel_open() {
+        let quick_dock = win.get_quick_panel_dock().to_string();
+        let quick_merged = win.get_quick_panel_collapsed()
+            && ((win.get_welcome_as_sidebar()
+                && win.get_welcome_collapsed()
+                && win.get_welcome_sidebar_dock().as_str() == quick_dock.as_str())
+                || (win.get_sidebar_collapsed() && side_dock.as_str() == quick_dock.as_str()));
+        if quick_merged {
+            return area;
+        }
+        let quick_take = if win.get_quick_panel_collapsed() {
+            36.0
+        } else if quick_dock == "left" || quick_dock == "right" {
+            win.get_quick_panel_width() + 4.0
+        } else {
+            win.get_quick_panel_height() + 4.0
+        };
+        shrink_edge(
+            &mut area.x,
+            &mut area.y,
+            &mut area.w,
+            &mut area.h,
+            &quick_dock,
+            quick_take,
+        );
+    }
     area
 }
 
@@ -2782,7 +3419,81 @@ fn wsl_available() -> bool {
 // Session callbacks (welcome page + dialog)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+/// Build the effective session represented by the dialog. When editing, blank
+/// secret fields retain their saved values because real passwords and pasted
+/// private keys are deliberately never echoed back into the UI (#10, #276).
+fn session_from_draft(
+    draft: &SessionDraft,
+    existing: Option<&Session>,
+    forwards: Vec<crate::config::PortForward>,
+) -> Session {
+    let password = if draft.password.is_empty() {
+        existing.map(|s| s.password.clone()).unwrap_or_default()
+    } else {
+        Secret::new(draft.password.to_string())
+    };
+    let private_key_inline = if draft.private_key_inline_mode {
+        if draft.private_key_inline.is_empty() {
+            existing
+                .map(|s| s.private_key_inline.clone())
+                .unwrap_or_default()
+        } else {
+            Secret::new(draft.private_key_inline.to_string())
+        }
+    } else {
+        Secret::default()
+    };
+    let private_key_path = if draft.private_key_inline_mode {
+        String::new()
+    } else {
+        draft.private_key_path.to_string().replace('\\', "/")
+    };
+    let kind = SessionKind::from_str(&draft.kind.to_string());
+    let auto_name = match kind {
+        SessionKind::Serial => format!("{} @{}", draft.serial_port, draft.baud_rate),
+        _ if draft.user.trim().is_empty() => draft.host.to_string(),
+        _ => format!("{}@{}", draft.user, draft.host),
+    };
+    let default_port = if kind == SessionKind::Telnet { 23 } else { 22 };
+
+    Session {
+        id: draft.id.to_string(),
+        name: if draft.name.is_empty() {
+            auto_name
+        } else {
+            draft.name.to_string()
+        },
+        host: draft.host.to_string(),
+        port: if draft.port <= 0 {
+            default_port
+        } else {
+            draft.port as u16
+        },
+        user: draft.user.to_string(),
+        auth: AuthMethod::from_str(&draft.auth.to_string()),
+        password,
+        private_key_path,
+        private_key_inline,
+        proxy: draft.proxy.to_string(),
+        last_used: None,
+        group: draft.group.to_string(),
+        kind,
+        serial_port: draft.serial_port.to_string(),
+        baud_rate: if draft.baud_rate <= 0 {
+            115_200
+        } else {
+            draft.baud_rate as u32
+        },
+        data_bits: draft.data_bits as u8,
+        stop_bits: draft.stop_bits as u8,
+        parity: draft.parity.to_string(),
+        flow_control: draft.flow_control.to_string(),
+        forwards,
+        disable_shell_integration: draft.disable_shell_integration,
+        notes: draft.note.to_string(),
+        jump_session_id: draft.jump_session_id.to_string(),
+    }
+}
 fn wire_session_callbacks(
     window: &AppWindow,
     store: Rc<RefCell<ConfigStore>>,
@@ -2809,8 +3520,8 @@ fn wire_session_callbacks(
     // Working set of port forwards (#56) for the session being created/edited.
     // The forward add/delete callbacks mutate it; saving reads it into
     // Session.forwards; opening the dialog (new/edit) resets it.
-    let edit_forwards: Rc<RefCell<Vec<crate::config::PortForward>>> =
-        Rc::new(RefCell::new(Vec::new()));
+    let edit_forwards: Rc<RefCell<Vec<PortFwd>>> =
+        Rc::new(RefCell::new(vec![blank_forward_draft()]));
 
     // New session -> open dialog with blank draft.
     let weak = window.as_weak();
@@ -2818,9 +3529,9 @@ fn wire_session_callbacks(
     let store_ng = store.clone();
     window.on_new_session_clicked(move || {
         if let Some(w) = weak.upgrade() {
-            ef_new.borrow_mut().clear();
+            *ef_new.borrow_mut() = vec![blank_forward_draft()];
             w.set_session_groups(session_groups_model(&store_ng.borrow()));
-            w.set_dialog_forwards(forward_model(&[]));
+            w.set_dialog_forwards(forward_model(&ef_new.borrow()));
             let empty = Session::new_empty();
             let (jump_labels, jump_ids, jump_idx) =
                 jump_candidates(&store_ng.borrow(), &empty.id, "");
@@ -3028,10 +3739,13 @@ fn wire_session_callbacks(
             let Some(session) = store.get(&id) else {
                 return;
             };
-            *ef_edit.borrow_mut() = session.forwards.clone();
+            *ef_edit.borrow_mut() = forward_drafts(&session.forwards);
+            if ef_edit.borrow().is_empty() {
+                ef_edit.borrow_mut().push(blank_forward_draft());
+            }
             if let Some(w) = weak.upgrade() {
                 w.set_session_groups(session_groups_model(&store));
-                w.set_dialog_forwards(forward_model(&session.forwards));
+                w.set_dialog_forwards(forward_model(&ef_edit.borrow()));
                 w.set_dialog_id(session.id.clone().into());
                 w.set_dialog_name(session.name.clone().into());
                 w.set_dialog_host(session.host.clone().into());
@@ -3230,6 +3944,15 @@ fn wire_session_callbacks(
         let edit_forwards = edit_forwards.clone();
         window.on_session_dialog_submit(move |draft: SessionDraft| {
             let id = draft.id.to_string();
+            let forwards = match validated_port_forwards(&edit_forwards.borrow()) {
+                Ok(forwards) => forwards,
+                Err(message) => {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_dialog_test_status(message.into());
+                    }
+                    return;
+                }
+            };
             // The edit dialog never echoes the real password (issue #10): a blank
             // field while editing means "keep the existing password" rather than
             // "clear it".  Only overwrite when the user actually typed something.
@@ -3309,7 +4032,7 @@ fn wire_session_callbacks(
                 stop_bits: draft.stop_bits as u8,
                 parity: draft.parity.to_string(),
                 flow_control: draft.flow_control.to_string(),
-                forwards: edit_forwards.borrow().clone(),
+                forwards,
                 disable_shell_integration: draft.disable_shell_integration,
                 notes: draft.notes.to_string(),
                 jump_session_id: draft.jump_session_id.to_string(),
@@ -3328,12 +4051,14 @@ fn wire_session_callbacks(
         });
     }
 
-    // Test connection from the session dialog. This is intentionally lightweight:
-    // it checks network reachability for the current host/port without saving the
-    // draft or opening a terminal tab.
+    // Test connection from the session dialog. SSH tests use the same handshake,
+    // host-key verification, proxy/jump routing, and authentication as a real
+    // terminal connection (#276). Telnet and serial retain reachability tests.
     {
         let weak = window.as_weak();
         let runtime = runtime.clone();
+        let store = store.clone();
+        let edit_forwards = edit_forwards.clone();
         window.on_session_dialog_test(move |draft: SessionDraft| {
             let kind = draft.kind.to_string();
             if kind == "serial" {
@@ -3364,14 +4089,108 @@ fn wire_session_callbacks(
                 });
                 return;
             }
-            let host = draft.host.to_string();
-            let default_port = if kind == "telnet" { 23 } else { 22 };
-            let port = if draft.port <= 0 {
-                default_port
-            } else {
-                draft.port as u16
+
+            let existing = store.borrow().get(draft.id.as_str()).cloned();
+            let forwards = match validated_port_forwards(&edit_forwards.borrow()) {
+                Ok(forwards) => forwards,
+                Err(message) => {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_dialog_test_status(message.into());
+                    }
+                    return;
+                }
             };
+            let session = session_from_draft(&draft, existing.as_ref(), forwards);
             let weak_done = weak.clone();
+
+            if kind == "ssh" {
+                let jump = resolve_jump(&store, &session);
+                let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+                runtime.spawn(async move {
+                    let mut test = Box::pin(test_session_auth(session, jump, events_tx));
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut test => break result,
+                            event = events_rx.recv() => {
+                                let Some(event) = event else { continue };
+                                if matches!(
+                                    event,
+                                    SessionEvent::HostKeyPrompt { .. }
+                                        | SessionEvent::CredentialPrompt { .. }
+                                        | SessionEvent::MfaPrompt { .. }
+                                ) {
+                                    let weak_prompt = weak_done.clone();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        let Some(w) = weak_prompt.upgrade() else { return };
+                                        match event {
+                                            SessionEvent::HostKeyPrompt {
+                                                host,
+                                                port,
+                                                key_type,
+                                                fingerprint,
+                                                changed,
+                                                responder,
+                                            } => enqueue_hostkey_prompt(
+                                                &w,
+                                                host,
+                                                port,
+                                                key_type,
+                                                fingerprint,
+                                                changed,
+                                                responder,
+                                            ),
+                                            SessionEvent::CredentialPrompt {
+                                                session_id,
+                                                host,
+                                                user,
+                                                need_user,
+                                                need_password,
+                                                responder,
+                                            } => enqueue_cred_prompt(
+                                                &w,
+                                                session_id,
+                                                host,
+                                                user,
+                                                need_user,
+                                                need_password,
+                                                responder,
+                                            ),
+                                            SessionEvent::MfaPrompt {
+                                                session_id,
+                                                host,
+                                                prompt,
+                                                echo,
+                                                responder,
+                                            } => enqueue_mfa_prompt(
+                                                &w,
+                                                session_id,
+                                                host,
+                                                prompt,
+                                                echo,
+                                                responder,
+                                            ),
+                                            _ => {}
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    };
+                    let message = match result {
+                        Ok(()) => t("连接正常", "Connection OK").to_string(),
+                        Err(e) => format!("{}: {e:#}", t("连接失败", "Connection failed")),
+                    };
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = weak_done.upgrade() {
+                            w.set_dialog_test_status(message.into());
+                        }
+                    });
+                });
+                return;
+            }
+
+            let host = session.host;
+            let port = session.port;
             runtime.spawn(async move {
                 let target = format!("{host}:{port}");
                 let result = tokio::time::timeout(
@@ -3409,7 +4228,12 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         window.on_session_dialog_pick_key(move || {
             let mut dialog =
-                rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
+                rfd::FileDialog::new()
+                    .set_title(t("选择私钥文件", "Choose private key file"))
+                    .add_filter(
+                        t("SSH 私钥", "SSH private keys"),
+                        &["ppk", "pem", "key"],
+                    );
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -3425,38 +4249,28 @@ fn wire_session_callbacks(
         });
     }
 
-    // Add a port forward to the session being edited (#56).
+    // Add another editable port-forward row (#56, #277).
     {
         let weak = window.as_weak();
         let ef = edit_forwards.clone();
-        window.on_add_forward(
-            move |name: SharedString,
-                  kind: SharedString,
-                  bind_addr: SharedString,
-                  bind_port: i32,
-                  host: SharedString,
-                  host_port: i32| {
-                let kind = kind.to_string();
-                // Local/remote need a target host; dynamic doesn't.
-                if bind_port <= 0 || bind_port > 65535 {
-                    return;
-                }
-                if kind != "dynamic" && (host.trim().is_empty() || host_port <= 0) {
-                    return;
-                }
-                ef.borrow_mut().push(crate::config::PortForward {
-                    kind,
-                    name: name.trim().to_string(),
-                    bind_addr: bind_addr.trim().to_string(),
-                    bind_port: bind_port as u16,
-                    host: host.trim().to_string(),
-                    host_port: host_port.max(0) as u16,
-                });
-                if let Some(w) = weak.upgrade() {
-                    w.set_dialog_forwards(forward_model(&ef.borrow()));
-                }
-            },
-        );
+        window.on_add_forward(move || {
+            ef.borrow_mut().push(blank_forward_draft());
+            if let Some(w) = weak.upgrade() {
+                w.set_dialog_forwards(forward_model(&ef.borrow()));
+            }
+        });
+    }
+    // Keep each editable row in the Rust-side working set. Saving validates and
+    // converts all non-empty rows together, so no separate "added" state exists.
+    {
+        let ef = edit_forwards.clone();
+        window.on_update_forward(move |index: i32, forward: PortFwd| {
+            let i = index as usize;
+            let mut forwards = ef.borrow_mut();
+            if i < forwards.len() {
+                forwards[i] = forward;
+            }
+        });
     }
     // Delete a port forward by index (#56).
     {
@@ -3468,6 +4282,9 @@ fn wire_session_callbacks(
                 let mut v = ef.borrow_mut();
                 if i < v.len() {
                     v.remove(i);
+                }
+                if v.is_empty() {
+                    v.push(blank_forward_draft());
                 }
             }
             if let Some(w) = weak.upgrade() {
@@ -3530,6 +4347,7 @@ fn wire_session_callbacks(
                 tab_id.clone(),
                 TabStatus {
                     host: conn_label.clone(),
+                    user: session.user.clone(),
                     session_id: id.clone(),
                     state: 0,
                     ..Default::default()
@@ -3598,12 +4416,24 @@ fn wire_session_callbacks(
             // terminal-resize callback). 5000-line scrollback is stored for
             // future scroll-navigation support.
             let is_dark_now = weak.upgrade().map(|w| w.get_dark_mode()).unwrap_or(true);
+            let (output_highlight, custom_highlight_rules) = {
+                let settings = store.borrow();
+                (
+                    OutputHighlightPreset::from_settings(
+                        settings.output_highlight_enabled(),
+                        settings.output_highlight_preset(),
+                    ),
+                    compile_output_rules(settings.output_highlight_rules()),
+                )
+            };
             bufs.lock().unwrap().insert(
                 tab_id.clone(),
                 Arc::new(Mutex::new(TermBuffer {
                     parser: vt100::Parser::new(24, 80, 5000),
                     find_query: String::new(),
                     is_dark: is_dark_now,
+                    output_highlight,
+                    custom_highlight_rules,
                     sel_anchor: None,
                     sel_focus: None,
                     sel_ranges: Vec::new(),
@@ -3767,17 +4597,30 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
     };
     ctx.handles.borrow_mut().insert(tab_id.to_string(), handle);
 
-    // Separate SFTP connection for the same session (SSH only).
-    let sftp_evt_tx = if has_sftp {
+    // Separate SFTP connection for the same session (SSH only). It waits for
+    // the interactive PTY to report Connected so a second SSH handshake cannot
+    // contend with terminal startup on the same host/network path.
+    let (sftp_evt_tx, sftp_ready_tx) = if has_sftp {
         let (sftp_tx, sftp_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-        let sftp_handle = spawn_sftp(ctx.runtime.handle(), session, jump, sftp_tx);
-        ctx.sftp_handles
-            .lock()
-            .unwrap()
-            .insert(tab_id.to_string(), sftp_handle);
-        Some(sftp_rx)
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let sftp_runtime = ctx.runtime.clone();
+        let sftp_task_runtime = sftp_runtime.clone();
+        let sftp_handles = ctx.sftp_handles.clone();
+        let sftp_tab_id = tab_id.to_string();
+        sftp_runtime.spawn(async move {
+            if ready_rx.await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+            let sftp_handle =
+                spawn_sftp(sftp_task_runtime.handle(), session, jump, sftp_tx);
+            if let Ok(mut handles) = sftp_handles.lock() {
+                handles.insert(sftp_tab_id, sftp_handle);
+            }
+        });
+        (Some(sftp_rx), Some(ready_tx))
     } else {
-        None
+        (None, None)
     };
 
     // --- Shell event pump (dedicated thread) ---
@@ -3796,6 +4639,7 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
         let render_gates_pump = ctx.render_gates.clone();
         std::thread::spawn(move || {
             let mut shell_rx = rx;
+            let mut sftp_ready_tx = sftp_ready_tx;
             let mut cwd_debounce: Option<tokio::task::JoinHandle<()>> = None;
             // Reusable scratch so a fast firehose doesn't reallocate every batch.
             let mut drained: Vec<SessionEvent> = Vec::new();
@@ -3825,6 +4669,12 @@ fn start_session_in_tab(tab_id: &str, session: Session, ctx: &ConnectCtx) {
                 let mut ui_batch: Vec<SessionEvent> = Vec::with_capacity(drained.len());
                 for evt in drained.drain(..) {
                     match evt {
+                        SessionEvent::Connected => {
+                            if let Some(ready) = sftp_ready_tx.take() {
+                                let _ = ready.send(());
+                            }
+                            ui_batch.push(SessionEvent::Connected);
+                        }
                         SessionEvent::CwdChanged(cwd) => {
                             // Shared map (not a thread-local) so manual SFTP
                             // navigation can clear the entry — then the very next
@@ -4213,18 +5063,60 @@ fn gpu_model(gpus: &[GpuSnapshot]) -> ModelRc<GpuInfo> {
 
 /// Build the process-monitor model for the popup (#23). `cpu`/`mem` are
 /// pre-formatted to one decimal; `cpu_frac` (0..1) drives the row's load bar.
-fn proc_rows(procs: &[ProcInfo]) -> Vec<ProcRow> {
+fn set_process_action_error(weak: &slint::Weak<ProcWindow>, message: &str) {
+    if let Some(window) = weak.upgrade() {
+        window.set_action_busy(false);
+        window.set_action_error(true);
+        window.set_action_status(message.into());
+    }
+}
+
+/// A root login can signal any process directly. Non-root logins may signal
+/// only their own processes; root and other users' processes require `su`.
+fn process_needs_root(current_user: &str, process_user: &str) -> bool {
+    current_user != "root" && process_user != current_user
+}
+
+fn proc_rows(procs: &[ProcInfo], current_user: &str, tab_id: &str) -> Vec<ProcRow> {
     procs
         .iter()
         .map(|p| ProcRow {
+            tab_id: tab_id.into(),
             pid: p.pid.to_string().into(),
             user: p.user.clone().into(),
             cpu: format!("{:.1}", p.cpu).into(),
             mem: format!("{:.1}", p.mem).into(),
             command: p.command.clone().into(),
             cpu_frac: (p.cpu / 100.0).clamp(0.0, 1.0),
+            own_process: !process_needs_root(current_user, &p.user),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod process_row_tests {
+    use super::*;
+
+    #[test]
+    fn marks_owner_and_preserves_source_tab() {
+        let input = vec![
+            ProcInfo { pid: 10, user: "alice".into(), cpu: 1.0, mem: 2.0, command: "own".into() },
+            ProcInfo { pid: 11, user: "root".into(), cpu: 3.0, mem: 4.0, command: "other".into() },
+        ];
+        let rows = proc_rows(&input, "alice", "term-a");
+        assert!(rows[0].own_process);
+        assert!(!rows[1].own_process);
+        assert!(rows.iter().all(|row| row.tab_id.as_str() == "term-a"));
+    }
+
+    #[test]
+    fn privilege_rules_match_effective_login_user() {
+        assert!(!process_needs_root("alice", "alice"));
+        assert!(process_needs_root("alice", "root"));
+        assert!(process_needs_root("alice", "bob"));
+        assert!(!process_needs_root("root", "root"));
+        assert!(!process_needs_root("root", "alice"));
+    }
 }
 
 fn metric_rows(
@@ -4742,6 +5634,29 @@ fn place_system_info_window(main: &AppWindow, sys: &SystemInfoWindow) {
     });
 }
 
+/// Center the process monitor on the same physical monitor as the main window.
+/// Physical coordinates avoid logical/physical rounding errors when the two
+/// displays use different DPI scale factors. Keep the user's current process
+/// window size; opening it should reposition, not reset a manual resize.
+fn place_process_window(main: &AppWindow, process: &ProcWindow) {
+    use i_slint_backend_winit::winit::dpi::PhysicalPosition;
+
+    let monitor = main
+        .window()
+        .with_winit_window(|ww| ww.current_monitor().or_else(|| ww.primary_monitor()))
+        .flatten();
+    let Some(monitor) = monitor else { return };
+    let origin = monitor.position();
+    let monitor_size = monitor.size();
+
+    process.window().with_winit_window(|ww| {
+        let window_size = ww.outer_size();
+        let x = origin.x + monitor_size.width.saturating_sub(window_size.width) as i32 / 2;
+        let y = origin.y + monitor_size.height.saturating_sub(window_size.height) as i32 / 2;
+        ww.set_outer_position(PhysicalPosition::new(x, y));
+    });
+}
+
 /// Persist the current panel docking layout (both panels' edge + size) and the
 /// window size, so the next launch restores the user's arrangement. Called on
 /// every exit path (#dock).
@@ -4758,6 +5673,11 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
     s.set_sftp_panel_width(win.get_sftp_panel_width());
     s.set_sftp_panel_height(win.get_sftp_panel_height());
     s.set_sftp_dock(win.get_sftp_dock().to_string());
+    s.set_quick_panel_open(win.get_quick_panel_open());
+    s.set_quick_panel_collapsed(win.get_quick_panel_collapsed());
+    s.set_quick_panel_width(win.get_quick_panel_width());
+    s.set_quick_panel_height(win.get_quick_panel_height());
+    s.set_quick_panel_dock(win.get_quick_panel_dock().to_string());
     s.set_welcome_sidebar_width(win.get_welcome_sidebar_width());
     s.set_welcome_sidebar_dock(win.get_welcome_sidebar_dock().to_string());
     s.set_welcome_collapsed(win.get_welcome_collapsed());
@@ -4768,8 +5688,15 @@ fn save_layout(win: &AppWindow, store: &Rc<RefCell<ConfigStore>>) {
         .window()
         .with_winit_window(|ww| ww.is_maximized())
         .unwrap_or_else(|| win.get_window_maximized());
-    if !native_maximized && w > 200.0 && h > 200.0 {
-        let (w, h) = clamp_window_size_to_monitor(win.window(), Some((w, h))).unwrap_or((w, h));
+    let (saved_w, saved_h) = s.window_size();
+    if !native_maximized
+        && (saved_w <= 0.0 || saved_h <= 0.0)
+        && w > 200.0
+        && h > 200.0
+    {
+        // Normal resize events keep this cache current. Only fall back to the
+        // close-time geometry for a first run where no valid resize was seen;
+        // do not issue a new native resize while the window is shutting down.
         s.set_window_size(w, h);
     }
     let _ = s.save();
@@ -4879,31 +5806,142 @@ fn quick_cmd_model(
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
-/// Build the port-forward list model for the session dialog (#56). Each row is
-/// a one-line human summary (`-L 127.0.0.1:8080 → host:80`).
-fn forward_model(forwards: &[crate::config::PortForward]) -> ModelRc<PortFwd> {
-    let rows: Vec<PortFwd> = forwards
+fn blank_forward_draft() -> PortFwd {
+    PortFwd {
+        kind: "local".into(),
+        name: "".into(),
+        bind_addr: "127.0.0.1".into(),
+        bind_port: "".into(),
+        host: "".into(),
+        host_port: "".into(),
+    }
+}
+
+fn forward_drafts(forwards: &[crate::config::PortForward]) -> Vec<PortFwd> {
+    forwards
         .iter()
-        .map(|f| {
-            let bind = if f.bind_addr.trim().is_empty() {
-                "127.0.0.1"
+        .map(|forward| PortFwd {
+            kind: forward.kind.clone().into(),
+            name: forward.name.clone().into(),
+            bind_addr: if forward.bind_addr.trim().is_empty() {
+                "127.0.0.1".into()
             } else {
-                f.bind_addr.trim()
-            };
-            let summary = match f.kind.as_str() {
-                "local" => format!("-L {}:{} → {}:{}", bind, f.bind_port, f.host, f.host_port),
-                "remote" => format!("-R {}:{} → {}:{}", bind, f.bind_port, f.host, f.host_port),
-                "dynamic" => format!("-D {}:{} (SOCKS5)", bind, f.bind_port),
-                _ => String::new(),
-            };
-            PortFwd {
-                kind: f.kind.clone().into(),
-                name: f.name.clone().into(),
-                summary: summary.into(),
-            }
+                forward.bind_addr.trim().into()
+            },
+            bind_port: forward.bind_port.to_string().into(),
+            host: forward.host.clone().into(),
+            host_port: if forward.kind == "dynamic" {
+                "".into()
+            } else {
+                forward.host_port.to_string().into()
+            },
         })
-        .collect();
-    ModelRc::from(Rc::new(VecModel::from(rows)))
+        .collect()
+}
+
+fn forward_model(forwards: &[PortFwd]) -> ModelRc<PortFwd> {
+    ModelRc::from(Rc::new(VecModel::from(forwards.to_vec())))
+}
+
+fn validated_port_forwards(
+    drafts: &[PortFwd],
+) -> std::result::Result<Vec<crate::config::PortForward>, String> {
+    let mut forwards = Vec::new();
+    for draft in drafts {
+        let is_blank = draft.name.trim().is_empty()
+            && draft.bind_port.trim().is_empty()
+            && draft.host.trim().is_empty()
+            && draft.host_port.trim().is_empty();
+        if is_blank {
+            continue;
+        }
+
+        let bind_port = draft
+            .bind_port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| {
+                t(
+                    "请输入有效的监听端口（1-65535）",
+                    "Enter a valid listen port (1-65535).",
+                )
+                .to_string()
+            })?;
+        let kind = draft.kind.as_str();
+        let (host, host_port) = if kind == "dynamic" {
+            (String::new(), 0)
+        } else {
+            let host = draft.host.trim();
+            let host_port = draft
+                .host_port
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0);
+            if host.is_empty() || host_port.is_none() {
+                return Err(t(
+                    "请输入目标主机和有效的目标端口（1-65535）",
+                    "Enter a target host and a valid target port (1-65535).",
+                )
+                .to_string());
+            }
+            (host.to_string(), host_port.unwrap())
+        };
+
+        forwards.push(crate::config::PortForward {
+            kind: kind.to_string(),
+            name: draft.name.trim().to_string(),
+            bind_addr: if draft.bind_addr.trim().is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                draft.bind_addr.trim().to_string()
+            },
+            bind_port,
+            host,
+            host_port,
+        });
+    }
+    Ok(forwards)
+}
+
+#[cfg(test)]
+mod port_forward_draft_tests {
+    use super::{blank_forward_draft, validated_port_forwards};
+
+    #[test]
+    fn blank_rows_are_ignored_when_saving() {
+        assert!(validated_port_forwards(&[blank_forward_draft()])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn filled_rows_are_saved_without_an_add_step() {
+        let mut local = blank_forward_draft();
+        local.bind_port = "8080".into();
+        local.host = "service.internal".into();
+        local.host_port = "80".into();
+
+        let mut dynamic = blank_forward_draft();
+        dynamic.kind = "dynamic".into();
+        dynamic.bind_port = "1080".into();
+
+        let forwards = validated_port_forwards(&[local, dynamic]).unwrap();
+        assert_eq!(forwards.len(), 2);
+        assert_eq!(forwards[0].bind_port, 8080);
+        assert_eq!(forwards[0].host, "service.internal");
+        assert_eq!(forwards[1].kind, "dynamic");
+        assert_eq!(forwards[1].host_port, 0);
+    }
+
+    #[test]
+    fn partially_filled_rows_block_saving() {
+        let mut draft = blank_forward_draft();
+        draft.bind_port = "8080".into();
+        assert!(validated_port_forwards(&[draft]).is_err());
+    }
 }
 
 /// Collect the full paths of the checked SFTP entries for a tab (#100).
@@ -4974,6 +6012,57 @@ fn history_model(store: &ConfigStore) -> ModelRc<SharedString> {
         .map(|s| s.clone().into())
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn output_highlight_rule_model(store: &ConfigStore) -> ModelRc<OutputRuleItem> {
+    let rows: Vec<OutputRuleItem> = store
+        .output_highlight_rules()
+        .iter()
+        .map(|rule| OutputRuleItem {
+            pattern: rule.pattern.clone().into(),
+            regex: rule.regex,
+            case_sensitive: rule.case_sensitive,
+            whole_line: rule.whole_line,
+            color: match rule.color.as_str() {
+                "yellow" | "green" | "cyan" | "magenta" | "gray" => rule.color.clone(),
+                _ => "red".to_string(),
+            }
+            .into(),
+            enabled: rule.enabled,
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+fn parse_hex_color(value: &str) -> Option<slint::Color> {
+    let digits = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let red = u8::from_str_radix(&digits[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&digits[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&digits[4..6], 16).ok()?;
+    Some(slint::Color::from_rgb_u8(red, green, blue))
+}
+
+fn validate_output_highlight_rule(
+    pattern: &str,
+    is_regex: bool,
+    case_sensitive: bool,
+) -> std::result::Result<(), String> {
+    if pattern.is_empty() {
+        return Err(t("请输入关键词或正则表达式", "Enter a keyword or regular expression").into());
+    }
+    if pattern.chars().count() > 512 {
+        return Err(t("规则不能超过 512 个字符", "Rules cannot exceed 512 characters").into());
+    }
+    if is_regex {
+        regex::RegexBuilder::new(pattern)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map_err(|error| format!("{}: {error}", t("无效的正则表达式", "Invalid regular expression")))?;
+    }
+    Ok(())
 }
 
 /// Build the filtered history-view model for the dropdown: case-insensitive
@@ -5173,6 +6262,43 @@ fn apply_dark_mode(window: &AppWindow, bufs: &TermBuffers, dark: bool) {
     }
 }
 
+fn apply_output_highlight(
+    window: &AppWindow,
+    bufs: &TermBuffers,
+    enabled: bool,
+    preset: &str,
+) {
+    let mode = OutputHighlightPreset::from_settings(enabled, preset);
+    {
+        let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
+        for handle in handles {
+            handle.lock().unwrap().output_highlight = mode;
+        }
+    }
+    let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
+    for tab_id in tab_ids {
+        rebuild_tab_display(window, bufs, &tab_id);
+    }
+}
+
+fn apply_custom_output_rules(
+    window: &AppWindow,
+    bufs: &TermBuffers,
+    rules: &[OutputHighlightRule],
+) {
+    let compiled = compile_output_rules(rules);
+    {
+        let handles: Vec<_> = bufs.lock().unwrap().values().cloned().collect();
+        for handle in handles {
+            handle.lock().unwrap().custom_highlight_rules = compiled.clone();
+        }
+    }
+    let tab_ids: Vec<String> = bufs.lock().unwrap().keys().cloned().collect();
+    for tab_id in tab_ids {
+        rebuild_tab_display(window, bufs, &tab_id);
+    }
+}
+
 /// Apply a wallpaper id to the window: load the image + derived palette, push the
 /// immersive Theme overrides (accent / tint / image) and set `dark` from the
 /// image luminance. An empty or undecodable id turns immersive mode off and
@@ -5291,13 +6417,13 @@ fn refresh_sidebar(
     // instead of replacing it — replacing would break the sharing. Only a live
     // remote session has process data; default to empty and let the connected
     // branch below fill it in.
-    let set_procs = |win: &AppWindow, procs: &[ProcInfo]| {
+    let set_procs = |win: &AppWindow, procs: &[ProcInfo], current_user: &str, tab_id: &str| {
         if let Some(vm) = win
             .get_proc_list()
             .as_any()
             .downcast_ref::<VecModel<ProcRow>>()
         {
-            vm.set_vec(proc_rows(procs));
+            vm.set_vec(proc_rows(procs, current_user, tab_id));
         }
     };
     let set_system_models = |win: &AppWindow,
@@ -5388,7 +6514,8 @@ fn refresh_sidebar(
         }
     };
     win.set_proc_available(false);
-    set_procs(win, &[]);
+    win.set_system_info_available(false);
+    set_procs(win, &[], "", "");
 
     let active = win.get_active_tab_id().to_string();
     let status = if active == "welcome" {
@@ -5422,7 +6549,8 @@ fn refresh_sidebar(
             win.set_disks(disk_model(&st.disks));
             win.set_gpus(gpu_model(&st.gpus));
             win.set_proc_available(true);
-            set_procs(win, &st.procs);
+            win.set_system_info_available(true);
+            set_procs(win, &st.procs, &st.user, &active);
             set_system_models(
                 win,
                 st.cpu,
@@ -5451,8 +6579,8 @@ fn refresh_sidebar(
                 "".into(),
                 "".into(),
                 Vec::new(),
-                disk_rows(&snap.disks),
-                local_system_details(&snap),
+                Vec::new(),
+                SystemDetails::default(),
             );
         }
         // Still connecting.
@@ -5471,8 +6599,8 @@ fn refresh_sidebar(
                 "".into(),
                 "".into(),
                 Vec::new(),
-                disk_rows(&snap.disks),
-                local_system_details(&snap),
+                Vec::new(),
+                SystemDetails::default(),
             );
         }
         // Welcome tab (or unknown) → local machine top + bottom.
@@ -5494,8 +6622,8 @@ fn refresh_sidebar(
                     up: format_bytes_per_sec(snap.net_tx_per_sec).into(),
                     down: format_bytes_per_sec(snap.net_rx_per_sec).into(),
                 }],
-                disk_rows(&snap.disks),
-                local_system_details(&snap),
+                Vec::new(),
+                SystemDetails::default(),
             );
         }
     }
@@ -5633,6 +6761,7 @@ fn apply_session_event_to_window(
             swap_total_kib,
             net,
             disks,
+            current_user: _,
             procs,
             gpus,
             sys,
@@ -5647,7 +6776,9 @@ fn apply_session_event_to_window(
                 st.disks = disks;
                 st.procs = procs;
                 st.gpus = gpus;
-                st.sys = sys;
+                if let Some(sys) = sys {
+                    st.sys = sys;
+                }
                 // A sample means the channel is alive → treat as connected.
                 if st.state != 1 {
                     st.state = 1;
@@ -5655,6 +6786,20 @@ fn apply_session_event_to_window(
                 // Append the selected interface's total rate to its sparkline.
                 let (_, rx, tx) = selected_iface(st);
                 push_ring(&mut st.net_hist, (rx + tx) as f32);
+            }
+            if win.get_active_tab_id().as_str() == tab_id {
+                refresh_sidebar(win, statuses, local, local_net_hist);
+            }
+        }
+        SessionEvent::ProcessStats {
+            current_user,
+            procs,
+        } => {
+            if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
+                if !current_user.is_empty() {
+                    st.user = current_user;
+                }
+                st.procs = procs;
             }
             if win.get_active_tab_id().as_str() == tab_id {
                 refresh_sidebar(win, statuses, local, local_net_hist);
@@ -8386,6 +9531,18 @@ fn wire_key_input(
                 tracing::info!("[KEY_DIAG] Backspace PASSED all filters → sent to PTY");
             }
 
+            if should_drop_debian_bare_ctrl_marker(
+                key.as_str(),
+                ctrl,
+                debian_ctrl_marker_workaround_enabled(),
+            ) {
+                tracing::debug!(
+                    "send_key: dropped Debian/Slint bare Ctrl modifier marker {}",
+                    redact_key(key.as_str())
+                );
+                return;
+            }
+
             let bytes = key_to_pty_bytes(key.as_str(), ctrl, alt, app_cursor);
             // 本地echo预测：立即应用预测
             if let Some(predictable_action) = is_predictable(key.as_str(), ctrl, alt) {
@@ -8523,6 +9680,7 @@ fn wire_key_input(
     // Middle-click / Ctrl+Shift+V: paste clipboard text into PTY.
     {
         let handles = handles.clone();
+        let bufs = bufs.clone();
         let weak = window.as_weak();
         window.on_paste_from_clipboard(move |tab_id: SharedString| {
             // Clone the (Send) command sender for this tab so the clipboard read
@@ -8534,31 +9692,26 @@ fn wire_key_input(
                 .get(tab_id.as_str())
                 .map(|h| h.commands.clone());
             let Some(sender) = sender else { return };
+            let bracketed = terminal_uses_bracketed_paste(&bufs, tab_id.as_str());
             let weak = weak.clone();
             let tab_id = tab_id.to_string();
             std::thread::spawn(move || {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
                         if text.contains(['\r', '\n']) {
-                            let preview: String = text.chars().take(1200).collect();
-                            let truncated = text.chars().count() > 1200;
-                            let preview = if truncated {
-                                format!("{preview}\n…")
-                            } else {
-                                preview
-                            };
+                            let large = paste_requires_large_review(&text);
+                            let preview = text.clone();
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(w) = weak.upgrade() {
                                     w.set_paste_confirm_tab(tab_id.into());
                                     w.set_paste_confirm_text(text.into());
                                     w.set_paste_confirm_preview(preview.into());
+                                    w.set_paste_confirm_large(large);
                                     w.set_paste_confirm_open(true);
                                 }
                             });
                         } else {
-                            // Normalise line endings to a single CR so the
-                            // terminal receives the same input on every OS.
-                            let bytes = normalize_pasted_newlines(&text).into_bytes();
+                            let bytes = encode_pasted_text(&text, bracketed);
                             let _ = sender.send(SessionCommand::RawInput(bytes));
                         }
                     }
@@ -8571,6 +9724,7 @@ fn wire_key_input(
     // Accept a previously reviewed multi-line paste (#262).
     {
         let handles_paste = handles.clone();
+        let bufs_paste = bufs.clone();
         let weak = window.as_weak();
         window.on_paste_confirmed(move |tab_id: SharedString| {
             let Some(sender) = handles_paste
@@ -8582,9 +9736,10 @@ fn wire_key_input(
             };
             let Some(w) = weak.upgrade() else { return };
             let text = w.get_paste_confirm_text().to_string();
-            let _ = sender.send(SessionCommand::RawInput(
-                normalize_pasted_newlines(&text).into_bytes(),
-            ));
+            let bracketed = terminal_uses_bracketed_paste(&bufs_paste, tab_id.as_str());
+            let _ = sender.send(SessionCommand::RawInput(encode_pasted_text(
+                &text, bracketed,
+            )));
             w.set_paste_confirm_open(false);
         });
     }
@@ -9473,6 +10628,72 @@ fn normalize_pasted_newlines(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
+/// Encode clipboard text according to the mode requested by the remote
+/// application. Bracketed paste lets shells and editors distinguish pasted
+/// text from typed keystrokes, preserving multi-line layout and indentation.
+fn encode_pasted_text(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return normalize_pasted_newlines(text).into_bytes();
+    }
+
+    // A pasted ESC could forge the end marker; Ctrl+C also terminates bracketed
+    // paste in some shells. Match established terminal-emulator behaviour by
+    // filtering both before wrapping the payload.
+    let filtered = text.replace(['\x1b', '\x03'], "");
+    let mut bytes = Vec::with_capacity(filtered.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(filtered.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+fn terminal_uses_bracketed_paste(bufs: &TermBuffers, tab_id: &str) -> bool {
+    let buffer = bufs
+        .lock()
+        .ok()
+        .and_then(|buffers| buffers.get(tab_id).cloned());
+    buffer
+        .and_then(|buffer| {
+            buffer
+                .lock()
+                .ok()
+                .map(|buffer| buffer.parser.screen().bracketed_paste())
+        })
+        .unwrap_or(false)
+}
+
+fn should_drop_debian_bare_ctrl_marker(key: &str, ctrl: bool, workaround: bool) -> bool {
+    workaround
+        && ctrl
+        && matches!(key.chars().collect::<Vec<_>>().as_slice(), ['\u{0011}'] | ['\u{0016}'])
+}
+
+#[cfg(target_os = "linux")]
+fn debian_ctrl_marker_workaround_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let Ok(release) = std::fs::read_to_string("/etc/os-release") else {
+            return false;
+        };
+        release.lines().any(|line| {
+            let Some((key, value)) = line.split_once('=') else {
+                return false;
+            };
+            let value = value.trim_matches('"');
+            key == "ID" && value.eq_ignore_ascii_case("debian")
+                || key == "ID_LIKE"
+                    && value
+                        .split_ascii_whitespace()
+                        .any(|item| item.eq_ignore_ascii_case("debian"))
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn debian_ctrl_marker_workaround_enabled() -> bool {
+    false
+}
+
 fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u8> {
     // --- Special keys (Slint PUA code points) ------------------------------
     // Arrow keys: respect DECCKM application-cursor mode.
@@ -9541,15 +10762,14 @@ fn key_to_pty_bytes(key: &str, ctrl: bool, alt: bool, app_cursor: bool) -> Vec<u
     // Meta and discard the line the user was typing — the "Alt clears the
     // command" bug.
     //
-    // The `!ctrl` guard is deliberate: a real Ctrl+P..Ctrl+X is encoded by some
-    // Linux/macOS builds directly as the same C0 bytes (0x10..0x18) but with
-    // ctrl=true (handled by the Ctrl branch just below), so we must NOT swallow
-    // those. A lone modifier never carries ctrl=true except bare Ctrl/CtrlR
-    // themselves, which are harmless to pass through as today.
-    if !ctrl {
-        if let Some(c) = key.chars().next() {
-            let cp = c as u32;
-            if key.chars().count() == 1 && (0x10..=0x18).contains(&cp) {
+    // Keep ctrl=true C0 values here: some Linux/macOS builds encode real
+    // Ctrl+P..Ctrl+X directly as 0x10..=0x18. Debian's bare Ctrl markers are
+    // filtered at the event boundary, where the distro-specific workaround is
+    // available (#274).
+    if let Some(c) = key.chars().next() {
+        let cp = c as u32;
+        if key.chars().count() == 1 {
+            if !ctrl && (0x10..=0x18).contains(&cp) {
                 return vec![];
             }
         }
@@ -9788,6 +11008,352 @@ fn build_row(screen: &vt100::Screen, r: u16, cols: u16) -> Line {
         });
     }
     (plain, runs, screen.row_wrapped(r))
+}
+
+/// Highlight the first recognisable log-level token in each otherwise unstyled
+/// terminal run. Uppercase standalone levels cover conventional text logs;
+/// lowercase values are accepted only in a structured `level=...` / JSON field
+/// to avoid colouring ordinary prose that happens to contain words like "error".
+fn highlight_plain_output(
+    runs: Vec<HistSpan>,
+    preset: OutputHighlightPreset,
+    custom_rules: &[CompiledOutputRule],
+) -> Vec<HistSpan> {
+    if preset == OutputHighlightPreset::Off {
+        return runs;
+    }
+    let runs = highlight_custom_output(runs, custom_rules);
+    const SEARCH_COLS: i32 = 96;
+
+    let mut out = Vec::with_capacity(runs.len() + 2);
+    for run in runs {
+        let eligible = run.col < SEARCH_COLS
+            && matches!(run.fg, vt100::Color::Default)
+            && matches!(run.bg, vt100::Color::Default)
+            && !run.bold
+            && !run.inverse;
+        let max_chars = SEARCH_COLS.saturating_sub(run.col) as usize;
+        let Some((start, end, ansi_index)) = eligible
+            .then(|| output_highlight_marker(&run.text, max_chars, preset))
+            .flatten()
+        else {
+            out.push(run);
+            continue;
+        };
+
+        let before = run.text[..start].to_string();
+        let marker = run.text[start..end].to_string();
+        let after = run.text[end..].to_string();
+        let before_cells = before.chars().count() as i32;
+        let marker_cells = marker.chars().count() as i32;
+
+        if !before.is_empty() {
+            let mut part = run.clone();
+            part.text = before;
+            part.cells = before_cells;
+            out.push(part);
+        }
+
+        let mut level = run.clone();
+        level.text = marker;
+        level.fg = vt100::Color::Idx(ansi_index);
+        level.bold = true;
+        level.col += before_cells;
+        level.cells = marker_cells;
+        out.push(level);
+
+        if !after.is_empty() {
+            let mut part = run;
+            part.text = after;
+            part.col += before_cells + marker_cells;
+            part.cells = part.cells.saturating_sub(before_cells + marker_cells);
+            out.push(part);
+        }
+    }
+    out
+}
+
+fn highlight_custom_output(
+    mut runs: Vec<HistSpan>,
+    rules: &[CompiledOutputRule],
+) -> Vec<HistSpan> {
+    for rule in rules {
+        if rule.whole_line
+            && runs
+                .iter()
+                .any(|run| custom_rule_eligible(run) && rule.matcher.is_match(&run.text))
+        {
+            for run in &mut runs {
+                if custom_rule_eligible(run) {
+                    run.fg = vt100::Color::Idx(rule.ansi_index);
+                    run.bold = true;
+                }
+            }
+            continue;
+        }
+
+        let mut next = Vec::with_capacity(runs.len() + 2);
+        for run in runs {
+            if !custom_rule_eligible(&run) {
+                next.push(run);
+                continue;
+            }
+            let matches: Vec<(usize, usize)> = rule
+                .matcher
+                .find_iter(&run.text)
+                .filter(|m| !m.is_empty())
+                .map(|m| (m.start(), m.end()))
+                .collect();
+            if matches.is_empty() {
+                next.push(run);
+            } else {
+                next.extend(style_custom_matches(run, &matches, rule.ansi_index));
+            }
+        }
+        runs = next;
+    }
+    runs
+}
+
+fn custom_rule_eligible(run: &HistSpan) -> bool {
+    matches!(run.fg, vt100::Color::Default)
+        && matches!(run.bg, vt100::Color::Default)
+        && !run.bold
+        && !run.inverse
+}
+
+fn style_custom_matches(
+    run: HistSpan,
+    matches: &[(usize, usize)],
+    ansi_index: u8,
+) -> Vec<HistSpan> {
+    let mut out = Vec::with_capacity(matches.len() * 2 + 1);
+    let mut byte_pos = 0usize;
+    let mut col = run.col;
+    for &(start, end) in matches {
+        if start < byte_pos || end > run.text.len() {
+            continue;
+        }
+        if start > byte_pos {
+            let text = &run.text[byte_pos..start];
+            let cells = text_cell_width(text);
+            let mut part = run.clone();
+            part.text = text.to_string();
+            part.col = col;
+            part.cells = cells;
+            out.push(part);
+            col += cells;
+        }
+
+        let text = &run.text[start..end];
+        let cells = text_cell_width(text);
+        let mut hit = run.clone();
+        hit.text = text.to_string();
+        hit.fg = vt100::Color::Idx(ansi_index);
+        hit.bold = true;
+        hit.col = col;
+        hit.cells = cells;
+        out.push(hit);
+        col += cells;
+        byte_pos = end;
+    }
+    if byte_pos < run.text.len() {
+        let mut part = run;
+        part.text = part.text[byte_pos..].to_string();
+        part.col = col;
+        // Recompute instead of relying on subtraction: wide/combining glyphs
+        // can make byte/character counts differ from terminal grid cells.
+        part.cells = text_cell_width(&part.text);
+        out.push(part);
+    }
+    out
+}
+
+fn text_cell_width(text: &str) -> i32 {
+    use unicode_width::UnicodeWidthChar;
+    text.chars()
+        .map(|ch| ch.width().unwrap_or(0) as i32)
+        .sum()
+}
+
+/// Return `(byte_start, byte_end, xterm_256_index)` for a log severity marker.
+fn log_level_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> {
+    const LEVELS: [(&str, u8); 10] = [
+        ("CRITICAL", 9),
+        ("WARNING", 11),
+        ("ERROR", 9),
+        ("FATAL", 9),
+        ("PANIC", 9),
+        ("TRACE", 8),
+        ("DEBUG", 8),
+        ("NOTICE", 14),
+        ("INFO", 14),
+        ("WARN", 11),
+    ];
+
+    let bytes = text.as_bytes();
+    let mut best: Option<(usize, usize, u8)> = None;
+    for (word, colour) in LEVELS {
+        for (start, _) in text.match_indices(word) {
+            if text[..start].chars().count() >= max_chars
+                || !ascii_word_boundary(bytes, start, start + word.len())
+            {
+                continue;
+            }
+            let candidate = (start, start + word.len(), colour);
+            if best.map_or(true, |current| start < current.0) {
+                best = Some(candidate);
+            }
+            break;
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+
+    // Structured logging commonly emits `level=error`, `level: warn`, or
+    // `{"level":"info"}` using lowercase values. Only accept those values
+    // after a real `level` key, keeping normal lowercase prose untouched.
+    let lower = text.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
+    for (key_start, _) in lower.match_indices("level") {
+        if text[..key_start].chars().count() >= max_chars
+            || !ascii_word_boundary(lower_bytes, key_start, key_start + 5)
+        {
+            continue;
+        }
+        let mut pos = key_start + 5;
+        if lower_bytes.get(pos) == Some(&b'"') {
+            pos += 1;
+        }
+        while lower_bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if !matches!(lower_bytes.get(pos).copied(), Some(b'=') | Some(b':')) {
+            continue;
+        }
+        pos += 1;
+        while lower_bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if matches!(lower_bytes.get(pos).copied(), Some(b'"') | Some(b'\'')) {
+            pos += 1;
+        }
+        for (word, colour) in LEVELS {
+            let word = word.to_ascii_lowercase();
+            if lower[pos..].starts_with(&word)
+                && ascii_word_boundary(lower_bytes, pos, pos + word.len())
+            {
+                return Some((pos, pos + word.len(), colour));
+            }
+        }
+    }
+    None
+}
+
+fn output_highlight_marker(
+    text: &str,
+    max_chars: usize,
+    preset: OutputHighlightPreset,
+) -> Option<(usize, usize, u8)> {
+    let log = log_level_marker(text, max_chars);
+    if preset != OutputHighlightPreset::DevOps {
+        return log;
+    }
+    let ops = devops_marker(text, max_chars);
+    match (log, ops) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(marker), None) | (None, Some(marker)) => Some(marker),
+        (None, None) => None,
+    }
+}
+
+/// Additional deployment/operations states used by the DevOps preset. The list
+/// intentionally avoids ambiguous short words such as OK/UP/DOWN.
+fn devops_marker(text: &str, max_chars: usize) -> Option<(usize, usize, u8)> {
+    const STATES: [(&str, u8); 15] = [
+        ("UNHEALTHY", 9),
+        ("SUCCEEDED", 10),
+        ("SUCCESS", 10),
+        ("FAILURE", 9),
+        ("FAILED", 9),
+        ("TIMEOUT", 9),
+        ("DENIED", 9),
+        ("DEGRADED", 11),
+        ("RETRYING", 11),
+        ("PENDING", 11),
+        ("HEALTHY", 10),
+        ("READY", 10),
+        ("PASSED", 10),
+        ("RETRY", 11),
+        ("FAIL", 9),
+    ];
+
+    let bytes = text.as_bytes();
+    let mut best: Option<(usize, usize, u8)> = None;
+    for (word, colour) in STATES {
+        for (start, _) in text.match_indices(word) {
+            if text[..start].chars().count() >= max_chars
+                || !ascii_word_boundary(bytes, start, start + word.len())
+            {
+                continue;
+            }
+            let candidate = (start, start + word.len(), colour);
+            if best.map_or(true, |current| start < current.0) {
+                best = Some(candidate);
+            }
+            break;
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let lower_bytes = lower.as_bytes();
+    for key in ["status", "state", "result"] {
+        for (key_start, _) in lower.match_indices(key) {
+            if text[..key_start].chars().count() >= max_chars
+                || !ascii_word_boundary(lower_bytes, key_start, key_start + key.len())
+            {
+                continue;
+            }
+            let mut pos = key_start + key.len();
+            if lower_bytes.get(pos) == Some(&b'"') {
+                pos += 1;
+            }
+            while lower_bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+            if !matches!(lower_bytes.get(pos).copied(), Some(b'=') | Some(b':')) {
+                continue;
+            }
+            pos += 1;
+            while lower_bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+            if matches!(lower_bytes.get(pos).copied(), Some(b'"') | Some(b'\'')) {
+                pos += 1;
+            }
+            for (word, colour) in STATES {
+                let word = word.to_ascii_lowercase();
+                if lower[pos..].starts_with(&word)
+                    && ascii_word_boundary(lower_bytes, pos, pos + word.len())
+                {
+                    return Some((pos, pos + word.len(), colour));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn ascii_word_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    bytes
+        .get(start.wrapping_sub(1))
+        .map_or(true, |b| !is_word(*b))
+        && bytes.get(end).map_or(true, |b| !is_word(*b))
 }
 
 /// Detect how many lines scrolled off the top between two screen snapshots by
@@ -10226,21 +11792,20 @@ impl TermBuffer {
             let s = self.parser.screen();
             for r in 0..rows {
                 let (plain, runs, _wrapped) = build_row(s, r, cols);
+                let runs = if is_alt {
+                    runs
+                } else {
+                    highlight_plain_output(
+                        runs,
+                        self.output_highlight,
+                        &self.custom_highlight_rules,
+                    )
+                };
                 if !runs.is_empty() {
                     last_content = r as i32;
                 }
                 for hs in runs {
-                    let (fg, bg) = vt_span_colors(hs.fg, hs.bg, hs.bold, hs.inverse, self.is_dark);
-                    spans.push(TermSpan {
-                        cjk: contains_cjk(&hs.text),
-                        text: hs.text.into(),
-                        fg,
-                        bg,
-                        bold: hs.bold,
-                        row: r as i32,
-                        col: hs.col,
-                        cells: hs.cells,
-                    });
+                    spans.extend(render_term_span(&hs, r as i32, self.is_dark));
                 }
                 displayed.push(plain.trim_end().to_string());
             }
@@ -10286,18 +11851,13 @@ impl TermBuffer {
             } else {
                 &live[idx - hist_len]
             };
-            for hs in &line.1 {
-                let (fg, bg) = vt_span_colors(hs.fg, hs.bg, hs.bold, hs.inverse, self.is_dark);
-                spans.push(TermSpan {
-                    text: hs.text.clone().into(),
-                    fg,
-                    bg,
-                    bold: hs.bold,
-                    row: d as i32,
-                    col: hs.col,
-                    cells: hs.cells,
-                    cjk: contains_cjk(&hs.text),
-                });
+            let runs = highlight_plain_output(
+                line.1.clone(),
+                self.output_highlight,
+                &self.custom_highlight_rules,
+            );
+            for hs in &runs {
+                spans.extend(render_term_span(hs, d as i32, self.is_dark));
             }
             displayed.push(line.0.trim_end().to_string());
         }
@@ -10645,6 +12205,224 @@ fn is_predictable(key: &str, ctrl: bool, alt: bool) -> Option<PredictionAction> 
     }
 
     None
+}
+
+/// Switch long prompts to the large, scrollable paste-review surface before a
+/// compact confirmation card can grow enough to cover its own action buttons.
+fn paste_requires_large_review(text: &str) -> bool {
+    const COMPACT_CHAR_LIMIT: usize = 600;
+    const COMPACT_LINE_LIMIT: usize = 12;
+    let bytes = text.as_bytes();
+    let mut lines = 1usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                lines += 1;
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+            }
+            b'\n' => lines += 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    text.chars().count() > COMPACT_CHAR_LIMIT || lines > COMPACT_LINE_LIMIT
+}
+
+thread_local! {
+    /// Decoded images are retained only for emoji actually seen in terminal
+    /// output. A full 72x72 RGBA Twemoji is ~20 KiB; this avoids decoding on
+    /// every redraw without eagerly allocating the entire emoji collection.
+    static TWEMOJI_CACHE: RefCell<HashMap<String, Option<slint::Image>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn twemoji_image(grapheme: &str) -> Option<slint::Image> {
+    TWEMOJI_CACHE.with(|cache| {
+        if let Some(image) = cache.borrow().get(grapheme) {
+            return image.clone();
+        }
+
+        // U+FE0E explicitly requests text presentation. U+FE0F requests emoji
+        // presentation, but Twemoji stores some legacy symbols (for example
+        // ❤️) under a key without VS16, so retry lookup with VS16 removed.
+        let normalized;
+        let asset = if grapheme.contains('\u{fe0e}') {
+            None
+        } else {
+            normalized = grapheme.replace('\u{fe0f}', "");
+            twemoji_assets::png::PngTwemojiAsset::from_emoji(grapheme).or_else(|| {
+                (normalized != grapheme)
+                    .then(|| twemoji_assets::png::PngTwemojiAsset::from_emoji(&normalized))
+                    .flatten()
+            })
+        };
+        let image = asset
+            .and_then(|asset| image::load_from_memory(asset.data.0).ok())
+            .map(|decoded| {
+                let rgba = decoded.into_rgba8();
+                let (width, height) = rgba.dimensions();
+                let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+                pixels.make_mut_bytes().copy_from_slice(rgba.as_raw());
+                slint::Image::from_rgba8(pixels)
+            });
+        cache.borrow_mut().insert(grapheme.to_string(), image.clone());
+        image
+    })
+}
+
+/// Split a styled terminal run only at complete Unicode grapheme boundaries.
+/// Ordinary graphemes remain grouped into large Text spans; emoji with a
+/// Twemoji asset become image spans so color survives Slint's monochrome font
+/// rasterizers. Columns still come from terminal cells, not image pixels.
+fn render_term_span(span: &HistSpan, row: i32, is_dark: bool) -> Vec<TermSpan> {
+    use unicode_segmentation::UnicodeSegmentation as _;
+    use unicode_width::UnicodeWidthStr as _;
+
+    let graphemes: Vec<&str> = span.text.graphemes(true).collect();
+    if graphemes.is_empty() {
+        return Vec::new();
+    }
+
+    let (fg, bg) = vt_span_colors(span.fg, span.bg, span.bold, span.inverse, is_dark);
+    let mut result = Vec::new();
+    let mut col = span.col;
+    let mut remaining_cells = span.cells.max(0);
+    let mut plain = String::new();
+    let mut plain_col = col;
+    let mut plain_cells = 0;
+
+    for (index, grapheme) in graphemes.iter().enumerate() {
+        let following = (graphemes.len() - index - 1) as i32;
+        let desired = (*grapheme).width().clamp(1, 2) as i32;
+        let cells = if following == 0 {
+            remaining_cells.max(1)
+        } else {
+            desired.min((remaining_cells - following).max(1))
+        };
+        remaining_cells = remaining_cells.saturating_sub(cells);
+
+        if let Some(emoji_image) = twemoji_image(grapheme) {
+            if !plain.is_empty() {
+                let plain_cjk = contains_cjk(&plain);
+                result.push(TermSpan {
+                    text: std::mem::take(&mut plain).into(),
+                    fg: fg.clone(),
+                    bg: bg.clone(),
+                    bold: span.bold,
+                    row,
+                    col: plain_col,
+                    cells: plain_cells,
+                    cjk: plain_cjk,
+                    emoji: false,
+                    emoji_image: slint::Image::default(),
+                });
+                plain_cells = 0;
+            }
+            result.push(TermSpan {
+                text: "".into(),
+                fg: fg.clone(),
+                bg: bg.clone(),
+                bold: span.bold,
+                row,
+                col,
+                cells,
+                cjk: false,
+                emoji: true,
+                emoji_image,
+            });
+            plain_col = col + cells;
+        } else {
+            if plain.is_empty() {
+                plain_col = col;
+            }
+            plain.push_str(grapheme);
+            plain_cells += cells;
+        }
+        col += cells;
+    }
+
+    if !plain.is_empty() {
+        let cjk = contains_cjk(&plain);
+        result.push(TermSpan {
+            text: plain.into(),
+            fg,
+            bg,
+            bold: span.bold,
+            row,
+            col: plain_col,
+            cells: plain_cells,
+            cjk,
+            emoji: false,
+            emoji_image: slint::Image::default(),
+        });
+    }
+    result
+}
+
+#[cfg(test)]
+mod color_emoji_tests {
+    use super::*;
+
+    fn run(text: &str, cells: i32) -> HistSpan {
+        HistSpan {
+            text: text.to_string(),
+            fg: vt100::Color::Default,
+            bg: vt100::Color::Default,
+            bold: false,
+            inverse: false,
+            col: 4,
+            cells,
+        }
+    }
+
+    #[test]
+    fn replaces_emoji_without_changing_terminal_columns() {
+        let spans = render_term_span(&run("A😀B", 4), 2, true);
+        assert_eq!(spans.len(), 3);
+        assert_eq!((spans[0].col, spans[0].cells), (4, 1));
+        assert!(!spans[0].emoji);
+        assert_eq!((spans[1].col, spans[1].cells), (5, 2));
+        assert!(spans[1].emoji);
+        assert_eq!((spans[2].col, spans[2].cells), (7, 1));
+        assert!(!spans[2].emoji);
+    }
+
+    #[test]
+    fn keeps_zwj_sequence_as_one_color_image() {
+        let spans = render_term_span(&run("👨‍👩‍👧‍👦", 2), 0, true);
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].emoji);
+        assert_eq!(spans[0].cells, 2);
+    }
+
+    #[test]
+    fn supports_common_composed_emoji_sequences() {
+        for emoji in ["👍🏽", "🇨🇳", "👨‍💻", "❤️"] {
+            let spans = render_term_span(&run(emoji, 2), 0, true);
+            assert_eq!(spans.len(), 1, "unexpected split for {emoji}");
+            assert!(spans[0].emoji, "missing color asset for {emoji}");
+            assert_eq!(spans[0].cells, 2);
+        }
+    }
+
+    #[test]
+    fn respects_explicit_text_presentation_selector() {
+        let spans = render_term_span(&run("♥\u{fe0e}", 1), 0, true);
+        assert_eq!(spans.len(), 1);
+        assert!(!spans[0].emoji);
+        assert_eq!(spans[0].text.as_str(), "♥\u{fe0e}");
+    }
+
+    #[test]
+    fn keeps_plain_text_grouped() {
+        let spans = render_term_span(&run("plain text", 10), 0, true);
+        assert_eq!(spans.len(), 1);
+        assert!(!spans[0].emoji);
+        assert_eq!(spans[0].text.as_str(), "plain text");
+    }
 }
 
 /// True if a terminal span contains any CJK character — ideograph, kana, or
@@ -11008,10 +12786,27 @@ mod key_tests {
     #[test]
     fn ctrl_letter_c0_still_passes() {
         // A real Ctrl+R encoded as the C0 byte 0x12 with ctrl=true must still be
-        // forwarded — the !ctrl guard keeps the #43 fix from breaking it.
+        // forwarded; the #274 fix filters only bare Ctrl/CtrlR markers.
         assert_eq!(key_to_pty_bytes("\u{0012}", true, false, false), vec![0x12]);
         // Ctrl+X as C0 0x18.
         assert_eq!(key_to_pty_bytes("\u{0018}", true, false, false), vec![0x18]);
+    }
+
+    #[test]
+    fn debian_bare_ctrl_markers_do_not_reach_nano() {
+        // Slint on Debian emits these before the actual Ctrl+letter event.
+        assert!(should_drop_debian_bare_ctrl_marker("\u{0011}", true, true));
+        assert!(should_drop_debian_bare_ctrl_marker("\u{0016}", true, true));
+        // Other platforms retain their existing direct-C0 behaviour.
+        assert!(!should_drop_debian_bare_ctrl_marker(
+            "\u{0011}",
+            true,
+            false
+        ));
+        assert!(!should_drop_debian_bare_ctrl_marker("x", true, true));
+        // The following Ctrl+X must still become CAN (0x18), which nano uses
+        // for Exit.
+        assert_eq!(key_to_pty_bytes("x", true, false, false), vec![0x18]);
     }
 
     #[test]
@@ -11056,6 +12851,39 @@ mod key_tests {
         assert_eq!(normalize_pasted_newlines("a\rb"), "a\rb");
         // No newlines → unchanged.
         assert_eq!(normalize_pasted_newlines("echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn paste_uses_remote_bracketed_paste_mode() {
+        assert_eq!(
+            encode_pasted_text("first\r\n  second", true),
+            b"\x1b[200~first\r\n  second\x1b[201~"
+        );
+        assert_eq!(
+            encode_pasted_text("safe\x1b[201~\x03text", true),
+            b"\x1b[200~safe[201~text\x1b[201~"
+        );
+        assert_eq!(
+            encode_pasted_text("first\r\nsecond", false),
+            b"first\rsecond"
+        );
+    }
+
+    #[test]
+    fn long_pastes_switch_to_large_review() {
+        assert!(!paste_requires_large_review("short prompt\nsecond line"));
+        assert!(!paste_requires_large_review(&"a".repeat(600)));
+        assert!(paste_requires_large_review(&"a".repeat(601)));
+        assert!(!paste_requires_large_review(&vec!["line"; 12].join("\r\n")));
+        assert!(paste_requires_large_review(&vec!["line"; 13].join("\r\n")));
+    }
+
+    #[test]
+    fn confirmed_exit_never_reopens_close_prompt() {
+        assert!(should_block_close(false, true));
+        assert!(!should_block_close(false, false));
+        assert!(!should_block_close(true, true));
+        assert!(!should_block_close(true, false));
     }
 }
 
@@ -11161,6 +12989,8 @@ mod selection_tests {
             parser,
             find_query: String::new(),
             is_dark: false,
+            output_highlight: OutputHighlightPreset::Log,
+            custom_highlight_rules: Vec::new(),
             sel_anchor: None,
             sel_focus: None,
             sel_ranges: Vec::new(),
@@ -11173,6 +13003,23 @@ mod selection_tests {
             predictions: std::collections::VecDeque::new(),
             prediction_timeout: std::time::Duration::from_millis(PREDICTION_TIMEOUT_MS),
         }
+    }
+
+    #[test]
+    fn paste_tracks_remote_bracketed_paste_state() {
+        let bufs = TermBuffers::default();
+        let mut buffer = make_buf(2, 20, &[], &[], 0);
+        buffer.parser.process(b"\x1b[?2004h");
+        bufs.lock()
+            .unwrap()
+            .insert("tab".into(), Arc::new(Mutex::new(buffer)));
+
+        assert!(terminal_uses_bracketed_paste(&bufs, "tab"));
+        assert!(!terminal_uses_bracketed_paste(&bufs, "missing"));
+
+        let buffer = term_buf(&bufs, "tab").unwrap();
+        buffer.lock().unwrap().parser.process(b"\x1b[?2004l");
+        assert!(!terminal_uses_bracketed_paste(&bufs, "tab"));
     }
 
     #[test]
@@ -11968,5 +13815,204 @@ mod prediction_tests {
         // (overwriting the predicted 'b').
         assert_eq!(buf.get_char_at(0, 0), 'a');
         assert_eq!(buf.get_char_at(0, 1), 'c');
+    }
+}
+
+#[cfg(test)]
+mod log_highlight_tests {
+    use super::*;
+
+    fn plain_run(text: &str, col: i32) -> HistSpan {
+        HistSpan {
+            text: text.to_string(),
+            fg: vt100::Color::Default,
+            bg: vt100::Color::Default,
+            bold: false,
+            inverse: false,
+            col,
+            cells: text.chars().count() as i32,
+        }
+    }
+
+    fn custom_rule(
+        pattern: &str,
+        regex: bool,
+        case_sensitive: bool,
+        whole_line: bool,
+        color: &str,
+    ) -> CompiledOutputRule {
+        compile_output_rules(&[OutputHighlightRule {
+            pattern: pattern.to_string(),
+            regex,
+            case_sensitive,
+            whole_line,
+            color: color.to_string(),
+            enabled: true,
+        }])
+        .pop()
+        .expect("test rule should compile")
+    }
+
+    #[test]
+    fn highlights_uppercase_level_and_preserves_columns() {
+        let runs = highlight_plain_output(
+            vec![plain_run(
+                "2026-07-14T10:20:30Z ERROR request failed",
+                0,
+            )],
+            OutputHighlightPreset::Log,
+            &[],
+        );
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].text, "ERROR");
+        assert_eq!(runs[1].col, 21);
+        assert_eq!(runs[1].cells, 5);
+        assert!(runs[1].bold);
+        assert!(matches!(runs[1].fg, vt100::Color::Idx(9)));
+        assert_eq!(runs[2].col, 26);
+    }
+
+    #[test]
+    fn highlights_structured_lowercase_level_only() {
+        let json = r#"{"level":"warn","message":"disk nearly full"}"#;
+        let runs = highlight_plain_output(
+            vec![plain_run(json, 4)],
+            OutputHighlightPreset::Log,
+            &[],
+        );
+        let level = runs
+            .iter()
+            .find(|run| run.text == "warn")
+            .expect("structured level should be highlighted");
+        assert!(matches!(level.fg, vt100::Color::Idx(11)));
+
+        assert!(log_level_marker("an error occurred", 96).is_none());
+        assert!(log_level_marker("ERROR_CODE=5", 96).is_none());
+    }
+
+    #[test]
+    fn preserves_existing_ansi_styles() {
+        let mut coloured = plain_run("ERROR", 0);
+        coloured.fg = vt100::Color::Idx(2);
+        let runs = highlight_plain_output(vec![coloured], OutputHighlightPreset::Log, &[]);
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(runs[0].fg, vt100::Color::Idx(2)));
+        assert!(!runs[0].bold);
+    }
+
+    #[test]
+    fn alternate_screen_does_not_add_log_colours() {
+        let mut parser = vt100::Parser::new(3, 30, 0);
+        parser.process(b"\x1b[?1049hERROR");
+        assert!(parser.screen().alternate_screen());
+        let (_plain, runs, _wrapped) = build_row(parser.screen(), 0, 30);
+        let level = runs
+            .iter()
+            .find(|run| run.text.contains("ERROR"))
+            .expect("alternate-screen text should still render");
+        assert!(matches!(level.fg, vt100::Color::Default));
+        assert!(!level.bold);
+    }
+
+    #[test]
+    fn off_preset_leaves_plain_levels_untouched() {
+        let runs = highlight_plain_output(
+            vec![plain_run("ERROR request failed", 0)],
+            OutputHighlightPreset::Off,
+            &[],
+        );
+        assert_eq!(runs.len(), 1);
+        assert!(matches!(runs[0].fg, vt100::Color::Default));
+        assert!(!runs[0].bold);
+    }
+
+    #[test]
+    fn devops_preset_adds_deployment_and_structured_states() {
+        let success = highlight_plain_output(
+            vec![plain_run("deploy SUCCESS", 0)],
+            OutputHighlightPreset::DevOps,
+            &[],
+        );
+        let token = success
+            .iter()
+            .find(|run| run.text == "SUCCESS")
+            .expect("DevOps success should be highlighted");
+        assert!(matches!(token.fg, vt100::Color::Idx(10)));
+
+        let json = highlight_plain_output(
+            vec![plain_run(r#"{"status":"failed"}"#, 0)],
+            OutputHighlightPreset::DevOps,
+            &[],
+        );
+        let token = json
+            .iter()
+            .find(|run| run.text == "failed")
+            .expect("structured DevOps state should be highlighted");
+        assert!(matches!(token.fg, vt100::Color::Idx(9)));
+
+        let conservative = highlight_plain_output(
+            vec![plain_run("deploy SUCCESS", 0)],
+            OutputHighlightPreset::Log,
+            &[],
+        );
+        assert_eq!(conservative.len(), 1);
+    }
+
+    #[test]
+    fn custom_literal_is_case_insensitive_and_overrides_builtin_colour() {
+        let rule = custom_rule("error", false, false, false, "green");
+        let runs = highlight_plain_output(
+            vec![plain_run("ERROR then error", 0)],
+            OutputHighlightPreset::Log,
+            &[rule],
+        );
+        let hits: Vec<_> = runs
+            .iter()
+            .filter(|run| matches!(run.fg, vt100::Color::Idx(10)))
+            .collect();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, "ERROR");
+        assert_eq!(hits[1].text, "error");
+        assert!(!runs.iter().any(|run| matches!(run.fg, vt100::Color::Idx(9))));
+    }
+
+    #[test]
+    fn custom_regex_can_highlight_whole_line_without_overwriting_ansi() {
+        let rule = custom_rule(r"timeout|denied", true, false, true, "magenta");
+        let mut ansi = plain_run(" ANSI", 18);
+        ansi.fg = vt100::Color::Idx(2);
+        let runs = highlight_plain_output(
+            vec![plain_run("request timeout   ", 0), ansi],
+            OutputHighlightPreset::Log,
+            &[rule],
+        );
+        assert!(matches!(runs[0].fg, vt100::Color::Idx(13)));
+        assert!(runs[0].bold);
+        assert!(matches!(runs[1].fg, vt100::Color::Idx(2)));
+    }
+
+    #[test]
+    fn custom_unicode_match_preserves_terminal_grid_columns() {
+        let rule = custom_rule("错误", false, true, false, "red");
+        let text = "前缀错误 done";
+        let mut run = plain_run(text, 0);
+        run.cells = text_cell_width(text);
+        let runs = highlight_plain_output(
+            vec![run],
+            OutputHighlightPreset::Log,
+            &[rule],
+        );
+        let hit = runs
+            .iter()
+            .find(|run| run.text == "错误")
+            .expect("CJK keyword should be highlighted");
+        assert_eq!(hit.col, 4);
+        assert_eq!(hit.cells, 4);
+    }
+
+    #[test]
+    fn invalid_regex_is_rejected_before_persistence() {
+        assert!(validate_output_highlight_rule("([", true, false).is_err());
+        assert!(validate_output_highlight_rule("literal", false, false).is_ok());
     }
 }

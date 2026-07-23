@@ -55,6 +55,10 @@ pub(crate) fn load_session_private_key(session: &Session, pass: &str) -> Result<
     let pass = if pass.is_empty() { None } else { Some(pass) };
     let inline = session.private_key_inline.as_str().trim();
     if !inline.is_empty() {
+        if crate::ppk::is_ppk(inline.as_bytes()) {
+            return crate::ppk::decode_ppk(inline.as_bytes(), pass.unwrap_or_default())
+                .context("failed to parse pasted PuTTY private key");
+        }
         return decode_secret_key(inline, pass).context("failed to parse pasted private key");
     }
 
@@ -71,6 +75,16 @@ pub(crate) fn load_session_private_key(session: &Session, pass: &str) -> Result<
         .strip_suffix(".pub")
         .map(str::to_string)
         .unwrap_or(normalised);
+    if Path::new(&key_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ppk"))
+    {
+        let raw = std::fs::read(&key_path)
+            .with_context(|| format!("failed to read PuTTY key {key_path}"))?;
+        return crate::ppk::decode_ppk(&raw, pass.unwrap_or_default())
+            .with_context(|| format!("failed to load PuTTY key {key_path}"));
+    }
     load_secret_key(Path::new(&key_path), pass)
         .with_context(|| format!("failed to load key {key_path}"))
 }
@@ -317,8 +331,22 @@ pub enum SessionCommand {
     },
     /// Stop a runtime tunnel created for this connected session (#206).
     StopTunnel(String),
+    /// Terminate one remote process on a short-lived exec channel. Supplying a
+    /// password selects the privileged `sudo -S` path; the secret is never
+    /// written to the interactive PTY or shell history.
+    KillProcess {
+        pid: u32,
+        root_password: Option<crate::config::Secret>,
+        reply: tokio::sync::oneshot::Sender<ProcessKillResult>,
+    },
     /// Gracefully disconnect and drop the session.
     Close,
+}
+
+#[derive(Debug)]
+pub struct ProcessKillResult {
+    pub success: bool,
+    pub message: String,
 }
 
 /// Carries the user's answer to a host-key confirmation prompt back to the
@@ -505,12 +533,24 @@ pub enum SessionEvent {
         net: Vec<(String, u64, u64)>,
         /// Per-filesystem (mount_point, available_bytes, total_bytes).
         disks: Vec<(String, u64, u64)>,
+        /// Effective login name reported by the remote host (`id -un`).
+        current_user: String,
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
         /// Per-GPU stats from nvidia-smi. Empty when unavailable.
         gpus: Vec<GpuSnapshot>,
         /// Detailed system information for the detached system-info window.
-        sys: SystemDetails,
+        /// Detailed data is present only for the separately delayed one-shot
+        /// system-information probe; lightweight resource samples leave it None.
+        sys: Option<SystemDetails>,
+    },
+
+    /// Effective user and top-process snapshot from the dedicated lightweight
+    /// process channel. Keeping this separate prevents a slow `df`, `lspci`, or
+    /// other system-information probe from freezing the process window.
+    ProcessStats {
+        current_user: String,
+        procs: Vec<ProcInfo>,
     },
 
     /// A command the user ran in the terminal, captured via the shell hook
@@ -598,8 +638,267 @@ impl SessionHandle {
         let _ = self.commands.send(SessionCommand::StopTunnel(id));
     }
 
+    pub fn kill_process(
+        &self,
+        pid: u32,
+        root_password: Option<crate::config::Secret>,
+    ) -> tokio::sync::oneshot::Receiver<ProcessKillResult> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self.commands.send(SessionCommand::KillProcess {
+            pid,
+            root_password,
+            reply,
+        });
+        rx
+    }
+
     pub fn close(&self) {
         let _ = self.commands.send(SessionCommand::Close);
+    }
+}
+
+async fn kill_remote_process(
+    handle: Arc<Handle<ClientHandler>>,
+    pid: u32,
+    root_password: Option<crate::config::Secret>,
+) -> ProcessKillResult {
+    use zeroize::Zeroize as _;
+
+    let privileged = root_password.is_some();
+    let stage = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let operation_stage = stage.clone();
+    let operation = async move {
+        let started = std::time::Instant::now();
+        tracing::warn!(
+            "[PROC_KILL] pid={pid} privileged={privileged} stage=open-channel begin"
+        );
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .context("open process-control channel")?;
+        operation_stage.store(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "[PROC_KILL] pid={pid} stage=open-channel ok elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        if privileged {
+            // `sudo` authentication is commonly configured by PAM to require a
+            // controlling terminal. Disable echo at the SSH PTY level so the
+            // password can never be reflected into channel output or logs.
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[(russh::Pty::ECHO, 0)])
+                .await
+                .context("request process-control terminal")?;
+            operation_stage.store(2, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "[PROC_KILL] pid={pid} stage=request-pty ok echo=off elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
+        let command = process_kill_command(pid, privileged);
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .context("execute process-control command")?;
+        operation_stage.store(3, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "[PROC_KILL] pid={pid} stage=exec-sudo ok elapsed_ms={} waiting_for_password_prompt={privileged}",
+            started.elapsed().as_millis()
+        );
+        if !privileged {
+            channel.eof().await.context("finish process-control input")?;
+        }
+
+        let mut response = String::new();
+        let mut password_sent = !privileged;
+        let prompt_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let exit_status = loop {
+            let msg = if !password_sent {
+                match tokio::time::timeout_at(prompt_deadline, channel.wait()).await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        tracing::warn!(
+                            "[PROC_KILL] pid={pid} stage=wait-password-prompt timeout; sending password fallback"
+                        );
+                        if let Some(password) = root_password.as_ref() {
+                            let mut input = password.as_str().as_bytes().to_vec();
+                            input.push(b'\r');
+                            let sent = channel.data(&input[..]).await;
+                            input.zeroize();
+                            sent.context("write root password after prompt timeout")?;
+                        }
+                        password_sent = true;
+                        operation_stage.store(5, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            } else {
+                channel.wait().await
+            };
+            let Some(msg) = msg else { break 1 };
+            match msg {
+                // ExitStatus is the authoritative completion result. Some SSH
+                // servers keep a PTY channel open and never promptly follow it
+                // with Close, so waiting beyond this point causes a false timeout.
+                ChannelMsg::ExitStatus { exit_status: status } => {
+                    operation_stage.store(6, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        "[PROC_KILL] pid={pid} stage=exit-status status={status} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    break status;
+                }
+                ChannelMsg::Close => {
+                    tracing::warn!(
+                        "[PROC_KILL] pid={pid} stage=channel-close without-exit-status elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    break 1;
+                }
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    let text = String::from_utf8_lossy(&data);
+                    let safe = process_control_log_text(
+                        &text,
+                        root_password.as_ref().map(|secret| secret.as_str()),
+                    );
+                    if !safe.is_empty() {
+                        tracing::warn!(
+                            "[PROC_KILL] pid={pid} stage=remote-output text={safe:?}"
+                        );
+                    }
+                    if response.len() < 1024 {
+                        response.push_str(&text);
+                        response.truncate(response.len().min(1024));
+                    }
+                    if !password_sent && looks_like_sudo_password_prompt(&text) {
+                        tracing::warn!(
+                            "[PROC_KILL] pid={pid} stage=password-prompt detected; submitting secret"
+                        );
+                        if let Some(password) = root_password.as_ref() {
+                            let mut input = password.as_str().as_bytes().to_vec();
+                            input.push(b'\r');
+                            let sent = channel.data(&input[..]).await;
+                            input.zeroize();
+                            sent.context("write root password after prompt")?;
+                        }
+                        password_sent = true;
+                        operation_stage.store(5, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            "[PROC_KILL] pid={pid} stage=password-submitted elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        );
+                    }
+                }
+                _ => {}
+            }
+        };
+        anyhow::Ok((exit_status, response))
+    };
+
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(15), operation).await {
+        Ok(Ok((0, _))) => ProcessKillResult {
+            success: true,
+            message: format!("{} PID {pid}", t("已发送 SIGTERM：", "SIGTERM sent to")),
+        },
+        Ok(Ok((_, response))) if privileged => ProcessKillResult {
+            success: false,
+            message: process_kill_failure_message(&response, true),
+        },
+        Ok(Ok((_, response))) => ProcessKillResult {
+            success: false,
+            message: process_kill_failure_message(&response, false),
+        },
+        Ok(Err(err)) => ProcessKillResult {
+            success: false,
+            message: format!("{}: {err}", t("结束进程失败", "Failed to terminate process")),
+        },
+        Err(_) => {
+            let stage = process_control_stage_name(
+                stage.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            tracing::warn!("[PROC_KILL] pid={pid} result=timeout stage={stage}");
+            ProcessKillResult {
+                success: false,
+                message: format!(
+                    "{} ({stage})",
+                    t("结束进程超时，诊断已写入 error.log", "Timed out; diagnostics were written to error.log")
+                ),
+            }
+        }
+    };
+    tracing::warn!(
+        "[PROC_KILL] pid={pid} result={} message={:?}",
+        if result.success { "success" } else { "failure" },
+        result.message
+    );
+    result
+}
+
+fn process_control_stage_name(stage: u8) -> &'static str {
+    match stage {
+        0 => "open-channel",
+        1 => "request-pty",
+        2 => "exec-sudo",
+        3 => "wait-password-prompt",
+        5 => "wait-exit-status",
+        6 => "completed",
+        _ => "unknown",
+    }
+}
+
+fn looks_like_sudo_password_prompt(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("password") || lower.contains("密码")
+}
+
+fn process_control_log_text(text: &str, password: Option<&str>) -> String {
+    let mut safe = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if let Some(password) = password.filter(|value| !value.is_empty()) {
+        safe = safe.replace(password, "[REDACTED]");
+    }
+    safe.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(512)
+        .collect()
+}
+
+fn process_kill_failure_message(response: &str, privileged: bool) -> String {
+    let detail = response
+        .replace(['\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !detail.is_empty() {
+        return format!("{}: {detail}", t("结束失败", "Failed to terminate process"));
+    }
+    if privileged {
+        t(
+            "结束失败：服务器未返回具体的 sudo/PAM 错误",
+            "Failed: the server returned no specific sudo/PAM error",
+        )
+        .to_string()
+    } else {
+        t(
+            "结束失败：进程已退出或无权操作",
+            "Failed: the process exited or permission was denied",
+        )
+        .to_string()
+    }
+}
+
+fn process_kill_command(pid: u32, privileged: bool) -> String {
+    if privileged {
+        // `sudo` authenticates the connected account, matching what users run
+        // manually. `su root` instead asks for the root account password, which
+        // is commonly locked even when the user is an authorised sudoer.
+        format!("LC_ALL=C sudo -S -p 'Password:' -- kill -TERM {pid}")
+    } else {
+        format!("kill -TERM {pid}")
     }
 }
 
@@ -1029,6 +1328,64 @@ pub(crate) const COMPAT_CIPHER: &[russh::cipher::Name] = &[
     russh::cipher::TRIPLE_DES_CBC, // legacy fallback
 ];
 
+fn ssh_client_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        // Keep idle connections alive (#160). The terminal usually has the
+        // resource-monitor channel streaming every 2 s, but with shell
+        // integration disabled (#140) it can go idle and be dropped by
+        // NAT / firewall / server timeouts.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        // Match the normal terminal connection exactly, including compatibility
+        // fallbacks for older servers and network equipment (#172).
+        preferred: russh::Preferred {
+            kex: std::borrow::Cow::Borrowed(COMPAT_KEX),
+            cipher: std::borrow::Cow::Borrowed(COMPAT_CIPHER),
+            ..russh::Preferred::DEFAULT
+        },
+        ..<_>::default()
+    })
+}
+
+/// Perform the same SSH handshake and authentication as a real terminal
+/// connection, but disconnect immediately after authentication succeeds.
+/// Prompt events are returned through `events` so the session dialog can reuse
+/// the normal host-key, missing-credential, and MFA UI (#276).
+pub async fn test_session_auth(
+    session: Session,
+    jump: Option<Session>,
+    events: UnboundedSender<SessionEvent>,
+) -> Result<()> {
+    let config = ssh_client_config();
+    let (mut handle, mut jump_handle) =
+        connect_ssh(&session, jump.as_ref(), config.clone(), &events).await?;
+
+    let auth = authenticate_session(
+        &mut handle,
+        &mut jump_handle,
+        &session,
+        jump.as_ref(),
+        config,
+        &events,
+    )
+    .await?;
+
+    let result = match auth {
+        AuthResult::Success => Ok(()),
+        AuthResult::Cancelled => Err(anyhow!("login cancelled")),
+        AuthResult::Failed => Err(anyhow!("authentication failed")),
+    };
+
+    let _ = handle
+        .disconnect(Disconnect::ByApplication, "connection test complete", "")
+        .await;
+    if let Some(jump_handle) = jump_handle {
+        let _ = jump_handle
+            .disconnect(Disconnect::ByApplication, "connection test complete", "")
+            .await;
+    }
+    result
+}
+
 async fn run_session(
     session: Session,
     jump: Option<Session>,
@@ -1037,6 +1394,7 @@ async fn run_session(
     initial_cols: u32,
     initial_rows: u32,
 ) -> Result<()> {
+    let session_started = std::time::Instant::now();
     let _ = events.send(SessionEvent::Status(format!(
         "{} {}@{}:{} ...",
         t("连接中", "Connecting"),
@@ -1045,27 +1403,15 @@ async fn run_session(
         session.port
     )));
 
-    let config = Arc::new(client::Config {
-        // Keep idle connections alive (#160). The terminal usually has the
-        // resource-monitor channel streaming every 2 s, but with shell
-        // integration disabled (#140) it can go idle and be dropped by
-        // NAT / firewall / server timeouts. A 30 s keepalive prevents that;
-        // keepalive_max (default 3) closes a genuinely dead connection.
-        keepalive_interval: Some(std::time::Duration::from_secs(30)),
-        // Offer legacy KEX (group14/group1-sha1) and CBC ciphers as fallbacks so
-        // old servers / network gear negotiate instead of failing with
-        // "No common algorithm" (#172). Modern algorithms stay first, so a capable
-        // server still picks a strong one.
-        preferred: russh::Preferred {
-            kex: std::borrow::Cow::Borrowed(COMPAT_KEX),
-            cipher: std::borrow::Cow::Borrowed(COMPAT_CIPHER),
-            ..russh::Preferred::DEFAULT
-        },
-        ..<_>::default()
-    });
+    let config = ssh_client_config();
 
     let (mut handle, mut jump_handle) =
         connect_ssh(&session, jump.as_ref(), config.clone(), &events).await?;
+    tracing::info!(
+        "[SESSION_START] id={} stage=transport-ready elapsed_ms={}",
+        session.id,
+        session_started.elapsed().as_millis()
+    );
 
     // --- Auth (shared with SFTP + jump-host paths) ---------------------
     // Try plain `password` first, then `keyboard-interactive` on a fresh handle —
@@ -1106,6 +1452,11 @@ async fn run_session(
             return Ok(());
         }
     };
+    tracing::info!(
+        "[SESSION_START] id={} stage=authenticated elapsed_ms={}",
+        session.id,
+        session_started.elapsed().as_millis()
+    );
 
     // Keep the jump-host connection alive for the whole session — the direct-tcpip
     // tunnel that carries this session rides on it (#211).
@@ -1130,6 +1481,12 @@ async fn run_session(
         .await
         .context("request PTY")?;
     channel.request_shell(true).await.context("request shell")?;
+
+    tracing::info!(
+        "[SESSION_START] id={} stage=terminal-ready elapsed_ms={}",
+        session.id,
+        session_started.elapsed().as_millis()
+    );
 
     let _ = events.send(SessionEvent::Connected);
     let _ = events.send(SessionEvent::Status(format!(
@@ -1209,32 +1566,29 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __GPU__; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __SYS__; { . /etc/os-release 2>/dev/null; echo OS=${PRETTY_NAME:-$(uname -o 2>/dev/null)}; }; echo KERNEL=$(uname -s 2>/dev/null); echo KERNEL_RELEASE=$(uname -r 2>/dev/null); echo ARCH=$(uname -m 2>/dev/null); echo HOSTNAME=$(hostname 2>/dev/null); echo IPS=$(hostname -I 2>/dev/null); echo UPTIME=$(uptime -p 2>/dev/null); echo LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null); awk -F: '/model name|Hardware/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_MODEL=\"$2; exit}' /proc/cpuinfo 2>/dev/null; echo CPU_CORES=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null); awk -F: '/cache size/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_CACHE=\"$2; exit}' /proc/cpuinfo 2>/dev/null; awk -F: '/bogomips/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_BOGO=\"$2; exit}' /proc/cpuinfo 2>/dev/null; lspci 2>/dev/null | awk -F': ' '/VGA|3D|Display/{print \"GPU=\" $2; exit}'; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __MSTICK__; sleep 2; done\n";
+    // Detailed system information is intentionally one-shot and last priority.
+    // It includes commands such as lspci/hostname that may be slow on some hosts
+    // and must never delay either the terminal or the lightweight sidebar sample.
+    const SYS_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __PS__; ps -eo pid,user,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __GPU__; nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __SYS__; { . /etc/os-release 2>/dev/null; echo OS=${PRETTY_NAME:-$(uname -o 2>/dev/null)}; }; echo KERNEL=$(uname -s 2>/dev/null); echo KERNEL_RELEASE=$(uname -r 2>/dev/null); echo ARCH=$(uname -m 2>/dev/null); echo HOSTNAME=$(hostname 2>/dev/null); echo IPS=$(hostname -I 2>/dev/null); echo UPTIME=$(uptime -p 2>/dev/null); echo LOAD=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null); awk -F: '/model name|Hardware/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_MODEL=\"$2; exit}' /proc/cpuinfo 2>/dev/null; echo CPU_CORES=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null); awk -F: '/cache size/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_CACHE=\"$2; exit}' /proc/cpuinfo 2>/dev/null; awk -F: '/bogomips/{gsub(/^[ \\t]+/,\"\",$2); print \"CPU_BOGO=\"$2; exit}' /proc/cpuinfo 2>/dev/null; lspci 2>/dev/null | awk -F': ' '/VGA|3D|Display/{print \"GPU=\" $2; exit}'; echo __MSTICK__\n";
     // Skip the resource monitor entirely when shell integration is off (a
     // non-POSIX / Windows server) — the /proc-based loop only spews errors there
     // (#140).
-    let mut mon_channel = if session.disable_shell_integration {
-        None
-    } else {
-        match handle.channel_open_session().await {
-            Ok(ch) => match ch.exec(true, MON_CMD).await {
-                Ok(()) => Some(ch),
-                Err(e) => {
-                    tracing::warn!("monitor exec failed: {e}");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("monitor channel open failed: {e}");
-                None
-            }
-        }
-    };
+    let mut mon_channel: Option<Channel<Msg>> = None;
     let mut mon_buf = String::new();
+    let mut sys_buf = String::new();
     let mut prev_cpu: Option<(u64, u64)> = None; // (total jiffies, idle jiffies)
     let mut prev_net: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new(); // iface -> (rx_bytes, tx_bytes)
     let mut prev_net_at = std::time::Instant::now();
+
+    // Process sampling has its own channel. The broader resource command above
+    // includes probes such as `df` which can block indefinitely on a stale NFS
+    // mount; that must not leave dead PIDs frozen in the process window.
+    const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; ps -eo pid,user:32,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __PSTICK__; sleep 2; done\n";
+    let mut proc_channel: Option<Channel<Msg>> = None;
+    let mut sys_channel: Option<Channel<Msg>> = None;
+    let mut proc_buf = String::new();
 
     // --- Port forwarding / tunnels (#56) --------------------------------
     // Remote (-R) first, while we still hold `handle` mutably (tcpip_forward
@@ -1285,6 +1639,77 @@ async fn run_session(
         }
     }
     let handle = Arc::new(handle);
+
+    // Auxiliary channels are deliberately outside the terminal-ready critical
+    // path. SFTP gets the first opportunity after Connected; lightweight
+    // resources follow, and process/system enrichment starts last.
+    let (mon_ready_tx, mut mon_ready_rx) = tokio::sync::oneshot::channel();
+    let (proc_ready_tx, mut proc_ready_rx) = tokio::sync::oneshot::channel();
+    let (sys_ready_tx, mut sys_ready_rx) = tokio::sync::oneshot::channel();
+    if session.disable_shell_integration {
+        let _ = mon_ready_tx.send(None);
+        let _ = proc_ready_tx.send(None);
+        let _ = sys_ready_tx.send(None);
+    } else {
+        let mon_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+            let channel = match mon_handle.channel_open_session().await {
+                Ok(ch) => match ch.exec(true, MON_CMD).await {
+                    Ok(()) => Some(ch),
+                    Err(error) => {
+                        tracing::warn!("monitor exec failed: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("monitor channel open failed: {error}");
+                    None
+                }
+            };
+            let _ = mon_ready_tx.send(channel);
+        });
+        let proc_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let channel = match proc_handle.channel_open_session().await {
+                Ok(ch) => match ch.exec(true, PROC_CMD).await {
+                    Ok(()) => Some(ch),
+                    Err(error) => {
+                        tracing::warn!("process monitor exec failed: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("process monitor channel open failed: {error}");
+                    None
+                }
+            };
+            let _ = proc_ready_tx.send(channel);
+        });
+        let sys_handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+            let channel = match sys_handle.channel_open_session().await {
+                Ok(ch) => match ch.exec(true, SYS_CMD).await {
+                    Ok(()) => Some(ch),
+                    Err(error) => {
+                        tracing::warn!("system-info exec failed: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!("system-info channel open failed: {error}");
+                    None
+                }
+            };
+            let _ = sys_ready_tx.send(channel);
+        });
+    }
+    let mut mon_start_pending = true;
+    let mut proc_start_pending = true;
+    let mut sys_start_pending = true;
+    let mut first_terminal_output = true;
     // Local (-L) and dynamic (-D) listen client-side; their tasks are aborted
     // on session exit.
     for (idx, f) in session.forwards.iter().enumerate() {
@@ -1304,6 +1729,33 @@ async fn run_session(
     // --- Main pump ------------------------------------------------------
     loop {
         tokio::select! {
+            ready = &mut mon_ready_rx, if mon_start_pending => {
+                mon_start_pending = false;
+                mon_channel = ready.unwrap_or(None);
+                tracing::debug!(
+                    "[SESSION_START] id={} stage=resources-started elapsed_ms={}",
+                    session.id,
+                    session_started.elapsed().as_millis()
+                );
+            }
+            ready = &mut proc_ready_rx, if proc_start_pending => {
+                proc_start_pending = false;
+                proc_channel = ready.unwrap_or(None);
+                tracing::debug!(
+                    "[SESSION_START] id={} stage=process-monitor-started elapsed_ms={}",
+                    session.id,
+                    session_started.elapsed().as_millis()
+                );
+            }
+            ready = &mut sys_ready_rx, if sys_start_pending => {
+                sys_start_pending = false;
+                sys_channel = ready.unwrap_or(None);
+                tracing::debug!(
+                    "[SESSION_START] id={} stage=system-info-started elapsed_ms={}",
+                    session.id,
+                    session_started.elapsed().as_millis()
+                );
+            }
             cmd = commands.recv() => {
                 match cmd {
                     Some(SessionCommand::RawInput(bytes)) => {
@@ -1346,6 +1798,13 @@ async fn run_session(
                             };
                             emit_tunnel_update(&runtime_forwards, &events);
                         }
+                    }
+                    Some(SessionCommand::KillProcess { pid, root_password, reply }) => {
+                        let exec_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let result = kill_remote_process(exec_handle, pid, root_password).await;
+                            let _ = reply.send(result);
+                        });
                     }
                     Some(SessionCommand::Close) | None => {
                         let _ = channel.eof().await;
@@ -1415,6 +1874,15 @@ async fn run_session(
 
                         let chunk = String::from_utf8_lossy(&data).into_owned();
 
+                        if first_terminal_output {
+                            first_terminal_output = false;
+                            tracing::info!(
+                                "[SESSION_START] id={} stage=first-terminal-output elapsed_ms={}",
+                                session.id,
+                                session_started.elapsed().as_millis()
+                            );
+                        }
+
                         // Inject PROMPT_COMMAND after the first real shell output,
                         // unless shell integration is disabled for this session
                         // (e.g. a Windows pwsh/cmd server) (#140).
@@ -1435,9 +1903,13 @@ async fn run_session(
                                 tokio::time::Instant::now()
                                     + std::time::Duration::from_millis(2000),
                             );
+                            // Paint the banner/prompt immediately. Only later
+                            // output containing our injected setup command is
+                            // buffered and stripped; the first usable terminal
+                            // frame no longer waits for shell integration.
+                            let _ = events.send(SessionEvent::Output(chunk));
                             let _ = channel.data(prompt_setup.as_bytes()).await;
-                            // Fall through: this chunk is buffered below so the
-                            // echoed setup line is stripped as a single piece.
+                            continue;
                         }
 
                         // While suppressing, buffer output until our echoed setup
@@ -1558,6 +2030,67 @@ async fn run_session(
                     _ => {}
                 }
             }
+            sys = async {
+                match sys_channel.as_mut() {
+                    Some(ch) => ch.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match sys {
+                    Some(ChannelMsg::Data { data }) => {
+                        sys_buf.push_str(&String::from_utf8_lossy(&data));
+                        if let Some(idx) = sys_buf.find("__MSTICK__") {
+                            let block = sys_buf[..idx].to_string();
+                            let mut detail_cpu = None;
+                            let mut detail_net = std::collections::HashMap::new();
+                            let mut detail_at = std::time::Instant::now();
+                            if let Some(details) = parse_monitor_block(
+                                &block,
+                                &mut detail_cpu,
+                                &mut detail_net,
+                                &mut detail_at,
+                            ) {
+                                let _ = events.send(details);
+                            }
+                            sys_buf.clear();
+                            sys_channel = None;
+                        }
+                    }
+                    Some(ChannelMsg::Close) | None => {
+                        sys_channel = None;
+                    }
+                    _ => {}
+                }
+            }
+            proc_msg = async {
+                match proc_channel.as_mut() {
+                    Some(ch) => ch.wait().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match proc_msg {
+                    Some(ChannelMsg::Data { data }) => {
+                        proc_buf.push_str(&String::from_utf8_lossy(&data));
+                        while let Some(idx) = proc_buf.find("__PSTICK__") {
+                            let block = proc_buf[..idx].to_string();
+                            proc_buf = proc_buf[idx + "__PSTICK__".len()..]
+                                .trim_start_matches(['\r', '\n'])
+                                .to_string();
+                            let (current_user, procs) = parse_process_block(&block);
+                            let _ = events.send(SessionEvent::ProcessStats {
+                                current_user,
+                                procs,
+                            });
+                        }
+                        const PROC_BUF_CAP: usize = 1 << 18;
+                        if proc_buf.len() > PROC_BUF_CAP {
+                            proc_buf.clear();
+                        }
+                    }
+                    Some(ChannelMsg::Close) | None => proc_channel = None,
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -1577,6 +2110,34 @@ async fn run_session(
         t("连接已关闭", "connection closed").into(),
     ));
     Ok(())
+}
+
+fn parse_process_block(block: &str) -> (String, Vec<ProcInfo>) {
+    const MAX_PROCESS_ENTRIES: usize = 64;
+    enum Section {
+        None,
+        User,
+        Processes,
+    }
+    let mut section = Section::None;
+    let mut current_user = String::new();
+    let mut procs = Vec::new();
+    for line in block.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        match line {
+            "__ME__" => section = Section::User,
+            "__PS__" => section = Section::Processes,
+            _ => match section {
+                Section::User if current_user.is_empty() => current_user = line.to_string(),
+                Section::Processes if procs.len() < MAX_PROCESS_ENTRIES => {
+                    if let Some(process) = parse_ps_line(line) {
+                        procs.push(process);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    (current_user, procs)
 }
 
 /// Parse one monitor sample (a block of `/proc/stat` cpu line + `/proc/meminfo`
@@ -1614,12 +2175,14 @@ fn parse_monitor_block(
     // Processes from `ps` (#23): top-by-CPU rows.
     let mut procs: Vec<ProcInfo> = Vec::new();
     let mut gpus: Vec<GpuSnapshot> = Vec::new();
+    let mut current_user = String::new();
     let mut sys_kv: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // The sample is split into sections by `echo` markers; everything before the
     // first marker is the cpu/mem/net block.
     enum Section {
         Top,
         Df,
+        Me,
         Ps,
         Gpu,
         Sys,
@@ -1642,6 +2205,9 @@ fn parse_monitor_block(
         }
         if line == "__GPU__" {
             section = Section::Gpu;
+        }
+        if line == "__ME__" {
+            section = Section::Me;
             continue;
         }
         if line == "__SYS__" {
@@ -1687,6 +2253,9 @@ fn parse_monitor_block(
                             });
                         }
                     }
+            Section::Me => {
+                if current_user.is_empty() {
+                    current_user = line.trim().chars().take(64).collect();
                 }
                 continue;
             }
@@ -1777,18 +2346,20 @@ fn parse_monitor_block(
         return None;
     }
 
-    let sys = build_system_details(
-        &sys_kv,
-        &cpu_nums,
-        mem_total,
-        mem_avail,
-        mem_buffers,
-        mem_cached,
-        swap_total,
-        swap_free,
-        &net_counters,
-        &disks,
-    );
+    let sys = (!sys_kv.is_empty()).then(|| {
+        build_system_details(
+            &sys_kv,
+            &cpu_nums,
+            mem_total,
+            mem_avail,
+            mem_buffers,
+            mem_cached,
+            swap_total,
+            swap_free,
+            &net_counters,
+            &disks,
+        )
+    });
 
     Some(SessionEvent::ResourceStats {
         cpu_percent,
@@ -1798,6 +2369,7 @@ fn parse_monitor_block(
         swap_total_kib: swap_total,
         net,
         disks,
+        current_user,
         procs,
         gpus,
         sys,
@@ -2370,7 +2942,7 @@ mod osc_command_tests {
 
 #[cfg(test)]
 mod monitor_hardening_tests {
-    use super::{parse_df_line, parse_monitor_block};
+    use super::{parse_df_line, parse_monitor_block, parse_process_block};
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -2425,6 +2997,100 @@ mod monitor_hardening_tests {
         assert_eq!(gpus[0].vram_used_mib, 2048);
         assert_eq!(gpus[1].index, 1);
         assert_eq!(gpus[1].gpu_percent, 0.0);
+    }
+
+    #[test]
+    fn monitor_reports_effective_user_for_ownership_checks() {
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n__ME__\nalice\n__PS__\n10 alice 1.0 2.0 sleep 30";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { current_user, procs, .. } => {
+                assert_eq!(current_user, "alice");
+                assert_eq!(procs[0].user, "alice");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lightweight_resource_sample_does_not_replace_system_details() {
+        let block = "cpu 1 2 3 4\nMemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { sys, .. } => assert!(sys.is_none()),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delayed_system_sample_carries_detailed_information() {
+        let block = "cpu 1 2 3 4\nMemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n__SYS__\nOS=Debian GNU/Linux 12\nKERNEL=Linux\n";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { sys, .. } => {
+                let sys = sys.expect("delayed sample should include details");
+                assert!(sys.overview.iter().any(|(_, value)| value == "Debian GNU/Linux 12"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dedicated_process_block_reports_user_and_rows() {
+        let (user, procs) = parse_process_block(
+            "__ME__\nalice\n__PS__\nPID USER %CPU %MEM COMMAND\n42 root 3.5 1.2 java -jar demo.jar\n",
+        );
+        assert_eq!(user, "alice");
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].pid, 42);
+        assert_eq!(procs[0].user, "root");
+        assert_eq!(procs[0].command, "java -jar demo.jar");
+    }
+}
+
+#[cfg(test)]
+mod process_control_tests {
+    use super::{
+        looks_like_sudo_password_prompt, process_control_log_text, process_kill_command,
+    };
+
+    #[test]
+    fn own_process_uses_plain_term_signal() {
+        assert_eq!(process_kill_command(4242, false), "kill -TERM 4242");
+    }
+
+    #[test]
+    fn privileged_process_uses_root_su_without_embedding_password() {
+        assert_eq!(
+            process_kill_command(4242, true),
+            "LC_ALL=C sudo -S -p 'Password:' -- kill -TERM 4242"
+        );
+    }
+
+    #[test]
+    fn recognizes_su_password_prompt() {
+        assert!(looks_like_sudo_password_prompt("Password: "));
+        assert!(looks_like_sudo_password_prompt("请输入密码："));
+        assert!(!looks_like_sudo_password_prompt("Authentication failure"));
+    }
+
+    #[test]
+    fn diagnostic_output_redacts_password_and_controls() {
+        let safe = process_control_log_text("Password:\r\nsecret-value\x1b[0m", Some("secret-value"));
+        assert!(!safe.contains("secret-value"));
+        assert!(safe.contains("[REDACTED]"));
+        assert!(!safe.contains('\r'));
+        assert!(!safe.contains('\n'));
+>>>>>>> upstream/main
     }
 }
 

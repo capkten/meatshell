@@ -180,6 +180,12 @@ async fn run_local(
                 });
             }
             SessionCommand::AddTunnel { .. } | SessionCommand::StopTunnel(_) => {}
+            SessionCommand::KillProcess { reply, .. } => {
+                let _ = reply.send(crate::ssh::ProcessKillResult {
+                    success: false,
+                    message: t("本地终端不支持远程进程操作", "Remote process control is unavailable for local terminals").into(),
+                });
+            }
             SessionCommand::Close => {
                 exit_state.request_exit();
                 break;
