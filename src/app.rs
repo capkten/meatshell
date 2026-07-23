@@ -10014,8 +10014,11 @@ impl TermBuffer {
     /// and nothing is lost.  (Splitting only on `\n` is safe: VT escape
     /// sequences never contain a newline.)
     fn ingest(&mut self, input: &[u8]) {
-        // 处理服务器echo，匹配/修正预测
-        self.process_server_echo(input);
+        // 处理服务器echo，匹配/修正预测。  Returns how many leading bytes
+        // were consumed (matched / corrected / expired) and must NOT be
+        // re-processed by feed_batched, because apply_prediction already
+        // applied them to the vt100 screen.
+        let consumed = self.process_server_echo(input);
 
         // Rewrite HVP (`ESC [ … f`) → CUP (`ESC [ … H`) so vt100 (which only
         // implements `H`) honours btop/htop's absolute cursor positioning.
@@ -10024,7 +10027,9 @@ impl TermBuffer {
         // the new width and reflow already-printed output (#169).
         self.raw.extend(bytes.iter().copied());
         self.cap_raw();
-        self.feed_batched(&bytes);
+        // Skip bytes that were already applied to the screen by predictions.
+        let feed_start = consumed.min(bytes.len());
+        self.feed_batched(&bytes[feed_start..]);
     }
 
     /// Feed a (already HVP-rewritten) byte slice to vt100 in newline-bounded
@@ -10297,9 +10302,7 @@ impl TermBuffer {
 
         let deleted_char = match &action {
             PredictionAction::Insert(_ch) => {
-                // 在光标位置插入字符，光标右移
-                // vt100 parser 不支持直接插入，只记录预测，
-                // 实际显示更新在 render 时处理
+                // deleted_char is None for insert; actual screen update below
                 None
             }
             PredictionAction::Backspace => {
@@ -10323,6 +10326,27 @@ impl TermBuffer {
                 None
             }
         };
+
+        // Apply prediction to the vt100 parser screen so the user sees
+        // immediate visual feedback (local echo).
+        match &action {
+            PredictionAction::Insert(ch) => {
+                self.parser.process(ch.to_string().as_bytes());
+            }
+            PredictionAction::Backspace => {
+                // VT100 BS moves cursor left but does not erase the cell.
+                self.parser.process(b"\x08");
+            }
+            PredictionAction::MoveCursor(dir) => {
+                let seq: &[u8] = match dir {
+                    Direction::Up => b"\x1b[A",
+                    Direction::Down => b"\x1b[B",
+                    Direction::Left => b"\x1b[D",
+                    Direction::Right => b"\x1b[C",
+                };
+                self.parser.process(seq);
+            }
+        }
 
         // 记录预测条目
         let prediction = Prediction {
@@ -10380,32 +10404,45 @@ impl TermBuffer {
         }
     }
 
-    /// 处理服务器echo，匹配/修正预测
-    fn process_server_echo(&mut self, bytes: &[u8]) {
+    /// 处理服务器echo，匹配/修正预测。
+    ///
+    /// Returns the number of **input bytes** that were consumed by predictions
+    /// (matched, corrected, or expired). The caller must skip those bytes when
+    /// feeding the same input to `feed_batched`, because `apply_prediction`
+    /// already applied them to the vt100 screen.
+    fn process_server_echo(&mut self, bytes: &[u8]) -> usize {
         // 先检查超时
         self.check_prediction_timeouts();
 
         // 将bytes解析为字符
         let text = String::from_utf8_lossy(bytes);
+        let mut consumed_bytes = 0usize;
 
         for ch in text.chars() {
             if let Some(pred) = self.predictions.front() {
                 if pred.expired {
-                    // 已过期，移除预测，字符由 feed_batched 统一送入 parser
+                    // 已过期，移除预测。  The prediction was already applied to
+                    // the screen by `apply_prediction`, so skip this byte to
+                    // avoid double-processing in `feed_batched`.
                     self.predictions.pop_front();
+                    consumed_bytes += ch.len_utf8();
                 } else if self.match_prediction(pred, ch) {
-                    // 匹配成功，移除预测，字符由 feed_batched 统一送入 parser
+                    // 匹配成功，移除预测。  Already on screen → skip.
                     self.predictions.pop_front();
+                    consumed_bytes += ch.len_utf8();
                 } else {
                     // 不匹配，用服务器数据修正（correct_prediction 内部
-                    // 会调用 apply_char_to_screen / overwrite_char_at 来修正覆盖层）
+                    // 会调用 overwrite_char_at 来修正覆盖层）→ skip.
                     let pred = self.predictions.pop_front().unwrap();
                     self.correct_prediction(&pred, ch);
+                    consumed_bytes += ch.len_utf8();
                 }
             } else {
-                // 没有预测，字符由 feed_batched 统一送入 parser
+                // 没有预测，剩余字节由 feed_batched 统一送入 parser
+                break;
             }
         }
+        consumed_bytes
     }
 
     /// 检查服务器字符是否匹配预测
@@ -11497,14 +11534,14 @@ mod prediction_tests {
             &buf.predictions[2].action,
             PredictionAction::Backspace
         ));
-        // All predictions record the same cursor position (0, 2) because
-        // apply_prediction only records — it does not move the vt100 cursor.
-        // The actual screen update happens during rendering (future task).
+        // Each prediction records the cursor position *before* it was applied
+        // and then moves the parser cursor, so positions are sequential.
         assert_eq!(buf.predictions[0].position, (0, 2));
-        assert_eq!(buf.predictions[1].position, (0, 2));
-        assert_eq!(buf.predictions[2].position, (0, 2));
-        // Backspace at (0, 2) deletes the char at col 1 = 'b'.
-        assert_eq!(buf.predictions[2].deleted_char, Some('b'));
+        assert_eq!(buf.predictions[1].position, (0, 3));
+        assert_eq!(buf.predictions[2].position, (0, 4));
+        // Backspace at (0, 4) deletes the char at col 3 = 'd' (inserted by
+        // the previous prediction).
+        assert_eq!(buf.predictions[2].deleted_char, Some('d'));
     }
 
     // ---- check_prediction_timeouts ----
@@ -11757,13 +11794,16 @@ mod prediction_tests {
     fn echo_matching_insert_removes_prediction_and_skips_parser() {
         let mut buf = buf_with(b"hello");
         buf.apply_prediction(PredictionAction::Insert('x'));
+        // After C1, 'x' is already on screen at (0,5) and cursor moved to (0,6).
         // Server echoes 'x' — matches the prediction.
-        buf.process_server_echo(b"x");
+        let consumed = buf.process_server_echo(b"x");
         assert!(buf.predictions.is_empty(), "prediction should be consumed");
-        // process_server_echo only consumes the prediction; matching chars
-        // are NOT fed to the parser (feed_batched handles that in ingest).
+        assert_eq!(consumed, 1, "matched byte is consumed");
+        // The prediction already placed 'x' at (0,5); in real ingest(),
+        // feed_batched would receive an empty slice so no double-processing.
         assert_eq!(buf.get_char_at(0, 0), 'h');
         assert_eq!(buf.get_char_at(0, 4), 'o');
+        assert_eq!(buf.get_char_at(0, 5), 'x');
     }
 
     #[test]
@@ -11778,18 +11818,21 @@ mod prediction_tests {
     }
 
     #[test]
-    fn echo_expired_prediction_applies_char_normally() {
+    fn echo_expired_prediction_consumes_byte_to_avoid_double_processing() {
         let mut buf = buf_with(b"hello");
         buf.apply_prediction(PredictionAction::Insert('x'));
+        // After C1, 'x' is on screen at (0,5), cursor at (0,6).
         // Force-expire the prediction.
         buf.predictions[0].expired = true;
-        buf.process_server_echo(b"z");
+        let consumed = buf.process_server_echo(b"z");
         assert!(buf.predictions.is_empty());
-        // process_server_echo only consumes the expired prediction; the
-        // character is applied later by feed_batched in the real ingest path.
-        buf.feed_batched(b"z");
-        // 'z' should be applied to screen normally at cursor.
-        assert_eq!(buf.get_char_at(0, 5), 'z');
+        // Expired predictions still consume the byte because apply_prediction
+        // already modified the screen — letting feed_batched re-process would
+        // double the character.
+        assert_eq!(consumed, 1);
+        // In real ingest(), feed_batched receives an empty slice.
+        // The prediction's 'x' stays on screen at (0,5).
+        assert_eq!(buf.get_char_at(0, 5), 'x');
     }
 
     #[test]
@@ -11839,16 +11882,15 @@ mod prediction_tests {
         let mut buf = buf_with(b"");
         buf.apply_prediction(PredictionAction::Insert('a'));
         buf.apply_prediction(PredictionAction::Insert('b'));
+        // After C1: screen "ab", cursor at (0,2).
         // Server echoes 'a' (match) then 'c' (mismatch for 'b').
-        buf.process_server_echo(b"ac");
+        let consumed = buf.process_server_echo(b"ac");
         assert!(buf.predictions.is_empty());
-        // 'a' was matched — consumed by process_server_echo without applying
-        // to the parser (process_server_echo only does prediction bookkeeping;
-        // feed_batched applies chars to the parser in the real ingest path).
-        // Both predictions recorded position (0,0) because apply_prediction
-        // doesn't move the parser cursor.
-        // 'c' corrects the second prediction via overwrite_char_at(0,0).
-        // So only 'c' appears in the parser state at (0,0).
-        assert_eq!(buf.get_char_at(0, 0), 'c');
+        assert_eq!(consumed, 2, "both bytes consumed by predictions");
+        // 'a' was matched — the prediction already placed it at (0,0).
+        // 'c' corrects the second prediction via overwrite_char_at((0,1), 'c')
+        // (overwriting the predicted 'b').
+        assert_eq!(buf.get_char_at(0, 0), 'a');
+        assert_eq!(buf.get_char_at(0, 1), 'c');
     }
 }
