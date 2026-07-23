@@ -3490,7 +3490,7 @@ fn session_from_draft(
         flow_control: draft.flow_control.to_string(),
         forwards,
         disable_shell_integration: draft.disable_shell_integration,
-        notes: draft.note.to_string(),
+        notes: draft.notes.to_string(),
         jump_session_id: draft.jump_session_id.to_string(),
     }
 }

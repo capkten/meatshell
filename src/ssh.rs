@@ -2253,6 +2253,9 @@ fn parse_monitor_block(
                             });
                         }
                     }
+                }
+                continue;
+            }
             Section::Me => {
                 if current_user.is_empty() {
                     current_user = line.trim().chars().take(64).collect();
@@ -3090,7 +3093,6 @@ mod process_control_tests {
         assert!(safe.contains("[REDACTED]"));
         assert!(!safe.contains('\r'));
         assert!(!safe.contains('\n'));
->>>>>>> upstream/main
     }
 }
 
