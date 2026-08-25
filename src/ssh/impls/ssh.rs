@@ -1468,15 +1468,14 @@ async fn run_session(
     // Reset PATH to the standard system directories first (#27): the monitor
     // runs over an exec channel, so a server with a hijacked PATH (or a
     // BASH_ENV pointing at a malicious file) could otherwise shadow awk/cat/df/
-    // sleep with arbitrary binaries. A fixed PATH covering /usr/bin and /bin is
-    // more portable than hardcoding one absolute path per tool (their location
-    // differs across distros). Monitoring is best-effort, so even if this shell
-    // is unusual and the reset finds nothing, only the sidebar stats are lost.
+    // sleep with arbitrary binaries. The accelerator tools are also installed
+    // outside the standard PATH on common Ascend hosts, so include only their
+    // known system locations rather than inheriting the interactive shell PATH.
     // The `ps` section feeds the process monitor (#23): top-40 by CPU, columns
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __NPU__; npu-smi info 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/usr/local/bin:/usr/local/Ascend/driver/tools:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __NPU__; (npu-smi info || /usr/local/Ascend/driver/tools/npu-smi info || /usr/local/bin/npu-smi info) 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
     // Detailed system information is intentionally one-shot and last priority.
     // It includes commands such as lspci/hostname that may be slow on some hosts
     // and must never delay either the terminal or the lightweight sidebar sample.
