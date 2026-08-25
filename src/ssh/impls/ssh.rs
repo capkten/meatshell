@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{AuthMethod, PortForward, Session};
 use crate::i18n::t;
+use crate::resource::GpuSnapshot;
 
 use super::structs::*;
 
@@ -2037,6 +2038,8 @@ fn parse_monitor_block(
     let mut seen_fs: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     // Processes from `ps` (#23): top-by-CPU rows.
     let mut procs: Vec<ProcInfo> = Vec::new();
+    // GPU stats from the remote nvidia-smi monitor section.
+    let mut gpus: Vec<GpuSnapshot> = Vec::new();
     let mut current_user = String::new();
     let mut sys_kv: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // The sample is split into sections by `echo` markers; everything before the
@@ -2112,8 +2115,22 @@ fn parse_monitor_block(
                 continue;
             }
             Section::Gpu => {
-                if !line.trim().is_empty() && !sys_kv.contains_key("GPU") {
-                    sys_kv.insert("GPU".to_string(), line.trim().chars().take(256).collect());
+                if gpus.len() < MAX_MON_ENTRIES {
+                    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+                    if parts.len() >= 4 {
+                        if let (Ok(util), Ok(used), Ok(total)) = (
+                            parts[1].parse::<f32>(),
+                            parts[2].parse::<u64>(),
+                            parts[3].parse::<u64>(),
+                        ) {
+                            gpus.push(GpuSnapshot {
+                                index: gpus.len() as u32,
+                                gpu_percent: (util / 100.0).clamp(0.0, 1.0),
+                                vram_used_mib: used,
+                                vram_total_mib: total,
+                            });
+                        }
+                    }
                 }
                 continue;
             }
@@ -2223,6 +2240,7 @@ fn parse_monitor_block(
         disks,
         current_user,
         procs,
+        gpus,
         sys,
     })
 }
@@ -2969,6 +2987,26 @@ mod monitor_hardening_tests {
         assert!(parse_monitor_block(&block, &mut prev, &mut prev_net, &mut at).is_some());
         // The remembered interface set is capped, not 500.
         assert!(prev_net.len() <= 64, "prev_net held {}", prev_net.len());
+    }
+
+    #[test]
+    fn parses_remote_gpu_monitor_rows() {
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__GPU__\nNVIDIA RTX 4090, 45, 2048, 16384\nNVIDIA RTX 3080, 0, 0, 8192";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { gpus, .. } => {
+                assert_eq!(gpus.len(), 2);
+                assert_eq!(gpus[0].index, 0);
+                assert_eq!(gpus[0].gpu_percent, 0.45);
+                assert_eq!(gpus[0].vram_used_mib, 2048);
+                assert_eq!(gpus[1].index, 1);
+                assert_eq!(gpus[1].vram_total_mib, 8192);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

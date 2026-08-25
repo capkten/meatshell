@@ -2,6 +2,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::config::PortForward;
+use crate::resource::GpuSnapshot;
 
 use super::{
     CredentialResponder, HostKeyResponder, MfaResponder, ProcInfo, ProcessKillResult, RemoteEntry,
@@ -70,6 +71,8 @@ pub enum SessionEvent {
         current_user: String,
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
+        /// Per-GPU stats from the remote `nvidia-smi` monitor command.
+        gpus: Vec<GpuSnapshot>,
         /// Detailed system information for the detached system-info window.
         /// Detailed data is present only for the separately delayed one-shot
         /// system-information probe; lightweight resource samples leave it None.

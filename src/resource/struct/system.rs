@@ -128,6 +128,7 @@ pub(crate) struct TabStatus {
     pub(crate) net_hist: Vec<f32>,
     pub(crate) disks: Vec<(String, u64, u64)>,
     pub(crate) procs: Vec<ProcInfo>,
+    pub(crate) gpus: Vec<GpuSnapshot>,
     pub(crate) sys: SystemDetails,
 }
 
