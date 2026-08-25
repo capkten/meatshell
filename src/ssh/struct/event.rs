@@ -72,7 +72,9 @@ pub enum SessionEvent {
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
         procs: Vec<ProcInfo>,
         /// Per-GPU stats from the remote `nvidia-smi` monitor command.
-        gpus: Vec<GpuSnapshot>,
+        /// `None` means this event did not contain accelerator data, so the
+        /// UI must retain the previous monitor sample.
+        gpus: Option<Vec<GpuSnapshot>>,
         /// Detailed system information for the detached system-info window.
         /// Detailed data is present only for the separately delayed one-shot
         /// system-information probe; lightweight resource samples leave it None.

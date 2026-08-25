@@ -146,7 +146,9 @@ pub(super) fn apply_session_event_to_window(
                 st.swap_total_kib = swap_total_kib;
                 st.net = net;
                 st.disks = disks;
-                st.gpus = gpus;
+                if let Some(gpus) = gpus {
+                    st.gpus = gpus;
+                }
                 if let Some(sys) = sys {
                     st.sys = sys;
                 }

@@ -2040,6 +2040,7 @@ fn parse_monitor_block(
     let mut procs: Vec<ProcInfo> = Vec::new();
     // GPU stats from the remote nvidia-smi monitor section.
     let mut gpus: Vec<GpuSnapshot> = Vec::new();
+    let mut accelerators_seen = false;
     let mut current_user = String::new();
     let mut sys_kv: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // The sample is split into sections by `echo` markers; everything before the
@@ -2079,10 +2080,12 @@ fn parse_monitor_block(
         }
         if line == "__GPU__" {
             section = Section::Gpu;
+            accelerators_seen = true;
             continue;
         }
         if line == "__NPU__" {
             section = Section::Npu;
+            accelerators_seen = true;
             continue;
         }
         match section {
@@ -2282,7 +2285,7 @@ fn parse_monitor_block(
         disks,
         current_user,
         procs,
-        gpus,
+        gpus: accelerators_seen.then_some(gpus),
         sys,
     })
 }
@@ -3040,6 +3043,7 @@ mod monitor_hardening_tests {
         let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
         match event {
             super::SessionEvent::ResourceStats { gpus, .. } => {
+                let gpus = gpus.expect("GPU monitor section should be present");
                 assert_eq!(gpus.len(), 2);
                 assert_eq!(gpus[0].index, 0);
                 assert_eq!(gpus[0].gpu_percent, 0.45);
@@ -3060,12 +3064,28 @@ mod monitor_hardening_tests {
         let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
         match event {
             super::SessionEvent::ResourceStats { gpus, .. } => {
+                let gpus = gpus.expect("NPU monitor section should be present");
                 assert_eq!(gpus.len(), 3);
                 assert_eq!(gpus[0].label, "NPU0");
                 assert_eq!(gpus[0].gpu_percent, 0.0);
                 assert_eq!(gpus[0].vram_used_mib, 22573);
                 assert_eq!(gpus[0].vram_total_mib, 44278);
                 assert_eq!(gpus[2].label, "NPU2");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_detail_sample_does_not_clear_remote_accelerators() {
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__SYS__\nOS=Linux";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { gpus, .. } => {
+                assert!(gpus.is_none());
             }
             other => panic!("unexpected event: {other:?}"),
         }
