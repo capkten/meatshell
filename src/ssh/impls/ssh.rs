@@ -1475,7 +1475,7 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/local/bin:/usr/local/Ascend/driver/tools:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __NPU__; (npu-smi info || /usr/local/Ascend/driver/tools/npu-smi info || /usr/local/bin/npu-smi info) 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/opt/rocm/bin:/usr/local/bin:/usr/local/Ascend/driver/tools:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __NPU__; (npu-smi info || /usr/local/Ascend/driver/tools/npu-smi info || /usr/local/bin/npu-smi info) 2>/dev/null || true; echo __DCU__; (rocm-smi --showpids || /opt/rocm/bin/rocm-smi --showpids || /usr/local/bin/rocm-smi --showpids) 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
     // Detailed system information is intentionally one-shot and last priority.
     // It includes commands such as lspci/hostname that may be slow on some hosts
     // and must never delay either the terminal or the lightweight sidebar sample.
@@ -2040,6 +2040,10 @@ fn parse_monitor_block(
     // GPU stats from the remote nvidia-smi monitor section.
     let mut gpus: Vec<GpuSnapshot> = Vec::new();
     let mut accelerators_seen = false;
+    let mut dcu_index: Option<u32> = None;
+    let mut dcu_used_mib: Option<u64> = None;
+    let mut dcu_totals: std::collections::HashMap<u32, (u64, u64)> =
+        std::collections::HashMap::new();
     let mut current_user = String::new();
     let mut sys_kv: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // The sample is split into sections by `echo` markers; everything before the
@@ -2052,6 +2056,7 @@ fn parse_monitor_block(
         Sys,
         Gpu,
         Npu,
+        Dcu,
     }
     let mut section = Section::Top;
 
@@ -2084,6 +2089,11 @@ fn parse_monitor_block(
         }
         if line == "__NPU__" {
             section = Section::Npu;
+            accelerators_seen = true;
+            continue;
+        }
+        if line == "__DCU__" {
+            section = Section::Dcu;
             accelerators_seen = true;
             continue;
         }
@@ -2174,6 +2184,31 @@ fn parse_monitor_block(
                                 });
                             }
                         }
+                    }
+                }
+                continue;
+            }
+            Section::Dcu => {
+                let trimmed = line.trim();
+                if let Some(value) = trimmed.strip_prefix("DCU Index:") {
+                    dcu_index = value
+                        .split(|ch: char| !ch.is_ascii_digit())
+                        .find(|part| !part.is_empty())
+                        .and_then(|part| part.parse::<u32>().ok());
+                } else if let Some(value) = trimmed.strip_prefix("VRAM USED(MiB):") {
+                    dcu_used_mib = value.trim().parse::<u64>().ok();
+                } else if let Some(value) = trimmed.strip_prefix("VRAM USED(%):") {
+                    let Some(index) = dcu_index else { continue };
+                    let Some(used) = dcu_used_mib.take() else {
+                        continue;
+                    };
+                    let Ok(percent) = value.trim().parse::<u64>() else {
+                        continue;
+                    };
+                    let entry = dcu_totals.entry(index).or_default();
+                    entry.0 = entry.0.saturating_add(used);
+                    if percent > 0 {
+                        entry.1 = entry.1.max(used.saturating_mul(100) / percent);
                     }
                 }
                 continue;
@@ -2273,6 +2308,23 @@ fn parse_monitor_block(
             &disks,
         )
     });
+
+    for (index, (used, estimated_total)) in dcu_totals {
+        let total = estimated_total.max(used);
+        let percent = if total == 0 {
+            0.0
+        } else {
+            used as f32 / total as f32
+        };
+        gpus.push(GpuSnapshot {
+            label: format!("DCU{index}"),
+            index,
+            gpu_percent: percent,
+            vram_used_mib: used,
+            vram_total_mib: total,
+        });
+    }
+    gpus.sort_by_key(|gpu| gpu.label.clone());
 
     Some(SessionEvent::ResourceStats {
         cpu_percent,
@@ -3070,6 +3122,26 @@ mod monitor_hardening_tests {
                 assert_eq!(gpus[0].vram_used_mib, 22573);
                 assert_eq!(gpus[0].vram_total_mib, 44278);
                 assert_eq!(gpus[2].label, "NPU2");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregates_remote_dcu_process_memory() {
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__DCU__\nPID: 1\n        DCU Index: ['0']\n        VRAM USED(MiB): 9141\n        VRAM USED(%): 14\nPID: 2\n        DCU Index: ['0']\n        VRAM USED(MiB): 13938\n        VRAM USED(%): 21\nPID: 3\n        DCU Index: ['1']\n        VRAM USED(MiB): 100\n        VRAM USED(%): 10";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { gpus, .. } => {
+                let gpus = gpus.expect("DCU monitor section should be present");
+                assert_eq!(gpus.len(), 2);
+                assert_eq!(gpus[0].label, "DCU0");
+                assert_eq!(gpus[0].vram_used_mib, 23079);
+                assert_eq!(gpus[0].vram_total_mib, 66371);
+                assert_eq!(gpus[1].label, "DCU1");
             }
             other => panic!("unexpected event: {other:?}"),
         }
