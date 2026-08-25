@@ -73,6 +73,7 @@ pub(super) fn refresh_sidebar(
         win.set_net_ifaces(ModelRc::from(Rc::new(VecModel::<SharedString>::default())));
         // Non-connected tabs show the local machine's filesystems.
         win.set_disks(disk_model(&snap.disks));
+        win.set_gpus(gpu_model(&snap.gpus));
     };
     let show_local_res = |win: &AppWindow| {
         win.set_resource_title(t("本机资源", "Local resources").into());
@@ -81,6 +82,7 @@ pub(super) fn refresh_sidebar(
         win.set_swap_percent(snap.swap_percent);
         win.set_mem_detail(format_mem(snap.mem_used_mib, snap.mem_total_mib).into());
         win.set_swap_detail(format_mem(snap.swap_used_mib, snap.swap_total_mib).into());
+        win.set_gpus(gpu_model(&snap.gpus));
     };
     let clear_stats = |win: &AppWindow| {
         win.set_cpu_percent(0.0);
@@ -88,6 +90,7 @@ pub(super) fn refresh_sidebar(
         win.set_swap_percent(0.0);
         win.set_mem_detail("".into());
         win.set_swap_detail("".into());
+        win.set_gpus(ModelRc::from(Rc::new(VecModel::<GpuInfo>::default())));
     };
 
     // Process monitor (#23) lives in a shared model (the AppWindow and the

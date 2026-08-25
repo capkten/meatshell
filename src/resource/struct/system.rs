@@ -5,6 +5,59 @@ use crate::ssh::{ProcInfo, SystemDetails};
 
 use sysinfo::{Disks, Networks, System};
 
+/// Per-GPU snapshot returned by a local GPU backend.
+#[derive(Debug, Clone, Default)]
+pub struct GpuSnapshot {
+    /// GPU index (0-based).
+    pub index: u32,
+    /// GPU core utilization, normalized to 0.0..1.0.
+    pub gpu_percent: f32,
+    /// VRAM used in MiB.
+    pub vram_used_mib: u64,
+    /// VRAM total in MiB.
+    pub vram_total_mib: u64,
+}
+
+/// Pluggable local GPU sampler.
+pub trait GpuBackend {
+    fn sample(&self) -> Vec<GpuSnapshot>;
+}
+
+/// NVIDIA GPU backend via NVML.
+pub struct NvidiaBackend {
+    nvml: nvml_wrapper::Nvml,
+    device_count: u32,
+}
+
+impl NvidiaBackend {
+    pub fn new() -> Result<Self, nvml_wrapper::error::NvmlError> {
+        let nvml = nvml_wrapper::Nvml::init()?;
+        let device_count = nvml.device_count()?;
+        if device_count == 0 {
+            return Err(nvml_wrapper::error::NvmlError::NotFound);
+        }
+        Ok(Self { nvml, device_count })
+    }
+}
+
+impl GpuBackend for NvidiaBackend {
+    fn sample(&self) -> Vec<GpuSnapshot> {
+        (0..self.device_count)
+            .filter_map(|index| {
+                let device = self.nvml.device_by_index(index).ok()?;
+                let utilization = device.utilization_rates().ok()?;
+                let memory = device.memory_info().ok()?;
+                Some(GpuSnapshot {
+                    index,
+                    gpu_percent: (utilization.gpu as f32 / 100.0).clamp(0.0, 1.0),
+                    vram_used_mib: memory.used / 1024 / 1024,
+                    vram_total_mib: memory.total / 1024 / 1024,
+                })
+            })
+            .collect()
+    }
+}
+
 /// Snapshot passed to the UI each tick.
 #[derive(Debug, Clone, Default)]
 pub struct SystemSnapshot {
@@ -20,6 +73,7 @@ pub struct SystemSnapshot {
     pub net_tx_per_sec: u64,
     /// Per-filesystem (mount, available_bytes, total_bytes).
     pub disks: Vec<(String, u64, u64)>,
+    pub gpus: Vec<GpuSnapshot>,
 }
 
 /// Stateful sampler. Construct once per process and poll via [`Self::sample`].
@@ -30,6 +84,7 @@ pub struct SystemSampler {
     pub(super) last_rx_total: u64,
     pub(super) last_tx_total: u64,
     pub(super) last_instant: std::time::Instant,
+    pub(super) gpu: Option<Box<dyn GpuBackend>>,
 }
 
 #[derive(Clone, Default)]

@@ -1,5 +1,17 @@
 use super::*;
 
+pub(super) fn gpu_model(gpus: &[GpuSnapshot]) -> ModelRc<GpuInfo> {
+    let rows: Vec<GpuInfo> = gpus
+        .iter()
+        .map(|gpu| GpuInfo {
+            label: format!("GPU{}", gpu.index).into(),
+            percent: gpu.gpu_percent,
+            detail: format_mem(gpu.vram_used_mib, gpu.vram_total_mib).into(),
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
 pub(super) fn push_ring(buf: &mut Vec<f32>, val: f32) {
     if buf.len() != NET_HISTORY_LEN {
         *buf = vec![0.0; NET_HISTORY_LEN];

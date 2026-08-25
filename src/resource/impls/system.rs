@@ -7,16 +7,19 @@ use std::time::Duration;
 
 use sysinfo::{Disks, Networks, System};
 
-use super::system_types::{SystemSampler, SystemSnapshot};
+use super::system_types::{NvidiaBackend, SystemSampler, SystemSnapshot};
 
 impl SystemSampler {
     pub fn new() -> Self {
         let mut sys = System::new_all();
         sys.refresh_all();
         let nets = Networks::new_with_refreshed_list();
-        let last_rx_total = nets.iter().map(|(_, d)| d.total_received()).sum();
-        let last_tx_total = nets.iter().map(|(_, d)| d.total_transmitted()).sum();
+        let last_rx_total = nets.values().map(|d| d.total_received()).sum();
+        let last_tx_total = nets.values().map(|d| d.total_transmitted()).sum();
         let disks = Disks::new_with_refreshed_list();
+        let gpu: Option<Box<dyn super::system_types::GpuBackend>> = NvidiaBackend::new()
+            .ok()
+            .map(|backend| Box::new(backend) as Box<dyn super::system_types::GpuBackend>);
         Self {
             sys,
             nets,
@@ -24,6 +27,7 @@ impl SystemSampler {
             last_rx_total,
             last_tx_total,
             last_instant: std::time::Instant::now(),
+            gpu,
         }
     }
 
@@ -56,8 +60,8 @@ impl SystemSampler {
         };
 
         // RX / TX bytes/sec from the delta across the iface list.
-        let rx_total: u64 = self.nets.iter().map(|(_, d)| d.total_received()).sum();
-        let tx_total: u64 = self.nets.iter().map(|(_, d)| d.total_transmitted()).sum();
+        let rx_total: u64 = self.nets.values().map(|d| d.total_received()).sum();
+        let tx_total: u64 = self.nets.values().map(|d| d.total_transmitted()).sum();
         let now = std::time::Instant::now();
         let elapsed = now
             .duration_since(self.last_instant)
@@ -86,6 +90,12 @@ impl SystemSampler {
             .filter(|(_, _, total)| *total > 0)
             .collect();
 
+        let gpus = self
+            .gpu
+            .as_ref()
+            .map(|backend| backend.sample())
+            .unwrap_or_default();
+
         SystemSnapshot {
             cpu_percent,
             mem_percent,
@@ -98,6 +108,7 @@ impl SystemSampler {
             net_rx_per_sec,
             net_tx_per_sec,
             disks,
+            gpus,
         }
     }
 }
