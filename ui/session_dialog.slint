@@ -1,4 +1,5 @@
 import { Theme } from "theme.slint";
+import { ComboBox } from "std-widgets.slint";
 import { LabeledInput, PrimaryButton, GhostButton } from "widgets.slint";
 import { TextEdit } from "std-widgets.slint";
 
@@ -34,6 +35,7 @@ export struct SessionDraft {
     stop-bits: int,
     parity: string,        // "none" | "odd" | "even"
     flow-control: string,  // "none" | "hardware" | "software"
+    encoding: string,
     // Skip the POSIX shell-integration setup (cwd-follow hook + monitor) for
     // Windows / pwsh servers where it breaks the shell (#140).
     disable-shell-integration: bool,
@@ -259,7 +261,7 @@ component GroupCombo inherits VerticalLayout {
             y: parent.height + 3px;
             width: parent.width;
             Rectangle {
-                background: Theme.bg-elevated;
+                background: Theme.popup-bg-alt;
                 border-radius: Theme.radius-sm;
                 border-width: 1px;
                 border-color: Theme.border-subtle;
@@ -349,7 +351,7 @@ component JumpCombo inherits VerticalLayout {
             y: parent.height + 3px;
             width: parent.width;
             Rectangle {
-                background: Theme.bg-elevated;
+                background: Theme.popup-bg-alt;
                 border-radius: Theme.radius-sm;
                 border-width: 1px;
                 border-color: Theme.border-subtle;
@@ -414,6 +416,7 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-stop-bits: "1";
     in-out property <string> draft-parity: "none";
     in-out property <string> draft-flow: "none";
+    in-out property <string> draft-encoding: "UTF-8";
     in-out property <bool> draft-disable-shell-integration: false;
     in-out property <string> draft-notes;
     in-out property <string> test-status;
@@ -453,7 +456,7 @@ export component SessionDialog inherits Rectangle {
         height: min(body.preferred-height + 53px, parent.height - 40px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        background: Theme.bg-panel;
+        background: Theme.popup-bg;
         border-radius: Theme.radius-lg;
         border-width: 1px;
         border-color: Theme.border-strong;
@@ -539,7 +542,13 @@ export component SessionDialog inherits Rectangle {
                     SegOption {
                         label: "SSH";
                         active: root.draft-kind == "ssh";
-                        clicked => { root.draft-kind = "ssh"; }
+                        clicked => {
+                            // Switch protocol defaults while leaving non-default ports untouched (#303).
+                            if (root.draft-kind != "ssh" && root.draft-port == "23") {
+                                root.draft-port = "22";
+                            }
+                            root.draft-kind = "ssh";
+                        }
                     }
                     SegOption {
                         label: @tr("Serial");
@@ -549,7 +558,12 @@ export component SessionDialog inherits Rectangle {
                     SegOption {
                         label: "Telnet";
                         active: root.draft-kind == "telnet";
-                        clicked => { root.draft-kind = "telnet"; }
+                        clicked => {
+                            if (root.draft-kind != "telnet" && root.draft-port == "22") {
+                                root.draft-port = "23";
+                            }
+                            root.draft-kind = "telnet";
+                        }
                     }
                 }
             }
@@ -859,7 +873,7 @@ export component SessionDialog inherits Rectangle {
                 HorizontalLayout {
                     spacing: 4px;
                     Text {
-                        text: @tr("Advanced (proxy, tunnels)");
+                        text: @tr("Advanced (encoding, proxy, tunnels)");
                         color: adv-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
                         font-size: Theme.fs-sm;
                         vertical-alignment: center;
@@ -873,6 +887,27 @@ export component SessionDialog inherits Rectangle {
                     }
                     Rectangle { horizontal-stretch: 1; }
                 }
+            }
+
+            // ── Terminal character encoding (SSH only) (#338) ───────────────
+            if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("Terminal character encoding");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                ComboBox {
+                    model: ["UTF-8", "GBK", "Big5", "Shift_JIS", "EUC-KR", "Windows-1252"];
+                    current-value: root.draft-encoding;
+                    selected(value) => { root.draft-encoding = value; }
+                }
+                Text {
+                    text: @tr("Use GBK for servers configured for GB2312 or GBK output.");
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                }
+                Rectangle { height: 6px; }
             }
 
             // ── Optional outbound proxy (SSH / Telnet only) ─────────────────
@@ -1021,6 +1056,7 @@ export component SessionDialog inherits Rectangle {
                             stop-bits: root.draft-stop-bits.to-float(),
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
+                            encoding: root.draft-encoding,
                             disable-shell-integration: root.draft-disable-shell-integration,
                             notes: root.draft-notes,
                             jump-session-id: (root.draft-jump-index > 0 && root.draft-jump-index < root.jump-ids.length)
@@ -1072,6 +1108,7 @@ export component SessionDialog inherits Rectangle {
                             stop-bits: root.draft-stop-bits.to-float(),
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
+                            encoding: root.draft-encoding,
                             disable-shell-integration: root.draft-disable-shell-integration,
                             notes: root.draft-notes,
                             jump-session-id: (root.draft-jump-index > 0 && root.draft-jump-index < root.jump-ids.length)

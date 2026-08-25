@@ -54,8 +54,8 @@ msgstr "About"
 msgid "About meatshell"
 msgstr "About meatshell"
 
-msgid "A lightweight Rust + Slint SSH terminal client by 'lil meatball'."
-msgstr "A lightweight Rust + Slint SSH terminal client by 'lil meatball'."
+msgid "A lightweight Rust + Slint SSH terminal client."
+msgstr "A lightweight Rust + Slint SSH terminal client."
 
 msgid "Open source · MIT / Apache-2.0"
 msgstr "Open source · MIT / Apache-2.0"
@@ -357,8 +357,14 @@ msgstr "Search history"
 msgid "Port forwarding"
 msgstr "Port forwarding"
 
-msgid "Advanced (proxy, tunnels)"
-msgstr "Advanced (proxy, tunnels)"
+msgid "Advanced (encoding, proxy, tunnels)"
+msgstr "Advanced (encoding, proxy, tunnels)"
+
+msgid "Terminal character encoding"
+msgstr "Terminal character encoding"
+
+msgid "Use GBK for servers configured for GB2312 or GBK output."
+msgstr "Use GBK for servers configured for GB2312 or GBK output."
 
 msgid "Local (-L)"
 msgstr "Local (-L)"
@@ -521,3 +527,21 @@ msgstr "Terminating process..."
 
 msgid "Terminate"
 msgstr "Terminate"
+
+msgid "Search by name or host..."
+msgstr "Search by name or host..."
+
+msgid "No matching sessions"
+msgstr "No matching sessions"
+
+msgid "Clear search"
+msgstr "Clear search"
+
+msgid "新建窗口"
+msgstr "New Window"
+
+msgid "Session name"
+msgstr "Session name"
+
+msgid "Leave empty to restore the default name"
+msgstr "Leave empty to restore the default name"
