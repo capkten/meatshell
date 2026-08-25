@@ -1476,7 +1476,7 @@ async fn run_session(
     // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __NPU__; npu-smi info 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
     // Detailed system information is intentionally one-shot and last priority.
     // It includes commands such as lspci/hostname that may be slow on some hosts
     // and must never delay either the terminal or the lightweight sidebar sample.
@@ -2051,6 +2051,7 @@ fn parse_monitor_block(
         Ps,
         Sys,
         Gpu,
+        Npu,
     }
     let mut section = Section::Top;
 
@@ -2078,6 +2079,10 @@ fn parse_monitor_block(
         }
         if line == "__GPU__" {
             section = Section::Gpu;
+            continue;
+        }
+        if line == "__NPU__" {
+            section = Section::Npu;
             continue;
         }
         match section {
@@ -2124,11 +2129,48 @@ fn parse_monitor_block(
                             parts[3].parse::<u64>(),
                         ) {
                             gpus.push(GpuSnapshot {
+                                label: format!("GPU{}", gpus.len()),
                                 index: gpus.len() as u32,
                                 gpu_percent: (util / 100.0).clamp(0.0, 1.0),
                                 vram_used_mib: used,
                                 vram_total_mib: total,
                             });
+                        }
+                    }
+                }
+                continue;
+            }
+            Section::Npu => {
+                if gpus.len() < MAX_MON_ENTRIES {
+                    let columns: Vec<&str> = line
+                        .split('|')
+                        .map(str::trim)
+                        .filter(|column| !column.is_empty())
+                        .collect();
+                    // Device rows have three cells: chip/device, bus id, and
+                    // AICore + memory. Health and process rows have a
+                    // different shape and are ignored.
+                    if columns.len() == 3 {
+                        let metrics: Vec<&str> = columns[2].split_whitespace().collect();
+                        if metrics.len() >= 3 {
+                            let memory = metrics[1..].concat();
+                            if let (Ok(util), Some((used, total))) =
+                                (metrics[0].parse::<f32>(), memory.split_once('/'))
+                            {
+                                let (Ok(used), Ok(total)) =
+                                    (used.parse::<u64>(), total.parse::<u64>())
+                                else {
+                                    continue;
+                                };
+                                let index = gpus.len() as u32;
+                                gpus.push(GpuSnapshot {
+                                    label: format!("NPU{index}"),
+                                    index,
+                                    gpu_percent: (util / 100.0).clamp(0.0, 1.0),
+                                    vram_used_mib: used,
+                                    vram_total_mib: total,
+                                });
+                            }
                         }
                     }
                 }
@@ -3004,6 +3046,26 @@ mod monitor_hardening_tests {
                 assert_eq!(gpus[0].vram_used_mib, 2048);
                 assert_eq!(gpus[1].index, 1);
                 assert_eq!(gpus[1].vram_total_mib, 8192);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_remote_npu_smi_rows() {
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__NPU__\n| 0       0                     | 0000:01:00.0    | 0            22573/ 44278                            |\n| 0       1                     | 0000:01:00.0    | 0            5177 / 43693                            |\n| 32768   0                     | 0000:81:00.0    | 0            3373 / 44278                            |";
+        let mut prev = None;
+        let mut prev_net = HashMap::new();
+        let mut at = Instant::now();
+        let event = parse_monitor_block(block, &mut prev, &mut prev_net, &mut at).unwrap();
+        match event {
+            super::SessionEvent::ResourceStats { gpus, .. } => {
+                assert_eq!(gpus.len(), 3);
+                assert_eq!(gpus[0].label, "NPU0");
+                assert_eq!(gpus[0].gpu_percent, 0.0);
+                assert_eq!(gpus[0].vram_used_mib, 22573);
+                assert_eq!(gpus[0].vram_total_mib, 44278);
+                assert_eq!(gpus[2].label, "NPU2");
             }
             other => panic!("unexpected event: {other:?}"),
         }

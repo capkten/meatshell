@@ -8,6 +8,8 @@ use sysinfo::{Disks, Networks, System};
 /// Per-GPU snapshot returned by a local GPU backend.
 #[derive(Debug, Clone, Default)]
 pub struct GpuSnapshot {
+    /// Display label, such as `GPU0` or `NPU0`.
+    pub label: String,
     /// GPU index (0-based).
     pub index: u32,
     /// GPU core utilization, normalized to 0.0..1.0.
@@ -48,6 +50,7 @@ impl GpuBackend for NvidiaBackend {
                 let utilization = device.utilization_rates().ok()?;
                 let memory = device.memory_info().ok()?;
                 Some(GpuSnapshot {
+                    label: format!("GPU{index}"),
                     index,
                     gpu_percent: (utilization.gpu as f32 / 100.0).clamp(0.0, 1.0),
                     vram_used_mib: memory.used / 1024 / 1024,

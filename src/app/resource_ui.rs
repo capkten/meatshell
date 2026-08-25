@@ -4,7 +4,11 @@ pub(super) fn gpu_model(gpus: &[GpuSnapshot]) -> ModelRc<GpuInfo> {
     let rows: Vec<GpuInfo> = gpus
         .iter()
         .map(|gpu| GpuInfo {
-            label: format!("GPU{}", gpu.index).into(),
+            label: if gpu.label.is_empty() {
+                format!("GPU{}", gpu.index).into()
+            } else {
+                gpu.label.clone().into()
+            },
             percent: gpu.gpu_percent,
             detail: format_mem(gpu.vram_used_mib, gpu.vram_total_mib).into(),
         })
