@@ -21,6 +21,11 @@ use crate::config::{AuthMethod, PortForward, Session};
 use crate::i18n::t;
 use crate::resource::GpuSnapshot;
 
+// DCU tools are often exposed only by an activated conda/module login
+// environment. Try that environment first, then stable system paths.
+#[cfg(test)]
+const DCU_PROBE: &str = "(bash -lc 'rocm-smi --showpids' || /opt/rocm/bin/rocm-smi --showpids || /usr/local/rocm/bin/rocm-smi --showpids || /usr/local/bin/rocm-smi --showpids)";
+
 use super::structs::*;
 
 // ---------------------------------------------------------------------------
@@ -1292,6 +1297,8 @@ fn append_bounded(target: &mut Vec<u8>, data: &[u8], limit: usize, truncated: &m
     *truncated |= take < data.len();
 }
 
+const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; top_rows=\"$(top -b -n 1 -w 240 2>/dev/null | sed -n '/^[[:space:]]*PID[[:space:]]/,$p' | head -n 65)\"; if [ -n \"$top_rows\" ]; then printf '%s\\n' \"$top_rows\"; else { ps -eo pid,user:32,pri,ni,vsz,rss,shr,stat,pcpu,pmem,time,args 2>/dev/null || ps -eo pid,user:32,pri,ni,vsz,rss,stat,pcpu,pmem,time,args 2>/dev/null || ps -eo pid,user:32,pcpu,pmem,args 2>/dev/null; } | head -n 201 | cut -c -240; fi; echo __PSTICK__; sleep 2; done\n";
+
 async fn run_session(
     session: Session,
     jump: Option<Session>,
@@ -1472,10 +1479,10 @@ async fn run_session(
     // outside the standard PATH on common Ascend hosts, so include only their
     // known system locations rather than inheriting the interactive shell PATH.
     // The `ps` section feeds the process monitor (#23): top-40 by CPU, columns
-    // pid/user/pcpu/pmem/args, each line clipped to 200 chars so a giant command
+    // pid/user/pri/ni/vsz/rss/shr/stat/pcpu/pmem/time/args, each line clipped to 200 chars so a giant command
     // line can't bloat the stream. A host whose `ps` lacks `--sort`/`-o` simply
     // yields nothing (2>/dev/null), degrading to an empty process list.
-    const MON_CMD: &[u8] = b"PATH=/opt/rocm/bin:/usr/local/bin:/usr/local/Ascend/driver/tools:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __NPU__; (npu-smi info || /usr/local/Ascend/driver/tools/npu-smi info || /usr/local/bin/npu-smi info) 2>/dev/null || true; echo __DCU__; (rocm-smi --showpids || /opt/rocm/bin/rocm-smi --showpids || /usr/local/bin/rocm-smi --showpids) 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
+    const MON_CMD: &[u8] = b"PATH=/opt/rocm/bin:/usr/local/bin:/usr/local/Ascend/driver/tools:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do awk '/^cpu /{print}' /proc/stat; awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree|Buffers|Cached):/{print}' /proc/meminfo; cat /proc/net/dev; echo __DF__; df -kP 2>/dev/null; echo __GPU__; nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true; echo __NPU__; (npu-smi info || /usr/local/Ascend/driver/tools/npu-smi info || /usr/local/bin/npu-smi info) 2>/dev/null || true; echo __DCU__; (bash -lc 'rocm-smi --showpids' || /opt/rocm/bin/rocm-smi --showpids || /usr/local/rocm/bin/rocm-smi --showpids || /usr/local/bin/rocm-smi --showpids) 2>/dev/null || true; echo __MSTICK__; sleep 2; done\n";
     // Detailed system information is intentionally one-shot and last priority.
     // It includes commands such as lspci/hostname that may be slow on some hosts
     // and must never delay either the terminal or the lightweight sidebar sample.
@@ -1494,7 +1501,6 @@ async fn run_session(
     // Process sampling has its own channel. The broader resource command above
     // includes probes such as `df` which can block indefinitely on a stale NFS
     // mount; that must not leave dead PIDs frozen in the process window.
-    const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; ps -eo pid,user:32,pcpu,pmem,args --sort=-pcpu 2>/dev/null | head -n 41 | cut -c -200; echo __PSTICK__; sleep 2; done\n";
     let mut proc_channel: Option<Channel<Msg>> = None;
     let mut sys_channel: Option<Channel<Msg>> = None;
     let mut proc_buf = String::new();
@@ -2498,25 +2504,82 @@ fn build_system_details(
     }
 }
 
-/// Parse one `ps -eo pid,user,pcpu,pmem,args` line into a [`ProcInfo`]. The
-/// header row (`PID` is not numeric) and any malformed line yield `None`.
-/// `args` (everything past the four fixed columns) keeps internal spacing
-/// collapsed — fine for a display-only command column.
+/// Parse one `ps -eo pid,user,pri,ni,vsz,rss,shr,stat,pcpu,pmem,time,args` line
+/// into a [`ProcInfo`]. The header row (`PID` is not numeric) and any malformed
+/// line yield `None`. `args` keeps internal spacing collapsed for display.
 fn parse_ps_line(line: &str) -> Option<ProcInfo> {
-    let mut it = line.split_whitespace();
-    let pid: u32 = it.next()?.parse().ok()?;
-    let user = it.next()?.to_string();
-    let cpu: f32 = it.next()?.parse().ok()?;
-    let mem: f32 = it.next()?.parse().ok()?;
-    let command = it.collect::<Vec<_>>().join(" ");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let pid: u32 = fields.first()?.parse().ok()?;
+    let user = fields.get(1)?.to_string();
+    let is_state = |value: &str| {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|ch| matches!(ch, 'R' | 'S' | 'D' | 'T' | 't' | 'X' | 'Z' | 'W' | 'I'))
+    };
+    let detailed_with_shr = fields.len() >= 12
+        && is_state(fields[7])
+        && fields[8].parse::<f32>().is_ok()
+        && fields[9].parse::<f32>().is_ok();
+    let detailed_without_shr = fields.len() >= 11
+        && is_state(fields[6])
+        && fields[7].parse::<f32>().is_ok()
+        && fields[8].parse::<f32>().is_ok();
+    let (priority, nice, virt, res, shr, state, cpu, mem, time, command) = if detailed_with_shr {
+        (
+            fields[2].to_string(),
+            fields[3].to_string(),
+            fields[4].to_string(),
+            fields[5].to_string(),
+            fields[6].to_string(),
+            fields[7].to_string(),
+            fields[8].parse().ok()?,
+            fields[9].parse().ok()?,
+            fields[10].to_string(),
+            fields[11..].join(" "),
+        )
+    } else if detailed_without_shr {
+        (
+            fields[2].to_string(),
+            fields[3].to_string(),
+            fields[4].to_string(),
+            fields[5].to_string(),
+            "-".to_string(),
+            fields[6].to_string(),
+            fields[7].parse().ok()?,
+            fields[8].parse().ok()?,
+            fields[9].to_string(),
+            fields[10..].join(" "),
+        )
+    } else {
+        (
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            fields.get(2)?.parse().ok()?,
+            fields.get(3)?.parse().ok()?,
+            "-".to_string(),
+            fields.get(4..)?.join(" "),
+        )
+    };
     if command.is_empty() {
         return None;
     }
     Some(ProcInfo {
         pid,
         user,
+        priority,
+        nice,
+        virt,
+        res,
+        shr,
+        state,
         cpu,
         mem,
+        time,
         command,
     })
 }
@@ -3047,6 +3110,17 @@ mod osc_command_tests {
 #[cfg(test)]
 mod monitor_hardening_tests {
     use super::{parse_df_line, parse_monitor_block, parse_process_block};
+
+    #[test]
+    fn process_probe_prefers_top_batch_output() {
+        assert!(String::from_utf8_lossy(super::PROC_CMD).contains("top -b -n 1"));
+    }
+
+    #[test]
+    fn dcu_probe_loads_login_shell_environment_before_fixed_paths() {
+        assert!(super::DCU_PROBE.contains("bash -lc"));
+        assert!(super::DCU_PROBE.contains("/opt/rocm/bin/rocm-smi"));
+    }
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -3164,7 +3238,7 @@ mod monitor_hardening_tests {
 
     #[test]
     fn monitor_reports_effective_user_for_ownership_checks() {
-        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n__ME__\nalice\n__PS__\n10 alice 1.0 2.0 sleep 30";
+        let block = "MemTotal: 1000 kB\nMemAvailable: 500 kB\n__DF__\n__ME__\nalice\n__PS__\n10 alice 20 0 100 50 25 S 1.0 2.0 00:00.01 sleep 30";
         let mut prev = None;
         let mut prev_net = HashMap::new();
         let mut at = Instant::now();
@@ -3217,13 +3291,48 @@ mod monitor_hardening_tests {
     #[test]
     fn dedicated_process_block_reports_user_and_rows() {
         let (user, procs) = parse_process_block(
-            "__ME__\nalice\n__PS__\nPID USER %CPU %MEM COMMAND\n42 root 3.5 1.2 java -jar demo.jar\n",
+            "__ME__\nalice\n__PS__\nPID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND\n42 root 20 0 123456 45678 7890 S 3.5 1.2 00:01.23 java -jar demo.jar\n",
         );
         assert_eq!(user, "alice");
         assert_eq!(procs.len(), 1);
         assert_eq!(procs[0].pid, 42);
         assert_eq!(procs[0].user, "root");
+        assert_eq!(procs[0].priority, "20");
+        assert_eq!(procs[0].nice, "0");
+        assert_eq!(procs[0].virt, "123456");
+        assert_eq!(procs[0].res, "45678");
+        assert_eq!(procs[0].shr, "7890");
+        assert_eq!(procs[0].state, "S");
+        assert_eq!(procs[0].time, "00:01.23");
         assert_eq!(procs[0].command, "java -jar demo.jar");
+    }
+
+    #[test]
+    fn dedicated_process_block_keeps_legacy_rows_when_detail_fields_are_unavailable() {
+        let (user, procs) = parse_process_block(
+            "__ME__\nalice\n__PS__\nPID USER %CPU %MEM COMMAND\n42 root 3.5 1.2 java -jar demo.jar\n",
+        );
+        assert_eq!(user, "alice");
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].cpu, 3.5);
+        assert_eq!(procs[0].mem, 1.2);
+        assert_eq!(procs[0].command, "java -jar demo.jar");
+    }
+
+    #[test]
+    fn parses_detailed_rows_without_a_shared_memory_column() {
+        let (user, procs) = parse_process_block(
+            "__ME__\nalice\n__PS__\nPID USER PR NI VIRT RES S %CPU %MEM TIME COMMAND\n42 root 20 0 123456 45678 S 3.5 1.2 00:01.23 java -jar demo.jar\n",
+        );
+        assert_eq!(user, "alice");
+        assert_eq!(procs.len(), 1);
+        assert_eq!(procs[0].priority, "20");
+        assert_eq!(procs[0].nice, "0");
+        assert_eq!(procs[0].virt, "123456");
+        assert_eq!(procs[0].res, "45678");
+        assert_eq!(procs[0].state, "S");
+        assert_eq!(procs[0].cpu, 3.5);
+        assert_eq!(procs[0].time, "00:01.23");
     }
 }
 

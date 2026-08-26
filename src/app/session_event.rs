@@ -1,5 +1,9 @@
 use super::*;
 
+fn process_stats_refreshes_sidebar(sidebar_visible: bool, system_info_open: bool) -> bool {
+    sidebar_visible || system_info_open
+}
+
 pub(super) fn apply_session_event_to_window(
     win: &AppWindow,
     window_id: u64,
@@ -177,7 +181,14 @@ pub(super) fn apply_session_event_to_window(
                 st.procs = procs;
             }
             if win.get_active_tab_id().as_str() == tab_id {
-                refresh_process_model(win, statuses);
+                if process_stats_refreshes_sidebar(
+                    sidebar_updates_visible(win),
+                    win.get_system_info_window_open(),
+                ) {
+                    refresh_sidebar(win, statuses, local, local_net_hist);
+                } else {
+                    refresh_process_model(win, statuses);
+                }
             }
         }
         SessionEvent::TunnelUpdate(rows) => {
@@ -462,6 +473,26 @@ thread_local! {
     /// terminal-captured commands (#113) can be appended to history. Set once at
     /// startup; only touched on the Slint event-loop thread.
     pub(super) static HISTORY_STORE: RefCell<Option<Rc<RefCell<ConfigStore>>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod process_stats_refresh_tests {
+    use super::process_stats_refreshes_sidebar;
+
+    #[test]
+    fn process_stats_refreshes_sidebar_when_left_panel_is_visible() {
+        assert!(process_stats_refreshes_sidebar(true, false));
+    }
+
+    #[test]
+    fn process_stats_refreshes_system_info_without_left_panel() {
+        assert!(process_stats_refreshes_sidebar(false, true));
+    }
+
+    #[test]
+    fn process_stats_skips_ui_refresh_when_both_views_are_hidden() {
+        assert!(!process_stats_refreshes_sidebar(false, false));
+    }
 }
 
 // ---------------------------------------------------------------------------

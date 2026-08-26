@@ -79,13 +79,116 @@ pub(super) fn proc_rows(procs: &[ProcInfo], current_user: &str, tab_id: &str) ->
             tab_id: tab_id.into(),
             pid: p.pid.to_string().into(),
             user: p.user.clone().into(),
+            priority: p.priority.clone().into(),
+            nice: p.nice.clone().into(),
+            virt: p.virt.clone().into(),
+            res: p.res.clone().into(),
+            shr: p.shr.clone().into(),
+            state: p.state.clone().into(),
             cpu: format!("{:.1}", p.cpu).into(),
             mem: format!("{:.1}", p.mem).into(),
+            time: p.time.clone().into(),
             command: p.command.clone().into(),
             cpu_frac: (p.cpu / 100.0).clamp(0.0, 1.0),
             own_process: !process_needs_root(current_user, &p.user),
         })
         .collect()
+}
+
+pub(super) const PROCESS_PAGE_SIZE: usize = 25;
+
+/// Return the compact process list shown directly in the resource sidebar.
+pub(super) fn proc_summary_rows(
+    procs: &[ProcInfo],
+    current_user: &str,
+    tab_id: &str,
+) -> Vec<ProcRow> {
+    proc_rows(&procs[..procs.len().min(4)], current_user, tab_id)
+}
+
+/// Sort and page a bounded remote process sample. `page` is zero-based.
+pub(super) fn paged_proc_rows(
+    procs: &[ProcInfo],
+    current_user: &str,
+    tab_id: &str,
+    page: usize,
+    sort_column: &str,
+    descending: bool,
+) -> (Vec<ProcRow>, usize) {
+    let mut sorted = procs.to_vec();
+    sorted.sort_by(|a, b| {
+        let ordering = match sort_column {
+            "pid" => a.pid.cmp(&b.pid),
+            "user" => a.user.cmp(&b.user).then_with(|| a.pid.cmp(&b.pid)),
+            "mem" => a
+                .mem
+                .partial_cmp(&b.mem)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.pid.cmp(&b.pid)),
+            "command" => a.command.cmp(&b.command).then_with(|| a.pid.cmp(&b.pid)),
+            _ => a
+                .cpu
+                .partial_cmp(&b.cpu)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.pid.cmp(&b.pid)),
+        };
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    let page_count = sorted.len().div_ceil(PROCESS_PAGE_SIZE).max(1);
+    let page = page.min(page_count - 1);
+    let start = page * PROCESS_PAGE_SIZE;
+    let end = (start + PROCESS_PAGE_SIZE).min(sorted.len());
+    (
+        proc_rows(&sorted[start..end], current_user, tab_id),
+        page_count,
+    )
+}
+
+#[cfg(test)]
+mod process_paging_tests {
+    use super::{paged_proc_rows, proc_summary_rows};
+    use crate::ssh::ProcInfo;
+
+    fn process(pid: u32, cpu: f32, mem: f32) -> ProcInfo {
+        ProcInfo {
+            pid,
+            user: "user".into(),
+            priority: "20".into(),
+            nice: "0".into(),
+            virt: "100".into(),
+            res: "50".into(),
+            shr: "25".into(),
+            state: "S".into(),
+            cpu,
+            mem,
+            time: "00:00.01".into(),
+            command: format!("command-{pid}"),
+        }
+    }
+
+    #[test]
+    fn sidebar_summary_keeps_only_four_rows() {
+        let processes: Vec<_> = (1..=6).map(|pid| process(pid, pid as f32, 1.0)).collect();
+        let rows = proc_summary_rows(&processes, "user", "tab");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].pid, "1");
+        assert_eq!(rows[3].pid, "4");
+    }
+
+    #[test]
+    fn paged_process_rows_sort_and_slice_input() {
+        let mut processes: Vec<_> = (1..=27).map(|pid| process(pid, pid as f32, 1.0)).collect();
+        processes[0].cpu = 99.0;
+        let (rows, page_count) = paged_proc_rows(&processes, "user", "tab", 1, "cpu", true);
+        assert_eq!(page_count, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pid, "3");
+        assert_eq!(rows[1].pid, "2");
+    }
 }
 
 #[cfg(test)]

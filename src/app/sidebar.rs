@@ -15,13 +15,36 @@ pub(super) fn refresh_process_model(win: &AppWindow, statuses: &TabStatuses) {
         return;
     }
     let active = win.get_active_tab_id().to_string();
-    let rows = statuses
+    let (procs, user, page, sort_column, descending) = statuses
         .lock()
         .unwrap()
         .get(&active)
         .filter(|status| status.state == 1)
-        .map(|status| proc_rows(&status.procs, &status.user, &active))
+        .map(|status| {
+            (
+                status.procs.clone(),
+                status.user.clone(),
+                win.get_proc_page(),
+                win.get_proc_sort_column().to_string(),
+                win.get_proc_sort_descending(),
+            )
+        })
         .unwrap_or_default();
+    let (rows, page_count) = if procs.is_empty() {
+        (Vec::new(), 1)
+    } else {
+        paged_proc_rows(
+            &procs,
+            &user,
+            &active,
+            page.max(0) as usize,
+            &sort_column,
+            descending,
+        )
+    };
+    let page = (page.max(0) as usize).min(page_count - 1);
+    win.set_proc_page(page as i32);
+    win.set_proc_page_count(page_count as i32);
     if let Some(model) = win
         .get_proc_list()
         .as_any()
@@ -91,6 +114,7 @@ pub(super) fn refresh_sidebar(
         win.set_mem_detail("".into());
         win.set_swap_detail("".into());
         win.set_gpus(ModelRc::from(Rc::new(VecModel::<GpuInfo>::default())));
+        win.set_proc_summary(ModelRc::from(Rc::new(VecModel::<ProcRow>::default())));
     };
 
     // Process monitor (#23) lives in a shared model (the AppWindow and the
@@ -99,16 +123,15 @@ pub(super) fn refresh_sidebar(
     // remote session has process data; default to empty and let the connected
     // branch below fill it in.
     let set_procs = |win: &AppWindow, procs: &[ProcInfo], current_user: &str, tab_id: &str| {
+        win.set_proc_summary(ModelRc::from(Rc::new(VecModel::from(proc_summary_rows(
+            procs,
+            current_user,
+            tab_id,
+        )))));
         if !win.get_process_window_open() {
             return;
         }
-        if let Some(vm) = win
-            .get_proc_list()
-            .as_any()
-            .downcast_ref::<VecModel<ProcRow>>()
-        {
-            vm.set_vec(proc_rows(procs, current_user, tab_id));
-        }
+        refresh_process_model(win, statuses);
     };
     let set_system_models = |win: &AppWindow,
                              cpu: f32,

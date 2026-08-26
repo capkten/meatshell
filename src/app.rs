@@ -711,6 +711,10 @@ fn open_window(
     let proc_win = Rc::new(ProcWindow::new().context("failed to build process window")?);
     proc_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
     proc_win.set_proc_list(ModelRc::from(proc_rows_model.clone()));
+    proc_win.set_page(0);
+    proc_win.set_page_count(1);
+    proc_win.set_sort_column("cpu".into());
+    proc_win.set_sort_descending(true);
     let sys_win = Rc::new(SystemInfoWindow::new().context("failed to build system info window")?);
     // Every fallible construction has now succeeded — register the window.
     // (cascade_origin above was captured before this point, as required.)
@@ -753,6 +757,19 @@ fn open_window(
             if let Some(w) = weak.upgrade() {
                 w.window().with_winit_window(|ww| {
                     let _ = ww.drag_window();
+                });
+                schedule_slint_pointer_ungrab(weak.clone());
+            }
+        });
+    }
+    {
+        // Right-edge resize handle.
+        use i_slint_backend_winit::winit::window::ResizeDirection;
+        let weak = proc_win.as_weak();
+        proc_win.on_win_resize_east(move || {
+            if let Some(w) = weak.upgrade() {
+                w.window().with_winit_window(|ww| {
+                    let _ = ww.drag_resize_window(ResizeDirection::East);
                 });
                 schedule_slint_pointer_ungrab(weak.clone());
             }
@@ -1935,6 +1952,48 @@ fn open_window(
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
+
+    // Sorting and paging are client-side views over the latest bounded remote
+    // process sample. Keep the AppWindow state authoritative so incoming
+    // ProcessStats events can refresh the visible page without another SSH call.
+    {
+        let main_weak = window.as_weak();
+        let proc_weak = proc_win.as_weak();
+        let statuses = tab_statuses.clone();
+        proc_win.on_sort_processes(move |column: SharedString| {
+            let (Some(main), Some(proc)) = (main_weak.upgrade(), proc_weak.upgrade()) else {
+                return;
+            };
+            let column = column.to_string();
+            if main.get_proc_sort_column().as_str() == column {
+                main.set_proc_sort_descending(!main.get_proc_sort_descending());
+            } else {
+                main.set_proc_sort_column(column.clone().into());
+                main.set_proc_sort_descending(true);
+            }
+            main.set_proc_page(0);
+            proc.set_sort_column(main.get_proc_sort_column());
+            proc.set_sort_descending(main.get_proc_sort_descending());
+            proc.set_page(0);
+            refresh_process_model(&main, &statuses);
+            proc.set_page(main.get_proc_page());
+            proc.set_page_count(main.get_proc_page_count());
+        });
+    }
+    {
+        let main_weak = window.as_weak();
+        let proc_weak = proc_win.as_weak();
+        let statuses = tab_statuses.clone();
+        proc_win.on_page_processes(move |page: i32| {
+            let (Some(main), Some(proc)) = (main_weak.upgrade(), proc_weak.upgrade()) else {
+                return;
+            };
+            main.set_proc_page(page.max(0));
+            refresh_process_model(&main, &statuses);
+            proc.set_page(main.get_proc_page());
+            proc.set_page_count(main.get_proc_page_count());
+        });
+    }
 
     // Per-tab display-name overrides set via "Rename session" (tab context
     // menu). Display only — the saved session keeps its own name.

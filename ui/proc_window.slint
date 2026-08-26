@@ -15,8 +15,15 @@ export struct ProcRow {
     tab-id: string,
     pid: string,
     user: string,
+    priority: string,
+    nice: string,
+    virt: string,
+    res: string,
+    shr: string,
+    state: string,
     cpu: string,       // "12.3" (percent, one decimal)
     mem: string,       // "4.5"
+    time: string,
     command: string,   // truncated args
     cpu-frac: float,   // 0.0..1.0, drives the row load bar
     own-process: bool, // may terminate without root authentication
@@ -67,6 +74,66 @@ component ProcDangerButton inherits Rectangle {
     }
 }
 
+component ProcHeaderCell inherits Rectangle {
+    in property <string> label;
+    in property <string> column;
+    in property <length> cell-width;
+    in property <bool> active;
+    in property <bool> descending;
+    callback clicked(string);
+    width: root.cell-width;
+    height: 24px;
+    border-radius: Theme.radius-sm;
+    background: header-touch.has-hover ? Theme.bg-hover : transparent;
+    header-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(root.column); }
+    }
+    HorizontalLayout {
+        padding-left: 6px; padding-right: 4px; spacing: 2px;
+        Text {
+            text: root.label;
+            color: root.active ? Theme.text-primary : Theme.text-muted;
+            font-size: Theme.fs-xs;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if root.active : Text {
+            text: root.descending ? "\u{E5CE}" : "\u{E5CF}";
+            font-family: "Material Icons";
+            color: Theme.accent;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ProcPageButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 34px;
+    height: 28px;
+    border-radius: Theme.radius-sm;
+    background: !root.enabled ? Theme.bg-panel
+        : touch.pressed ? Theme.bg-active
+        : touch.has-hover ? Theme.bg-hover : Theme.bg-panel;
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.text;
+        color: root.enabled ? Theme.text-primary : Theme.text-muted;
+        font-family: "Material Icons";
+        font-size: 14px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 export component ProcWindow inherits Window {
     title: "meatshell — " + @tr("Processes");
     icon: @image-url("../assets/icon.png");
@@ -91,6 +158,10 @@ export component ProcWindow inherits Window {
     no-frame: root.custom-titlebar;
     in property <[ProcRow]> proc-list;       // top remote processes by CPU
     in property <string> host;               // "user@host" shown in the titlebar
+    in-out property <int> page: 0;
+    in property <int> page-count: 1;
+    in property <string> sort-column: "cpu";
+    in property <bool> sort-descending: true;
 
     in-out property <string> action-status;
     in-out property <bool> action-busy;
@@ -108,9 +179,12 @@ export component ProcWindow inherits Window {
 
     callback close();
     callback win-drag();          // start an OS window-move (frameless titlebar)
+    callback win-resize-east();   // start an OS resize from the right edge
     callback win-resize-se();     // start an OS resize from the bottom-right grip
     callback copy-pid(string);
     callback terminate-process(string /* tab id */, string /* pid */, string /* root password, empty for own process */);
+    callback sort-processes(string);
+    callback page-processes(int);
 
     // Create the confirmation dialog only after the context-menu click event
     // has fully completed, preventing pointer-up fall-through on any backend.
@@ -125,7 +199,7 @@ export component ProcWindow inherits Window {
 
     min-width: 420px;
     min-height: 280px;
-    preferred-width: 640px;
+    preferred-width: 900px;
     preferred-height: 520px;
     // Opaque base; the wallpaper Image covers it and the panels frost over the
     // image (mirrors AppWindow) so this window matches the immersive look.
@@ -208,20 +282,6 @@ export component ProcWindow inherits Window {
             padding: 12px;
             spacing: 8px;
 
-            // Column header.
-            HorizontalLayout {
-                padding-left: 6px;
-                padding-right: 6px;
-                spacing: 6px;
-                Text { text: "PID"; width: 56px; color: Theme.text-muted; font-size: Theme.fs-xs; }
-                Text { text: @tr("User"); width: 84px; color: Theme.text-muted; font-size: Theme.fs-xs; }
-                Text { text: "CPU%"; width: 52px; color: Theme.text-muted; font-size: Theme.fs-xs;
-                       horizontal-alignment: right; }
-                Text { text: "MEM%"; width: 52px; color: Theme.text-muted; font-size: Theme.fs-xs;
-                       horizontal-alignment: right; }
-                Text { text: @tr("Command"); horizontal-stretch: 1; color: Theme.text-muted; font-size: Theme.fs-xs; }
-            }
-
             if root.action-status != "" : Text {
                 text: root.action-status;
                 color: root.action-busy ? Theme.text-muted
@@ -232,11 +292,49 @@ export component ProcWindow inherits Window {
 
             Flickable {
                 vertical-stretch: 1;
-                viewport-width: self.width;
+                viewport-width: max(self.width, 900px);
                 viewport-height: max(self.height, proc-col.preferred-height);
                 proc-col := VerticalLayout {
+                    min-width: 900px;
+                    preferred-width: 900px;
+                    horizontal-stretch: 1;
                     alignment: start;
                     spacing: 1px;
+
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        spacing: 6px;
+                        ProcHeaderCell { label: "PID"; column: "pid"; cell-width: 56px;
+                            active: root.sort-column == "pid"; descending: root.sort-descending;
+                            clicked(c) => { root.sort-processes(c); } }
+                        ProcHeaderCell { label: "USER"; column: "user"; cell-width: 84px;
+                            active: root.sort-column == "user"; descending: root.sort-descending;
+                            clicked(c) => { root.sort-processes(c); } }
+                        ProcHeaderCell { label: "PR"; column: "priority"; cell-width: 34px;
+                            active: false; descending: false; }
+                        ProcHeaderCell { label: "NI"; column: "nice"; cell-width: 34px;
+                            active: false; descending: false; }
+                        ProcHeaderCell { label: "VIRT"; column: "virt"; cell-width: 64px;
+                            active: false; descending: false; }
+                        ProcHeaderCell { label: "RES"; column: "res"; cell-width: 64px;
+                            active: false; descending: false; }
+                        ProcHeaderCell { label: "SHR"; column: "shr"; cell-width: 64px;
+                            active: false; descending: false; }
+                        ProcHeaderCell { label: "S"; column: "state"; cell-width: 32px;
+                            active: false; descending: false; }
+                        ProcHeaderCell { label: "CPU%"; column: "cpu"; cell-width: 52px;
+                            active: root.sort-column == "cpu"; descending: root.sort-descending;
+                            clicked(c) => { root.sort-processes(c); } }
+                        ProcHeaderCell { label: "MEM%"; column: "mem"; cell-width: 52px;
+                            active: root.sort-column == "mem"; descending: root.sort-descending;
+                            clicked(c) => { root.sort-processes(c); } }
+                        ProcHeaderCell { label: "TIME+"; column: "time"; cell-width: 68px;
+                            active: false; descending: false; }
+                        ProcHeaderCell { label: "COMMAND"; column: "command"; cell-width: 0px;
+                            horizontal-stretch: 1; active: root.sort-column == "command"; descending: root.sort-descending;
+                            clicked(c) => { root.sort-processes(c); } }
+                    }
 
                     if root.proc-list.length == 0 : Text {
                         text: @tr("No processes");
@@ -275,7 +373,7 @@ export component ProcWindow inherits Window {
                             background: p.cpu-frac > 0.5 ? Theme.warning.with-alpha(0.28)
                                       : Theme.accent.with-alpha(0.20);
                         }
-                        HorizontalLayout {
+                            HorizontalLayout {
                             padding-left: 6px;
                             padding-right: 6px;
                             spacing: 6px;
@@ -294,17 +392,50 @@ export component ProcWindow inherits Window {
                             }
                             Text { text: p.user; width: 84px; color: Theme.text-secondary;
                                    font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
+                            Text { text: p.priority; width: 34px; color: Theme.text-secondary;
+                                   font-size: Theme.fs-xs; vertical-alignment: center; }
+                            Text { text: p.nice; width: 34px; color: Theme.text-secondary;
+                                   font-size: Theme.fs-xs; vertical-alignment: center; }
+                            Text { text: p.virt; width: 64px; color: Theme.text-secondary;
+                                   font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: p.res; width: 64px; color: Theme.text-secondary;
+                                   font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: p.shr; width: 64px; color: Theme.text-secondary;
+                                   font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: p.state; width: 32px; color: Theme.text-secondary;
+                                   font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: center; }
                             Text { text: p.cpu; width: 52px; color: Theme.text-primary;
                                    font-size: Theme.fs-xs; vertical-alignment: center;
                                    horizontal-alignment: right; }
                             Text { text: p.mem; width: 52px; color: Theme.text-secondary;
                                    font-size: Theme.fs-xs; vertical-alignment: center;
                                    horizontal-alignment: right; }
+                            Text { text: p.time; width: 68px; color: Theme.text-secondary;
+                                   font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: right; }
                             Text { text: p.command; horizontal-stretch: 1; color: Theme.text-muted;
                                    font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
                         }
                     }
                 }
+            }
+
+            HorizontalLayout {
+                height: 32px;
+                spacing: 6px;
+                ProcPageButton { text: "\u{E5DC}"; enabled: root.page > 0;
+                    clicked => { root.page-processes(0); } }
+                ProcPageButton { text: "\u{E5CB}"; enabled: root.page > 0;
+                    clicked => { root.page-processes(root.page - 1); } }
+                Text {
+                    text: (root.page + 1) + " / " + root.page-count;
+                    color: Theme.text-secondary; font-size: Theme.fs-sm;
+                    horizontal-alignment: center; vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                ProcPageButton { text: "\u{E5CC}"; enabled: root.page + 1 < root.page-count;
+                    clicked => { root.page-processes(root.page + 1); } }
+                ProcPageButton { text: "\u{E5DD}"; enabled: root.page + 1 < root.page-count;
+                    clicked => { root.page-processes(root.page-count - 1); } }
             }
         }
     }
@@ -439,12 +570,32 @@ export component ProcWindow inherits Window {
         }
     }
 
+    // --- Right-edge resize handle (frameless platforms) --------------------
+    if root.custom-titlebar : Rectangle {
+        // Keep a generous hit target: the visible rounded edge is only a few
+        // pixels wide, and the content behind it can otherwise win the grab.
+        width: 24px;
+        height: root.height;
+        x: root.width - self.width;
+        y: 0px;
+        z: 100;
+        TouchArea {
+            mouse-cursor: ew-resize;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    root.win-resize-east();
+                }
+            }
+        }
+    }
+
     // --- Bottom-right resize grip (frameless platforms) --------------------
     if root.custom-titlebar : Rectangle {
         width: 16px;
         height: 16px;
         x: root.width - self.width;
         y: root.height - self.height;
+        z: 101;
         TouchArea {
             mouse-cursor: nwse-resize;
             pointer-event(e) => {

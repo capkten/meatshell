@@ -365,6 +365,11 @@ export component AppWindow inherits Window {
     in-out property <bool> process-window-open: false;
     in property <bool> proc-available;       // a live remote session is active
     in property <[ProcRow]> proc-list;       // top remote processes by CPU
+    in property <[ProcRow]> proc-summary;    // first four rows for the sidebar
+    in-out property <int> proc-page: 0;
+    in-out property <int> proc-page-count: 1;
+    in-out property <string> proc-sort-column: "cpu";
+    in-out property <bool> proc-sort-descending: true;
     callback open-system-info();
     in-out property <bool> system-info-window-open: false;
     in property <bool> system-info-available; // connected Linux session only (#268)
@@ -1407,6 +1412,7 @@ export component AppWindow inherits Window {
                 mem-detail: root.mem-detail;
                 swap-detail: root.swap-detail;
                 gpus: root.gpus;
+                proc-summary: root.proc-summary;
                 net-top-up: root.net-top-up;
                 net-top-down: root.net-top-down;
                 net-top-history: root.net-top-history;
@@ -3036,8 +3042,6 @@ export component AppWindow inherits Window {
                     text <=> root.tab-rename-value;
                     font-family: Theme.ui-font-family; // CJK-capable (#54)
                     placeholder-text: @tr("Session name");
-                    // Focus the text the moment the dialog opens.
-                    init => { tr-input.focus(); }
                     accepted => {
                         root.rename-tab(root.tab-rename-id, root.tab-rename-value);
                     }
