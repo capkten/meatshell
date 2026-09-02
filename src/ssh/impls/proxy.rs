@@ -68,6 +68,96 @@ fn parse(url: &str) -> Option<ProxyConfig> {
     })
 }
 
+fn parse_command(command: &str) -> Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            token_started = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            token_started = true;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                token_started = true;
+            }
+            c if c.is_whitespace() => {
+                if token_started {
+                    args.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            _ => {
+                current.push(ch);
+                token_started = true;
+            }
+        }
+    }
+
+    if escaped {
+        bail!("ProxyCommand ends with an escape");
+    }
+    if quote.is_some() {
+        bail!("ProxyCommand has an unterminated quote");
+    }
+    if token_started {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+fn expand_command(command: &str, host: &str, port: u16, user: &str) -> Result<Vec<String>> {
+    let command = command.trim();
+    if command.is_empty() || command.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+
+    parse_command(command)?
+        .into_iter()
+        .map(|arg| {
+            let mut expanded = String::with_capacity(arg.len());
+            let mut chars = arg.chars();
+            while let Some(ch) = chars.next() {
+                if ch != '%' {
+                    expanded.push(ch);
+                    continue;
+                }
+                let Some(next) = chars.next() else {
+                    bail!("ProxyCommand has a trailing '%' placeholder");
+                };
+                match next {
+                    '%' => expanded.push('%'),
+                    'h' => expanded.push_str(host),
+                    'p' => expanded.push_str(&port.to_string()),
+                    'r' => expanded.push_str(user),
+                    other => bail!("ProxyCommand contains unsupported placeholder '%{other}'"),
+                }
+            }
+            Ok(expanded)
+        })
+        .collect()
+}
+
 /// Human-readable description of where we're connecting (for status messages).
 pub fn describe(cfg: &ProxyConfig) -> String {
     let scheme = match cfg.kind {
@@ -144,4 +234,50 @@ async fn connect_http(cfg: &ProxyConfig, host: &str, port: u16) -> Result<TcpStr
         return Err(anyhow!("proxy CONNECT rejected: {}", status_line.trim()));
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_proxy_command_arguments_and_expands_supported_placeholders() {
+        let args = expand_command(
+            r#"cloudflared access ssh --hostname %h --port "%p" --user '%r' --label %%"#,
+            "ssh.capkin.cn",
+            22,
+            "capkin",
+        )
+        .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "cloudflared",
+                "access",
+                "ssh",
+                "--hostname",
+                "ssh.capkin.cn",
+                "--port",
+                "22",
+                "--user",
+                "capkin",
+                "--label",
+                "%",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_proxy_commands_and_unknown_placeholders() {
+        assert!(expand_command("cloudflared 'access", "host", 22, "user").is_err());
+        assert!(expand_command("cloudflared access\\", "host", 22, "user").is_err());
+        assert!(expand_command("cloudflared --host %x", "host", 22, "user").is_err());
+    }
+
+    #[test]
+    fn empty_or_none_proxy_commands_are_disabled() {
+        assert!(expand_command("   ", "host", 22, "user").unwrap().is_empty());
+        assert!(expand_command("none", "host", 22, "user").unwrap().is_empty());
+        assert!(expand_command("NONE", "host", 22, "user").unwrap().is_empty());
+    }
 }
