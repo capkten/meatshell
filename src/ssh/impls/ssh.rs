@@ -1058,6 +1058,26 @@ async fn connect_ssh(
         return Ok((handle, Some(jump_handle)));
     }
 
+    if crate::ssh::proxy::proxy_command_enabled(&session.proxy_command) {
+        let _ = events.send(SessionEvent::Status(format!(
+            "{} {}",
+            t("通过 ProxyCommand 连接", "via ProxyCommand"),
+            addr
+        )));
+        let stream = crate::ssh::proxy::connect_command(
+            &session.proxy_command,
+            &session.host,
+            session.port,
+            &session.user,
+        )
+        .await
+        .with_context(|| format!("ProxyCommand connect to {} failed", addr))?;
+        let handle = client::connect_stream(config, stream, handler)
+            .await
+            .with_context(|| format!("connect {} via ProxyCommand failed", addr))?;
+        return Ok((handle, None));
+    }
+
     // Connect directly, or tunnel through a SOCKS5 / HTTP proxy (issue #7).
     let handle = match crate::ssh::proxy::resolve(&session.proxy) {
         Some(p) => {

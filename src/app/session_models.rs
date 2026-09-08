@@ -468,6 +468,7 @@ pub(super) fn session_from_draft(
         private_key_path,
         private_key_inline,
         proxy: draft.proxy.to_string(),
+        proxy_command: draft.proxy_command.to_string(),
         last_used: None,
         group: draft.group.to_string(),
         kind,
@@ -627,5 +628,57 @@ mod serial_display_tests {
             assert_eq!(rows[0].port, 2222);
             assert_eq!(rows[0].user.as_str(), "alice");
         }
+    }
+}
+
+#[cfg(test)]
+mod draft_tests {
+    use super::*;
+
+    fn draft(proxy_command: &str) -> SessionDraft {
+        SessionDraft {
+            id: "session-id".into(),
+            name: "example".into(),
+            kind: "ssh".into(),
+            host: "ssh.capkin.cn".into(),
+            port: 22,
+            user: "capkin".into(),
+            auth: "password".into(),
+            password: "".into(),
+            private_key_path: "".into(),
+            private_key_inline: "".into(),
+            private_key_inline_mode: false,
+            proxy: "".into(),
+            proxy_command: proxy_command.into(),
+            group: "".into(),
+            serial_port: "".into(),
+            baud_rate: 115_200,
+            data_bits: 8,
+            stop_bits: 1,
+            parity: "none".into(),
+            flow_control: "none".into(),
+            encoding: "UTF-8".into(),
+            vt100_drawing: true,
+            disable_shell_integration: false,
+            notes: "".into(),
+            jump_session_id: "".into(),
+        }
+    }
+
+    #[test]
+    fn session_draft_proxy_command_is_mapped() {
+        let configured = session_from_draft(
+            &draft("cloudflared access ssh --hostname %h"),
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            configured.proxy_command,
+            "cloudflared access ssh --hostname %h"
+        );
+
+        let blank = session_from_draft(&draft(""), None, Vec::new(), Vec::new());
+        assert!(blank.proxy_command.is_empty());
     }
 }

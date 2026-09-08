@@ -2250,6 +2250,14 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_without_proxy_command_defaults_to_empty() {
+        let mut value = serde_json::to_value(Session::new_empty()).unwrap();
+        value.as_object_mut().unwrap().remove("proxy_command");
+        let session: Session = serde_json::from_value(value).unwrap();
+        assert!(session.proxy_command.is_empty());
+    }
+
+    #[test]
     fn wallpaper_transparency_default_migrates_without_overwriting_custom_value() {
         let mut old_default = ConfigFile {
             wallpaper_overlay: PREVIOUS_DEFAULT_WALLPAPER_OVERLAY,

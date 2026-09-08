@@ -34,6 +34,7 @@ export struct SessionDraft {
     private-key-inline: string,
     private-key-inline-mode: bool,
     proxy: string,     // "" | "socks5://host:port" | "http://host:port"
+    proxy-command: string,
     group: string,     // folder/group name ("" = ungrouped)
     // Serial-only (ignored unless kind == "serial")
     serial-port: string,
@@ -481,6 +482,7 @@ export component SessionDialog inherits Rectangle {
     in-out property <bool> draft-key-inline-mode: false;
     in-out property <string> draft-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> draft-proxy-hostport;
+    in-out property <string> draft-proxy-command;
     in-out property <string> draft-group;
     in property <[string]> session-groups;   // existing groups for the dropdown (#179)
     // SSH jump host picker (#211): parallel label/id lists (index 0 = "none")
@@ -1065,6 +1067,28 @@ export component SessionDialog inherits Rectangle {
                 }
             }
 
+            // ── Optional local SSH ProxyCommand ─────────────────────────────
+            if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: @tr("ProxyCommand (optional)");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                }
+                LabeledInput {
+                    input-background: Theme.bg-elevated;
+                    idle-border: Theme.border-strong;
+                    label: @tr("Local command");
+                    placeholder: "cloudflared access ssh --hostname %h";
+                    value <=> root.draft-proxy-command;
+                }
+                Text {
+                    text: @tr("Executed on this computer without a shell; leave blank to disable.");
+                    color: Theme.text-muted;
+                    font-size: Theme.fs-xs;
+                }
+            }
+
             // ── SSH jump host / bastion (SSH only) (#211) ───────────────────
             if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
                 spacing: 4px;
@@ -1194,6 +1218,7 @@ export component SessionDialog inherits Rectangle {
                             proxy: (root.draft-proxy-type == "none" || root.draft-proxy-hostport == "") ? ""
                                  : root.draft-proxy-type == "http" ? "http://" + root.draft-proxy-hostport
                                  : "socks5://" + root.draft-proxy-hostport,
+                            proxy-command: root.draft-proxy-command,
                             group: root.draft-group,
                             serial-port: root.draft-serial-port,
                             baud-rate: root.draft-baud.to-float(),
@@ -1247,6 +1272,7 @@ export component SessionDialog inherits Rectangle {
                             proxy: (root.draft-proxy-type == "none" || root.draft-proxy-hostport == "") ? ""
                                  : root.draft-proxy-type == "http" ? "http://" + root.draft-proxy-hostport
                                  : "socks5://" + root.draft-proxy-hostport,
+                            proxy-command: root.draft-proxy-command,
                             group: root.draft-group,
                             serial-port: root.draft-serial-port,
                             baud-rate: root.draft-baud.to-float(),

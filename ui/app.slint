@@ -848,6 +848,7 @@ export component AppWindow inherits Window {
     in-out property <bool> dialog-key-inline-mode: false;
     in-out property <string> dialog-proxy-type: "none";  // "none" | "socks5" | "http"
     in-out property <string> dialog-proxy-hostport;
+    in-out property <string> dialog-proxy-command;
     in-out property <string> dialog-group;
     // Existing group names (from Rust) for the dialog's group dropdown (#179).
     in property <[string]> session-groups;
@@ -4306,6 +4307,7 @@ export component AppWindow inherits Window {
         draft-key-inline-mode <=> root.dialog-key-inline-mode;
         draft-proxy-type <=> root.dialog-proxy-type;
         draft-proxy-hostport <=> root.dialog-proxy-hostport;
+        draft-proxy-command <=> root.dialog-proxy-command;
         draft-group <=> root.dialog-group;
         session-groups: root.session-groups;
         jump-choices: root.jump-choices;

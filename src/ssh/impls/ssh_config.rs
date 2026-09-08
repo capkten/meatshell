@@ -190,6 +190,7 @@ pub fn parse_str(text: &str, home: &Path) -> Vec<ImportedHost> {
                         user: String::new(),
                         port: 22,
                         identity_file: String::new(),
+                        proxy_command: String::new(),
                     });
                 }
             }
@@ -215,6 +216,15 @@ pub fn parse_str(text: &str, home: &Path) -> Vec<ImportedHost> {
                     if h.identity_file.is_empty() {
                         h.identity_file = expand_tilde(&val, home);
                     }
+                }
+            }
+            "proxycommand" => {
+                if let Some(h) = cur.as_mut() {
+                    h.proxy_command = if val.eq_ignore_ascii_case("none") {
+                        String::new()
+                    } else {
+                        val
+                    };
                 }
             }
             _ => {}
@@ -243,10 +253,23 @@ Host *
     User nobody
 
 Host alias-only
+
+Host cloud
+    HostName ssh.capkin.cn
+    User capkin
+    ProxyCommand cloudflared access ssh --hostname %h
+
+Host no-proxy
+    HostName no-proxy.example.com
+    User capkin
+
+Host proxy-none
+    HostName none.example.com
+    ProxyCommand none
 ";
         let home = Path::new("/home/me");
         let hosts = parse_str(cfg, home);
-        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts.len(), 5);
         assert_eq!(hosts[0].alias, "prod");
         assert_eq!(hosts[0].hostname, "10.0.0.5");
         assert_eq!(hosts[0].user, "deploy");
@@ -255,6 +278,12 @@ Host alias-only
         // alias-only: hostname falls back to the alias
         assert_eq!(hosts[1].alias, "alias-only");
         assert_eq!(hosts[1].hostname, "alias-only");
+        assert_eq!(
+            hosts[2].proxy_command,
+            "cloudflared access ssh --hostname %h"
+        );
+        assert!(hosts[3].proxy_command.is_empty());
+        assert!(hosts[4].proxy_command.is_empty());
     }
 
     #[test]

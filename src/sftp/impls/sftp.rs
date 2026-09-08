@@ -314,22 +314,40 @@ async fn run_sftp(
         }
         None => {
             _jump_keepalive = None;
-            match crate::ssh::proxy::resolve(&session.proxy) {
-                Some(p) => {
-                    let stream = crate::ssh::proxy::connect(&p, &session.host, session.port)
-                        .await
-                        .with_context(|| format!("sftp proxy connect {} failed", addr))?;
-                    client::connect_stream(config.clone(), stream, sftp_handler(&session, &events))
-                        .await
-                        .with_context(|| format!("sftp connect {} failed", addr))?
-                }
-                None => client::connect(
-                    config.clone(),
-                    addr.as_str(),
-                    sftp_handler(&session, &events),
+            if crate::ssh::proxy::proxy_command_enabled(&session.proxy_command) {
+                let stream = crate::ssh::proxy::connect_command(
+                    &session.proxy_command,
+                    &session.host,
+                    session.port,
+                    &session.user,
                 )
                 .await
-                .with_context(|| format!("sftp connect {} failed", addr))?,
+                .with_context(|| format!("sftp ProxyCommand connect {} failed", addr))?;
+                client::connect_stream(config.clone(), stream, sftp_handler(&session, &events))
+                    .await
+                    .with_context(|| format!("sftp connect {} via ProxyCommand failed", addr))?
+            } else {
+                match crate::ssh::proxy::resolve(&session.proxy) {
+                    Some(p) => {
+                        let stream = crate::ssh::proxy::connect(&p, &session.host, session.port)
+                            .await
+                            .with_context(|| format!("sftp proxy connect {} failed", addr))?;
+                        client::connect_stream(
+                            config.clone(),
+                            stream,
+                            sftp_handler(&session, &events),
+                        )
+                        .await
+                        .with_context(|| format!("sftp connect {} failed", addr))?
+                    }
+                    None => client::connect(
+                        config.clone(),
+                        addr.as_str(),
+                        sftp_handler(&session, &events),
+                    )
+                    .await
+                    .with_context(|| format!("sftp connect {} failed", addr))?,
+                }
             }
         }
     };
@@ -370,29 +388,51 @@ async fn run_sftp(
                     }
                     None => {
                         _jump_keepalive = None;
-                        match crate::ssh::proxy::resolve(&session.proxy) {
-                            Some(p) => {
-                                let stream =
-                                    crate::ssh::proxy::connect(&p, &session.host, session.port)
-                                        .await
-                                        .with_context(|| {
-                                            format!("sftp proxy reconnect {} failed", addr)
-                                        })?;
-                                client::connect_stream(
-                                    config.clone(),
-                                    stream,
-                                    sftp_handler(&session, &events),
-                                )
-                                .await
-                                .with_context(|| format!("sftp reconnect {} failed", addr))?
-                            }
-                            None => client::connect(
+                        if crate::ssh::proxy::proxy_command_enabled(&session.proxy_command) {
+                            let stream = crate::ssh::proxy::connect_command(
+                                &session.proxy_command,
+                                &session.host,
+                                session.port,
+                                &session.user,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!("sftp ProxyCommand reconnect {} failed", addr)
+                            })?;
+                            client::connect_stream(
                                 config.clone(),
-                                addr.as_str(),
+                                stream,
                                 sftp_handler(&session, &events),
                             )
                             .await
-                            .with_context(|| format!("sftp reconnect {} failed", addr))?,
+                            .with_context(|| {
+                                format!("sftp reconnect {} via ProxyCommand failed", addr)
+                            })?
+                        } else {
+                            match crate::ssh::proxy::resolve(&session.proxy) {
+                                Some(p) => {
+                                    let stream =
+                                        crate::ssh::proxy::connect(&p, &session.host, session.port)
+                                            .await
+                                            .with_context(|| {
+                                                format!("sftp proxy reconnect {} failed", addr)
+                                            })?;
+                                    client::connect_stream(
+                                        config.clone(),
+                                        stream,
+                                        sftp_handler(&session, &events),
+                                    )
+                                    .await
+                                    .with_context(|| format!("sftp reconnect {} failed", addr))?
+                                }
+                                None => client::connect(
+                                    config.clone(),
+                                    addr.as_str(),
+                                    sftp_handler(&session, &events),
+                                )
+                                .await
+                                .with_context(|| format!("sftp reconnect {} failed", addr))?,
+                            }
                         }
                     }
                 };

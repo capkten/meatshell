@@ -41,4 +41,5 @@ pub struct ImportedHost {
     pub user: String,
     pub port: u16,
     pub identity_file: String,
+    pub proxy_command: String,
 }

@@ -14,8 +14,12 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use std::process::Stdio;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use super::structs::{ProxyConfig, ProxyKind};
 use crate::config::Secret;
@@ -126,9 +130,25 @@ fn parse_command(command: &str) -> Result<Vec<String>> {
     Ok(args)
 }
 
+pub(crate) fn proxy_command_enabled(command: &str) -> bool {
+    let command = command.trim();
+    !command.is_empty() && !command.eq_ignore_ascii_case("none")
+}
+
+#[cfg(windows)]
+fn proxy_command_creation_flags() -> u32 {
+    // CREATE_NO_WINDOW keeps console-based ProxyCommand executables hidden.
+    0x0800_0000
+}
+
+fn configure_proxy_command(command: &mut Command) {
+    #[cfg(windows)]
+    command.creation_flags(proxy_command_creation_flags());
+}
+
 fn expand_command(command: &str, host: &str, port: u16, user: &str) -> Result<Vec<String>> {
     let command = command.trim();
-    if command.is_empty() || command.eq_ignore_ascii_case("none") {
+    if !proxy_command_enabled(command) {
         return Ok(Vec::new());
     }
 
@@ -156,6 +176,111 @@ fn expand_command(command: &str, host: &str, port: u16, user: &str) -> Result<Ve
             Ok(expanded)
         })
         .collect()
+}
+
+pub(crate) struct ProxyCommandStream {
+    child: Option<Child>,
+    stdout: ChildStdout,
+    stdin: Option<ChildStdin>,
+}
+
+impl AsyncRead for ProxyCommandStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ProxyCommandStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let Some(stdin) = self.get_mut().stdin.as_mut() else {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "ProxyCommand stdin is closed",
+            )));
+        };
+        Pin::new(stdin).poll_write(cx, data)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        let Some(stdin) = self.get_mut().stdin.as_mut() else {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "ProxyCommand stdin is closed",
+            )));
+        };
+        Pin::new(stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().stdin.take();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for ProxyCommandStream {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+pub(crate) async fn connect_command(
+    command: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+) -> Result<ProxyCommandStream> {
+    let argv = expand_command(command, host, port, user)?;
+    let Some(program) = argv.first() else {
+        bail!("ProxyCommand is empty");
+    };
+    let mut command = Command::new(program);
+    configure_proxy_command(&mut command);
+    let mut child = command
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("failed to start ProxyCommand executable {program}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("ProxyCommand stdin pipe is unavailable")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("ProxyCommand stdout pipe is unavailable")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("ProxyCommand stderr pipe is unavailable")?;
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 2048];
+        while stderr.read(&mut buffer).await.ok().is_some_and(|n| n > 0) {}
+    });
+
+    Ok(ProxyCommandStream {
+        child: Some(child),
+        stdout,
+        stdin: Some(stdin),
+    })
 }
 
 /// Human-readable description of where we're connecting (for status messages).
@@ -239,6 +364,7 @@ async fn connect_http(cfg: &ProxyConfig, host: &str, port: u16) -> Result<TcpStr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn parses_proxy_command_arguments_and_expands_supported_placeholders() {
@@ -285,5 +411,64 @@ mod tests {
         assert!(expand_command("NONE", "host", 22, "user")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn proxy_command_is_enabled_only_for_nonempty_non_none_values() {
+        assert!(!proxy_command_enabled(""));
+        assert!(!proxy_command_enabled("  none  "));
+        assert!(proxy_command_enabled(
+            "cloudflared access ssh --hostname %h"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn proxy_command_creation_flags_disable_console_window() {
+        assert_eq!(proxy_command_creation_flags(), 0x0800_0000);
+    }
+
+    #[cfg(windows)]
+    fn echo_proxy_command() -> &'static str {
+        "cmd /C more"
+    }
+
+    #[cfg(not(windows))]
+    fn echo_proxy_command() -> &'static str {
+        "cat"
+    }
+
+    #[tokio::test]
+    async fn command_stream_round_trips_bytes() {
+        let mut stream = connect_command(echo_proxy_command(), "host", 22, "user")
+            .await
+            .unwrap();
+        stream.write_all(b"proxy-payload").await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        let expected = if cfg!(windows) {
+            b"proxy-payload\r\n".as_slice()
+        } else {
+            b"proxy-payload".as_slice()
+        };
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn command_stream_reports_missing_executable() {
+        let error = match connect_command(
+            "meatshell-command-that-does-not-exist",
+            "host",
+            22,
+            "user",
+        )
+        .await
+        {
+            Ok(_) => panic!("missing ProxyCommand executable unexpectedly started"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ProxyCommand"));
     }
 }

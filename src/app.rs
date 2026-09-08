@@ -3679,6 +3679,7 @@ fn wire_session_callbacks(
             w.set_dialog_test_status("".into());
             w.set_dialog_proxy_type("none".into());
             w.set_dialog_proxy_hostport("".into());
+            w.set_dialog_proxy_command("".into());
             w.set_dialog_group("".into());
             w.set_dialog_kind("ssh".into());
             w.set_dialog_serial_port("".into());
@@ -3741,6 +3742,7 @@ fn wire_session_callbacks(
                         },
                         auth,
                         private_key_path: h.identity_file,
+                        proxy_command: h.proxy_command,
                         ..Session::new_empty()
                     });
                     added += 1;
@@ -3913,6 +3915,7 @@ fn wire_session_callbacks(
                 let (proxy_type, proxy_hostport) = split_proxy(&session.proxy);
                 w.set_dialog_proxy_type(proxy_type.into());
                 w.set_dialog_proxy_hostport(proxy_hostport.into());
+                w.set_dialog_proxy_command(session.proxy_command.clone().into());
                 let (jump_labels, jump_ids, jump_idx) =
                     jump_candidates(&store, &session.id, &session.jump_session_id);
                 w.set_jump_choices(jump_labels);
@@ -4317,6 +4320,7 @@ fn wire_session_callbacks(
                 private_key_path,
                 private_key_inline,
                 proxy: draft.proxy.to_string(),
+                proxy_command: draft.proxy_command.to_string(),
                 last_used: None,
                 group: draft.group.to_string(),
                 kind,
