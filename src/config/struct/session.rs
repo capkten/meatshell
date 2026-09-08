@@ -59,6 +59,10 @@ fn default_encoding() -> String {
     "UTF-8".to_string()
 }
 
+fn default_vt100_drawing() -> bool {
+    false
+}
+
 /// How a session authenticates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -152,10 +156,20 @@ pub struct Session {
     #[serde(default = "default_encoding")]
     pub encoding: String,
 
+    /// Honor VT100 line drawing (DEC Special Graphics via `ESC ( 0` and SO/SI)
+    /// even when the encoding is UTF-8 (#376). PuTTY's "Enable VT100 line
+    /// drawing even in UTF-8 mode"; opt-in, off for new/existing sessions.
+    #[serde(default = "default_vt100_drawing")]
+    pub vt100_drawing: bool,
+
     // --- SSH port forwarding / tunnels (#56) --------------------------------
     /// Tunnels established automatically when this SSH session connects.
     #[serde(default)]
     pub forwards: Vec<PortForward>,
+
+    /// Expect/send rules evaluated against interactive terminal output (#212).
+    #[serde(default)]
+    pub triggers: Vec<SessionTrigger>,
 
     /// Skip the shell-integration setup (the cwd-follow PROMPT_COMMAND hook + the
     /// remote resource monitor). Those assume a POSIX shell; on a Windows server
@@ -189,6 +203,23 @@ pub struct PortForward {
     pub host_port: u16,
 }
 
+/// Automatically send a response when literal terminal output is observed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionTrigger {
+    pub expect: String,
+    #[serde(default)]
+    pub response: Secret,
+    #[serde(default = "default_true")]
+    pub append_enter: bool,
+    /// False means the rule is consumed after its first match.
+    #[serde(default)]
+    pub repeat: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 impl Session {
     pub fn new_empty() -> Self {
         Self {
@@ -215,7 +246,9 @@ impl Session {
             parity: default_parity(),
             flow_control: default_flow(),
             encoding: default_encoding(),
+            vt100_drawing: default_vt100_drawing(),
             forwards: Vec::new(),
+            triggers: Vec::new(),
             disable_shell_integration: false,
             notes: String::new(),
         }

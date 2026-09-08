@@ -276,8 +276,14 @@ mod tests {
 
     #[test]
     fn empty_or_none_proxy_commands_are_disabled() {
-        assert!(expand_command("   ", "host", 22, "user").unwrap().is_empty());
-        assert!(expand_command("none", "host", 22, "user").unwrap().is_empty());
-        assert!(expand_command("NONE", "host", 22, "user").unwrap().is_empty());
+        assert!(expand_command("   ", "host", 22, "user")
+            .unwrap()
+            .is_empty());
+        assert!(expand_command("none", "host", 22, "user")
+            .unwrap()
+            .is_empty());
+        assert!(expand_command("NONE", "host", 22, "user")
+            .unwrap()
+            .is_empty());
     }
 }

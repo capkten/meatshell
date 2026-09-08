@@ -57,6 +57,9 @@ msgstr "About meatshell"
 msgid "A lightweight Rust + Slint SSH terminal client."
 msgstr "A lightweight Rust + Slint SSH terminal client."
 
+msgid "Transfers manager"
+msgstr "Transfers manager"
+
 msgid "Open source · MIT / Apache-2.0"
 msgstr "Open source · MIT / Apache-2.0"
 
@@ -366,6 +369,12 @@ msgstr "Terminal character encoding"
 msgid "Use GBK for servers configured for GB2312 or GBK output."
 msgstr "Use GBK for servers configured for GB2312 or GBK output."
 
+msgid "Enable VT100 line drawing even in UTF-8 mode"
+msgstr "Enable VT100 line drawing even in UTF-8 mode"
+
+msgid "Show box-drawing output from servers that switch charsets (ESC(0, SO/SI) while staying in UTF-8, e.g. top or mc frames."
+msgstr "Show box-drawing output from servers that switch charsets (ESC(0, SO/SI) while staying in UTF-8, e.g. top or mc frames."
+
 msgid "Local (-L)"
 msgstr "Local (-L)"
 
@@ -398,6 +407,9 @@ msgstr "-D: local SOCKS5 proxy"
 
 msgid "meatshell — a lightweight Rust + Slint SSH client by 'lil meatball'"
 msgstr "meatshell — a lightweight Rust + Slint SSH client by 'lil meatball'"
+
+msgid "A lightweight and efficient Rust + Slint SSH client"
+msgstr "A lightweight and efficient Rust + Slint SSH client"
 
 msgid "Quick connect"
 msgstr "Quick connect"
@@ -545,3 +557,24 @@ msgstr "Session name"
 
 msgid "Leave empty to restore the default name"
 msgstr "Leave empty to restore the default name"
+
+msgid "Login triggers"
+msgstr "Login triggers"
+
+msgid "Expected output"
+msgstr "Expected output"
+
+msgid "Response (leave blank to keep saved value)"
+msgstr "Response (leave blank to keep saved value)"
+
+msgid "Send Enter"
+msgstr "Send Enter"
+
+msgid "Repeat"
+msgstr "Repeat"
+
+msgid "Add trigger"
+msgstr "Add trigger"
+
+msgid "When expected text appears, send the response automatically. Responses are stored encrypted."
+msgstr "When expected text appears, send the response automatically. Responses are stored encrypted."

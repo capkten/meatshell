@@ -107,7 +107,7 @@ if ($newCargoLock -eq $cargoLock) {
 }
 
 if ($DryRun) {
-    Write-Host "Would set Cargo.toml and Cargo.lock version to $version."
+    Write-Host "Would update desktop Cargo manifests/locks to $version."
 } else {
     # Windows PowerShell 5 uses the active ANSI code page for Set-Content by
     # default, which corrupts non-ASCII comments and makes Cargo reject the
@@ -122,7 +122,11 @@ Run-CheckedOutput -Expected "meatshell $version" -Command @(
     "cargo", "run", "--locked", "--", "--version"
 )
 
-Run-Git -GitArgs @("add", "Cargo.toml", "Cargo.lock")
+Run-Git -GitArgs @(
+    "add",
+    "Cargo.toml",
+    "Cargo.lock"
+)
 Run-Git -GitArgs @("commit", "-m", "Release $Tag")
 Run-Git -GitArgs @("tag", "-a", $Tag, "-m", "Release $Tag")
 

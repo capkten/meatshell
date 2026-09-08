@@ -17,7 +17,7 @@ use ssh_key::{HashAlg, PublicKey};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::config::{AuthMethod, PortForward, Session};
+use crate::config::{AuthMethod, PortForward, Secret, Session, SessionTrigger};
 use crate::i18n::t;
 use crate::resource::GpuSnapshot;
 
@@ -27,6 +27,58 @@ use crate::resource::GpuSnapshot;
 const DCU_PROBE: &str = "(bash -lc 'rocm-smi --showpids' || /opt/rocm/bin/rocm-smi --showpids || /usr/local/rocm/bin/rocm-smi --showpids || /usr/local/bin/rocm-smi --showpids)";
 
 use super::structs::*;
+
+struct RuntimeTrigger {
+    rule: SessionTrigger,
+    buffer: String,
+    active: bool,
+}
+
+struct TriggerEngine(Vec<RuntimeTrigger>);
+
+impl TriggerEngine {
+    fn new(rules: &[SessionTrigger]) -> Self {
+        Self(
+            rules
+                .iter()
+                .filter(|rule| !rule.expect.is_empty() && !rule.response.is_empty())
+                .cloned()
+                .map(|rule| RuntimeTrigger {
+                    rule,
+                    buffer: String::new(),
+                    active: true,
+                })
+                .collect(),
+        )
+    }
+
+    fn feed(&mut self, text: &str) -> Vec<(Secret, bool)> {
+        let mut replies = Vec::new();
+        for trigger in &mut self.0 {
+            if !trigger.active {
+                continue;
+            }
+            trigger.buffer.push_str(text);
+            if let Some(end) = trigger
+                .buffer
+                .find(&trigger.rule.expect)
+                .map(|start| start + trigger.rule.expect.len())
+            {
+                replies.push((trigger.rule.response.clone(), trigger.rule.append_enter));
+                trigger.buffer.drain(..end);
+                trigger.active = trigger.rule.repeat;
+            }
+            // Preserve enough trailing text for a match split across chunks.
+            let keep = trigger.rule.expect.len().saturating_sub(1).max(256);
+            if trigger.buffer.len() > keep {
+                let split = trigger.buffer.len() - keep;
+                let split = trigger.buffer.ceil_char_boundary(split);
+                trigger.buffer.drain(..split);
+            }
+        }
+        replies
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SFTP-related shared types
@@ -73,7 +125,7 @@ pub(crate) fn load_session_private_key(session: &Session, pass: &str) -> Result<
 /// Format a byte count as a human-readable string.
 pub fn format_size(bytes: u64) -> String {
     const UNIT: f64 = 1024.0;
-    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
     let mut value = bytes as f64;
     let mut idx = 0;
     while value >= UNIT && idx < UNITS.len() - 1 {
@@ -86,6 +138,54 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.2} {}", value, UNITS[idx])
     } else {
         format!("{:.1} {}", value, UNITS[idx])
+    }
+}
+
+#[cfg(test)]
+mod size_format_tests {
+    use super::{format_size, TriggerEngine};
+    use crate::config::{Secret, SessionTrigger};
+
+    #[test]
+    fn formats_large_storage_units_through_exabytes() {
+        const GIB: u64 = 1024_u64.pow(3);
+        const TIB: u64 = 1024_u64.pow(4);
+        const PIB: u64 = 1024_u64.pow(5);
+        const EIB: u64 = 1024_u64.pow(6);
+
+        assert_eq!(format_size(GIB), "1.0 GB");
+        assert_eq!(format_size(TIB), "1.00 TB");
+        assert_eq!(format_size(PIB), "1.00 PB");
+        assert_eq!(format_size(EIB), "1.00 EB");
+        assert_eq!(format_size(u64::MAX), "16.00 EB");
+    }
+
+    fn trigger(expect: &str, response: &str, repeat: bool) -> SessionTrigger {
+        SessionTrigger {
+            expect: expect.to_string(),
+            response: Secret::new(response),
+            append_enter: true,
+            repeat,
+        }
+    }
+
+    #[test]
+    fn session_trigger_matches_across_output_chunks_once() {
+        let mut engine = TriggerEngine::new(&[trigger("Password:", "secret", false)]);
+        assert!(engine.feed("Pass").is_empty());
+        let replies = engine.feed("word:");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0.as_str(), "secret");
+        assert!(replies[0].1);
+        assert!(engine.feed("Password:").is_empty());
+    }
+
+    #[test]
+    fn repeating_session_trigger_consumes_each_match() {
+        let mut engine = TriggerEngine::new(&[trigger("continue?", "y", true)]);
+        assert_eq!(engine.feed("continue?").len(), 1);
+        assert!(engine.feed("unrelated output").is_empty());
+        assert_eq!(engine.feed("continue?").len(), 1);
     }
 }
 
@@ -247,22 +347,31 @@ async fn remote_supports_prompt_setup(handle: &Handle<ClientHandler>) -> bool {
         let _ = channel.eof().await;
 
         let mut output = String::new();
+        let mut supported: Option<bool> = None;
+        // Drain the channel fully, including the server's CHANNEL_CLOSE. Do not
+        // return as soon as the marker is seen (the old code dropped the Channel
+        // mid-flight) and do not just send `channel.close()` without awaiting the
+        // peer's confirmation: some servers reuse channel IDs aggressively and
+        // will tear down the *next* channel (the interactive shell) if it is
+        // opened while this one is still being torn down. Draining to Close
+        // serializes the teardown and avoids that race.
         while let Some(message) = channel.wait().await {
             match message {
                 ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                    output.push_str(&String::from_utf8_lossy(&data));
-                    if let Some(supported) = prompt_setup_supported(&output) {
-                        return Some(supported);
-                    }
-                    if output.len() > 256 {
-                        return Some(false);
+                    if supported.is_none() {
+                        output.push_str(&String::from_utf8_lossy(&data));
+                        if let Some(s) = prompt_setup_supported(&output) {
+                            supported = Some(s);
+                        } else if output.len() > 256 {
+                            supported = Some(false);
+                        }
                     }
                 }
                 ChannelMsg::Close => break,
                 _ => {}
             }
         }
-        Some(false)
+        supported
     };
 
     tokio::time::timeout(std::time::Duration::from_millis(1000), probe)
@@ -272,15 +381,40 @@ async fn remote_supports_prompt_setup(handle: &Handle<ClientHandler>) -> bool {
         .unwrap_or(false)
 }
 
-/// Detect the start of a ZMODEM transfer (sz/rz) in a raw channel chunk.
-///
-/// Every ZMODEM frame begins with ZDLE (0x18) followed by a type byte; the
-/// `sz` handshake leads with a ZRQINIT hex header (`**\x18B00...`). Matching
-/// ZDLE followed by `B` (hex frame) or `C` (binary frame) reliably catches the
-/// handshake without false-positiving on a lone 0x18 (Ctrl-X) in normal output.
-fn contains_zmodem_init(data: &[u8]) -> bool {
-    data.windows(2)
-        .any(|w| w[0] == 0x18 && (w[1] == b'B' || w[1] == b'C'))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZmodemDirection {
+    /// Remote `sz` sends files; MeatShell receives them.
+    Download,
+    /// Remote `rz` receives files; MeatShell sends selected local files.
+    Upload,
+}
+
+/// Identify the first hex ZMODEM handshake by its actual frame type. Remote
+/// `sz` starts with ZRQINIT (`00`), while remote `rz` starts with ZRINIT (`01`).
+/// Treating both as a receive operation made `rz` deadlock because each side
+/// waited for the other to start sending (#308).
+fn zmodem_direction(data: &[u8]) -> Option<ZmodemDirection> {
+    data.windows(4).find_map(|window| {
+        if window[0] != 0x18 || window[1] != b'B' {
+            return None;
+        }
+        let high = zmodem_hex_nibble(window[2])?;
+        let low = zmodem_hex_nibble(window[3])?;
+        match (high << 4) | low {
+            0 => Some(ZmodemDirection::Download),
+            1 => Some(ZmodemDirection::Upload),
+            _ => None,
+        }
+    })
+}
+
+fn zmodem_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn line_start_before(text: &str, pos: usize) -> usize {
@@ -1585,6 +1719,7 @@ async fn run_session(
     let mut terminal_decoder = crate::terminal::TerminalEncoding::new(&session.encoding);
     let mut extended_decoder = crate::terminal::TerminalEncoding::new(&session.encoding);
     let terminal_encoder = crate::terminal::TerminalEncoding::new(&session.encoding);
+    let mut trigger_engine = TriggerEngine::new(&session.triggers);
 
     // --- Main pump ------------------------------------------------------
     loop {
@@ -1720,14 +1855,60 @@ async fn run_session(
             msg = channel.wait() => {
                 match msg {
                     Some(ChannelMsg::Data { data }) => {
-                        // A `sz` in the terminal starts a ZMODEM send. Receive it
-                        // straight to the Downloads dir (FinalShell style, #76).
-                        // On any protocol error, cancel so the session recovers.
+                        // Route the two ZMODEM handshakes in opposite directions:
+                        // remote `sz` downloads into Downloads; remote `rz` opens
+                        // a local multi-file picker and uploads the selection.
                         let zmodem_cooldown = zmodem_done_at
                             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
-                        if !zmodem_cooldown && contains_zmodem_init(&data) {
-                            let result =
-                                crate::terminal::zmodem::receive(&mut channel, &data, &events).await;
+                        if let Some(direction) = (!zmodem_cooldown)
+                            .then(|| zmodem_direction(&data))
+                            .flatten()
+                        {
+                            let result = match direction {
+                                ZmodemDirection::Download => {
+                                    crate::terminal::zmodem::receive(&mut channel, &data, &events)
+                                        .await
+                                }
+                                ZmodemDirection::Upload => {
+                                    let files = tokio::task::spawn_blocking(|| {
+                                        rfd::FileDialog::new()
+                                            .set_title(t(
+                                                "选择要通过 rz 上传的文件",
+                                                "Choose files to upload via rz",
+                                            ))
+                                            .pick_files()
+                                            .unwrap_or_default()
+                                    })
+                                    .await
+                                    .unwrap_or_default();
+                                    if files.is_empty() {
+                                        let _ = channel.data(&ZMODEM_CANCEL[..]).await;
+                                        let _ = events.send(SessionEvent::Output(format!(
+                                            "\r\n[meatshell] {}\r\n",
+                                            t("已取消 rz 上传", "rz upload cancelled")
+                                        )));
+                                        zmodem_done_at = Some(std::time::Instant::now());
+                                        continue;
+                                    }
+                                    let _ = events.send(SessionEvent::Output(format!(
+                                        "\r\n[meatshell] {} {}...\r\n",
+                                        t("开始上传", "Uploading"),
+                                        files
+                                            .iter()
+                                            .filter_map(|path| path.file_name())
+                                            .map(|name| name.to_string_lossy())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    )));
+                                    crate::terminal::zmodem::send(
+                                        &mut channel,
+                                        &data,
+                                        &files,
+                                        &events,
+                                    )
+                                    .await
+                                }
+                            };
                             zmodem_done_at = Some(std::time::Instant::now());
                             match result {
                                 Ok(leftover) => {
@@ -1744,12 +1925,21 @@ async fn run_session(
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("zmodem receive failed: {e:#}");
+                                    tracing::warn!("zmodem {direction:?} failed: {e:#}");
                                     let _ = channel.data(&ZMODEM_CANCEL[..]).await;
                                     let _ = events.send(SessionEvent::Output(format!(
-                                        "\r\n[meatshell] {}: {e}\r\n",
-                                        t("ZMODEM 接收失败,已取消", "ZMODEM receive failed; cancelled")
-                                    ).into()));
+                                        "\r\n[meatshell] {}: {e:#}\r\n",
+                                        match direction {
+                                            ZmodemDirection::Download => t(
+                                                "ZMODEM 接收失败,已取消",
+                                                "ZMODEM receive failed; cancelled",
+                                            ),
+                                            ZmodemDirection::Upload => t(
+                                                "ZMODEM 上传失败,已取消",
+                                                "ZMODEM upload failed; cancelled",
+                                            ),
+                                        }
+                                    )));
                                 }
                             }
                             continue;
@@ -1780,11 +1970,29 @@ async fn run_session(
                             // Linux/macOS PTYs may echo this command after several
                             // seconds, while unsupported Windows shells never enter
                             // this branch.
-                            // Paint the banner/prompt immediately. Only later
-                            // output containing our injected setup command is
-                            // buffered and stripped; the first usable terminal
-                            // frame no longer waits for shell integration.
-                            let _ = events.send(SessionEvent::Output(chunk));
+                            // Paint the banner/prompt immediately so the first
+                            // usable terminal frame no longer waits for shell
+                            // integration (later output carrying the injected
+                            // setup command is still buffered and stripped).
+                            // On hosts without a login banner this frame IS the
+                            // shell prompt, and the shell prints an identical one
+                            // after the setup command returns — rendering it
+                            // twice. Drop the trailing prompt line here so only
+                            // the post-setup prompt (sent via the normal path
+                            // below) is shown; any banner text above it is
+                            // preserved.
+                            let mut painted = chunk.clone();
+                            if let Some(prompt_line) = painted.rsplit('\n').next() {
+                                if prompt_line
+                                    .trim_end()
+                                    .ends_with(['#', '$', '%', '>'])
+                                {
+                                    if let Some(pos) = painted.rfind(prompt_line) {
+                                        painted.truncate(pos);
+                                    }
+                                }
+                            }
+                            let _ = events.send(SessionEvent::Output(painted));
                             let _ = channel.data(prompt_setup.as_bytes()).await;
                             continue;
                         }
@@ -1799,15 +2007,15 @@ async fn run_session(
                         // buffer remains bounded while preserving split markers.
                         let mut text = if suppress_echo {
                             echo_buf.push_str(&chunk);
-                            if let Some(tail) = take_after_prompt_setup_done(&mut echo_buf) {
-                                suppress_echo = false;
-                                late_prompt_echo_pending = false;
-                                if let Some(cwd) = extract_osc7_path(&tail) {
-                                    tracing::debug!("OSC7 cwd={:?}", cwd);
-                                    let _ = events.send(SessionEvent::CwdChanged(cwd));
-                                }
-                                tail
-                            } else {
+                        if let Some(tail) = take_after_prompt_setup_done(&mut echo_buf) {
+                            suppress_echo = false;
+                            late_prompt_echo_pending = false;
+                            if let Some(cwd) = extract_osc7_path(&tail) {
+                                tracing::debug!("OSC7 cwd={:?}", cwd);
+                                let _ = events.send(SessionEvent::CwdChanged(cwd));
+                            }
+                            tail
+                        } else {
                                 bound_prompt_setup_echo(&mut echo_buf);
                                 continue; // keep buffering; show nothing yet
                             }
@@ -1837,18 +2045,54 @@ async fn run_session(
                             }
                         }
 
+                        for (response, append_enter) in trigger_engine.feed(&text) {
+                            let mut bytes = response.as_str().as_bytes().to_vec();
+                            if append_enter {
+                                bytes.push(b'\r');
+                            }
+                            let encoded = terminal_encoder.encode(&bytes);
+                            if let Err(error) = channel.data(&encoded[..]).await {
+                                tracing::warn!("session trigger response failed: {error}");
+                            }
+                        }
                         let _ = events.send(SessionEvent::Output(text));
                     }
                     Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
                         let text = extended_decoder.decode(&data);
+                        for (response, append_enter) in trigger_engine.feed(&text) {
+                            let mut bytes = response.as_str().as_bytes().to_vec();
+                            if append_enter {
+                                bytes.push(b'\r');
+                            }
+                            let encoded = terminal_encoder.encode(&bytes);
+                            if let Err(error) = channel.data(&encoded[..]).await {
+                                tracing::warn!("session trigger response failed: {error}");
+                            }
+                        }
                         let _ = events.send(SessionEvent::Output(text));
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        tracing::warn!(host = %session.host, exit_status, "SSH shell exited");
                         let _ = events.send(SessionEvent::Status(
                             format!("{} (code {exit_status})", t("远程进程退出", "remote process exited")),
                         ));
                     }
-                    Some(ChannelMsg::Close) | None => {
+                    Some(ChannelMsg::ExitSignal { signal_name, core_dumped, error_message, .. }) => {
+                        tracing::warn!(host = %session.host, signal = ?signal_name,
+                            core_dumped, message = ?error_message, "SSH shell terminated by signal");
+                    }
+                    Some(ChannelMsg::Close) => {
+                        tracing::warn!(host = %session.host,
+                            compatibility_mode = session.disable_shell_integration,
+                            elapsed_ms = session_started.elapsed().as_millis(),
+                            "SSH shell channel closed by peer");
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(host = %session.host,
+                            compatibility_mode = session.disable_shell_integration,
+                            elapsed_ms = session_started.elapsed().as_millis(),
+                            "SSH shell channel receiver ended; check transport disconnect log");
                         break;
                     }
                     _ => {}
@@ -2834,6 +3078,36 @@ pub(crate) async fn resolve_credentials(
 impl Handler for ClientHandler {
     type Error = russh::Error;
 
+    // The channel receiver closes for both transport failures and peer shutdown.
+    // Preserve the transport reason at WARN level before the shell pump loses it.
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => {
+                tracing::warn!(
+                    host = %self.host,
+                    port = self.port,
+                    reason = ?info.reason_code,
+                    message = ?info.message,
+                    "SSH server sent disconnect"
+                );
+                Ok(())
+            }
+            client::DisconnectReason::Error(error) => {
+                tracing::warn!(
+                    host = %self.host,
+                    port = self.port,
+                    error = ?error,
+                    "SSH transport ended with error"
+                );
+                // Match russh's default handler: callers must still receive it.
+                Err(error)
+            }
+        }
+    }
+
     async fn check_server_key(
         &mut self,
         server_public_key: &PublicKey,
@@ -3032,6 +3306,29 @@ mod prompt_setup_echo_tests {
 
         assert_eq!(parser.screen().contents().lines().next(), Some(prompt));
         assert_eq!(parser.screen().cursor_position(), (0, prompt.len() as u16));
+    }
+}
+
+#[cfg(test)]
+mod zmodem_detection_tests {
+    use super::{zmodem_direction, ZmodemDirection};
+
+    #[test]
+    fn distinguishes_remote_sz_from_remote_rz() {
+        assert_eq!(
+            zmodem_direction(b"**\x18B00000000000000\r\n"),
+            Some(ZmodemDirection::Download)
+        );
+        assert_eq!(
+            zmodem_direction(b"rz waiting to receive.**\x18B0100000023be50\r\n\x11"),
+            Some(ZmodemDirection::Upload)
+        );
+    }
+
+    #[test]
+    fn ignores_non_handshake_frames_and_ctrl_x() {
+        assert_eq!(zmodem_direction(b"plain \x18 text"), None);
+        assert_eq!(zmodem_direction(b"**\x18B08000000000000\r\n"), None);
     }
 }
 

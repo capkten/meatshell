@@ -14,6 +14,13 @@ export struct PortFwd {
     host-port: string,
 }
 
+export struct TriggerDraft {
+    expect: string,
+    response: string,
+    append-enter: bool,
+    repeat: bool,
+}
+
 export struct SessionDraft {
     id: string,
     name: string,
@@ -36,6 +43,9 @@ export struct SessionDraft {
     parity: string,        // "none" | "odd" | "even"
     flow-control: string,  // "none" | "hardware" | "software"
     encoding: string,
+    // Honor VT100 line drawing (DEC Special Graphics) even in UTF-8 mode (#376),
+    // like PuTTY's Window → Translation option. On by default.
+    vt100-drawing: bool,
     // Skip the POSIX shell-integration setup (cwd-follow hook + monitor) for
     // Windows / pwsh servers where it breaks the shell (#140).
     disable-shell-integration: bool,
@@ -81,6 +91,19 @@ component MiniInput inherits Rectangle {
     border-width: 1px;
     border-color: mi.has-focus ? Theme.accent : Theme.border-subtle;
     background: Theme.bg-root;
+    // Hide on focus: IME preedit is visible before value is committed.
+    if root.value == "" && !mi.has-focus : Text {
+        x: 8px;
+        width: parent.width - 16px;
+        height: parent.height;
+        overflow: elide;
+        text: root.placeholder;
+        color: Theme.text-muted;
+        font-family: Theme.ui-font-family;
+        font-size: Theme.fs-md;
+        vertical-alignment: center;
+    }
+
     mi := TextInput {
         x: 8px;
         width: parent.width - 16px;
@@ -92,14 +115,6 @@ component MiniInput inherits Rectangle {
         single-line: true;
         text <=> root.value;
         edited => { root.edited(root.value); }
-    }
-    if root.value == "" : Text {
-        x: 8px;
-        height: parent.height;
-        text: root.placeholder;
-        color: Theme.text-muted;
-        font-size: Theme.fs-md;
-        vertical-alignment: center;
     }
 }
 
@@ -189,6 +204,64 @@ component PortForwardRow inherits VerticalLayout {
     }
 }
 
+component TriggerRow inherits VerticalLayout {
+    in property <TriggerDraft> trigger;
+    in property <int> index;
+    callback updated(int, TriggerDraft);
+    callback remove(int);
+
+    property <string> expect: trigger.expect;
+    property <string> response: trigger.response;
+    property <bool> append-enter: trigger.append-enter;
+    property <bool> repeat: trigger.repeat;
+
+    function notify-updated() {
+        root.updated(root.index, {
+            expect: root.expect,
+            response: root.response,
+            append-enter: root.append-enter,
+            repeat: root.repeat,
+        });
+    }
+
+    spacing: 6px;
+    padding: 8px;
+    HorizontalLayout {
+        spacing: 6px;
+        MiniInput {
+            placeholder: @tr("Expected output");
+            value <=> root.expect;
+            edited(value) => { root.expect = value; root.notify-updated(); }
+        }
+        Rectangle {
+            width: 30px; height: 30px;
+            border-radius: Theme.radius-sm;
+            background: trigger-remove.has-hover ? Theme.danger.with-alpha(0.18) : transparent;
+            trigger-remove := TouchArea { mouse-cursor: pointer; clicked => { root.remove(root.index); } }
+            Text {
+                text: "\u{E5CD}"; font-family: "Material Icons"; color: Theme.danger;
+                font-size: Theme.fs-sm; horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+    }
+    MiniInput {
+        placeholder: @tr("Response (leave blank to keep saved value)");
+        value <=> root.response;
+        edited(value) => { root.response = value; root.notify-updated(); }
+    }
+    HorizontalLayout {
+        spacing: 14px;
+        SegOption {
+            label: @tr("Send Enter"); active: root.append-enter;
+            clicked => { root.append-enter = !root.append-enter; root.notify-updated(); }
+        }
+        SegOption {
+            label: @tr("Repeat"); active: root.repeat;
+            clicked => { root.repeat = !root.repeat; root.notify-updated(); }
+        }
+    }
+}
+
 // Group field with an editable text box + a dropdown of existing groups (#179).
 // Type to create a new group, or click the ▾ to pick one already in use.
 component GroupCombo inherits VerticalLayout {
@@ -211,6 +284,19 @@ component GroupCombo inherits VerticalLayout {
     border-color: ginput.has-focus ? Theme.accent : Theme.border-strong;
     background: Theme.bg-elevated;
 
+        // Hide on focus: IME preedit is visible before value is committed.
+        if root.value == "" && !ginput.has-focus : Text {
+            x: 10px;
+            width: parent.width - 44px;
+            height: parent.height;
+            overflow: elide;
+            text: root.placeholder;
+            color: Theme.text-muted;
+            font-family: Theme.ui-font-family;
+            font-size: Theme.fs-md;
+            vertical-alignment: center;
+        }
+
         ginput := TextInput {
             x: 10px;
             width: parent.width - 44px;     // room for the ▾ button
@@ -223,14 +309,6 @@ component GroupCombo inherits VerticalLayout {
             single-line: true;
         }
 
-        if root.value == "" : Text {
-            x: 10px;
-            height: parent.height;
-            text: root.placeholder;
-            color: Theme.text-muted;
-            font-size: Theme.fs-md;
-            vertical-alignment: center;
-        }
 
         // ▾ — opens the existing-groups list (no-op when there are none).
         drop-ta := TouchArea {
@@ -417,12 +495,14 @@ export component SessionDialog inherits Rectangle {
     in-out property <string> draft-parity: "none";
     in-out property <string> draft-flow: "none";
     in-out property <string> draft-encoding: "UTF-8";
+    in-out property <bool> draft-vt100-drawing: false;
     in-out property <bool> draft-disable-shell-integration: false;
     in-out property <string> draft-notes;
     in-out property <string> test-status;
 
     // Port forwards / tunnels (#56). Every row is an editable form (#277).
     in property <[PortFwd]> forwards;
+    in property <[TriggerDraft]> triggers;
     property <bool> show-advanced: false;   // collapse proxy + forwarding (#56)
 
     callback submit(SessionDraft);
@@ -431,6 +511,9 @@ export component SessionDialog inherits Rectangle {
     callback add-forward();
     callback update-forward(int /* index */, PortFwd);
     callback delete-forward(int /* index */);
+    callback add-trigger();
+    callback update-trigger(int /* index */, TriggerDraft);
+    callback delete-trigger(int /* index */);
     callback pick-key-file();   // open a native file picker for the private key
 
     visible: is-open;
@@ -497,7 +580,10 @@ export component SessionDialog inherits Rectangle {
                     height: 32px;
                     y: (parent.height - self.height) / 2;
                     border-radius: Theme.radius-sm;
-                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
+                    // Match ProcWindow's close button: red (#e81123) on hover,
+                    // white glyph, smooth 90ms transition (#close-hover-red).
+                    background: close-ta.has-hover ? #e81123 : transparent;
+                    animate background { duration: 90ms; }
                     close-ta := TouchArea {
                         mouse-cursor: pointer;
                         clicked => { root.cancel(); }
@@ -505,7 +591,7 @@ export component SessionDialog inherits Rectangle {
                     Text {
                         text: "\u{E5CD}";
                         font-family: "Material Icons";
-                        color: Theme.text-secondary;
+                        color: close-ta.has-hover ? white : Theme.text-secondary;
                         font-size: 18px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -910,6 +996,45 @@ export component SessionDialog inherits Rectangle {
                 Rectangle { height: 6px; }
             }
 
+            // ── VT100 line drawing (all session kinds) (#376) ───────────────
+            // Mirror of PuTTY's "Enable VT100 line drawing even in UTF-8 mode":
+            // honor ESC(0 / SO-SI charset switches and map DEC Special Graphics
+            // to box-drawing glyphs even when the encoding is UTF-8.
+            if root.show-advanced : VerticalLayout {
+                spacing: 6px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        width: 18px; height: 18px; y: 1px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: root.draft-vt100-drawing ? Theme.accent : Theme.border-strong;
+                        background: root.draft-vt100-drawing ? Theme.accent : transparent;
+                        Text {
+                            text: root.draft-vt100-drawing ? "\u{E5CA}" : "";
+                            font-family: "Material Icons"; color: white; font-size: 14px;
+                            width: 100%; height: 100%;
+                            horizontal-alignment: center; vertical-alignment: center;
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.draft-vt100-drawing = !root.draft-vt100-drawing; }
+                        }
+                    }
+                    Text {
+                        text: @tr("Enable VT100 line drawing even in UTF-8 mode");
+                        color: Theme.text-primary; font-size: Theme.fs-sm;
+                        vertical-alignment: center; horizontal-stretch: 1;
+                    }
+                }
+                Text {
+                    text: @tr("Show box-drawing output from servers that switch charsets (ESC(0, SO/SI) while staying in UTF-8, e.g. top or mc frames.");
+                    color: Theme.text-muted; font-size: Theme.fs-xs; wrap: word-wrap;
+                }
+                Rectangle { height: 6px; }
+            }
+
             // ── Optional outbound proxy (SSH / Telnet only) ─────────────────
             if root.show-advanced && root.draft-kind != "serial" : VerticalLayout {
                 spacing: 4px;
@@ -1019,6 +1144,26 @@ export component SessionDialog inherits Rectangle {
                 }
             }
 
+            // ── Expect/send login triggers (SSH only) (#212) ───────────────
+            if root.show-advanced && root.draft-kind == "ssh" : VerticalLayout {
+                spacing: 6px;
+                Text { text: @tr("Login triggers"); color: Theme.text-secondary; font-size: Theme.fs-sm; }
+                for trigger[i] in root.triggers : TriggerRow {
+                    trigger: trigger;
+                    index: i;
+                    updated(index, value) => { root.update-trigger(index, value); }
+                    remove(index) => { root.delete-trigger(index); }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    PrimaryButton { text: @tr("Add trigger"); clicked => { root.add-trigger(); } }
+                }
+                Text {
+                    text: @tr("When expected text appears, send the response automatically. Responses are stored encrypted.");
+                    color: Theme.text-muted; font-size: Theme.fs-xs; wrap: word-wrap;
+                }
+            }
+
             HorizontalLayout {
                 spacing: 8px;
                 GhostButton {
@@ -1057,6 +1202,7 @@ export component SessionDialog inherits Rectangle {
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
                             encoding: root.draft-encoding,
+                            vt100-drawing: root.draft-vt100-drawing,
                             disable-shell-integration: root.draft-disable-shell-integration,
                             notes: root.draft-notes,
                             jump-session-id: (root.draft-jump-index > 0 && root.draft-jump-index < root.jump-ids.length)
@@ -1109,6 +1255,7 @@ export component SessionDialog inherits Rectangle {
                             parity: root.draft-parity,
                             flow-control: root.draft-flow,
                             encoding: root.draft-encoding,
+                            vt100-drawing: root.draft-vt100-drawing,
                             disable-shell-integration: root.draft-disable-shell-integration,
                             notes: root.draft-notes,
                             jump-session-id: (root.draft-jump-index > 0 && root.draft-jump-index < root.jump-ids.length)

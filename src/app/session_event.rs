@@ -97,6 +97,13 @@ pub(super) fn apply_session_event_to_window(
             }
         }
         SessionEvent::Closed(reason) => {
+            // A disconnected tab remains open for Enter-to-reconnect, but it
+            // must not retain the old firehose scrollback while idle. Keep the
+            // tab and its status, release the heavy terminal state, then paint
+            // only the reconnect hint below.
+            if let Some(h) = crate::app::term_buf(bufs, tab_id) {
+                h.lock().unwrap().release_scrollback();
+            }
             // Print the hint into the terminal itself (FinalShell-style), via a
             // synthetic Output event so it reuses the normal render path (#79).
             apply_session_event_to_window(
@@ -271,6 +278,25 @@ pub(super) fn apply_session_event_to_window(
                 t.sftp_path = path.clone().into();
                 t.sftp_entries = model.clone();
                 t.sftp_loading = false;
+                // Reset the multi-select counter (#sftp-entries-selection).
+                // Every entry above is built with `selected: false`, so the
+                // rebuilt list is visually unchecked — but `sftp_selected_count`
+                // is a *separate* field on the tab row and is NOT derived from
+                // the entries, so it silently kept its stale value (e.g. "2")
+                // and the toolbar's count label plus the batch download/delete
+                // buttons stayed on screen until the user ticked a checkbox to
+                // force a recount.
+                // Clearing it here — where the list is actually rebuilt — fixes
+                // every path that reloads a directory at once: upload (both the
+                // SFTP panel button and shell drag-and-drop end in a `list_dir`
+                // + `SftpEntries` once the transfer finishes), download, delete,
+                // rename, mkdir, navigate and manual refresh. Future reload
+                // paths are covered automatically instead of needing another
+                // per-callback patch like the earlier `on_sftp_refresh` fix.
+                // NOTE: sorting is deliberately unaffected — it goes through
+                // `sorted_sftp_entries_from_model` in sftp_callbacks.rs, which
+                // re-sorts the existing rows and must preserve the selection.
+                t.sftp_selected_count = 0;
             });
         }
         SessionEvent::SftpStatus(msg) => {
@@ -293,7 +319,7 @@ pub(super) fn apply_session_event_to_window(
         } => {
             if error.is_empty() {
                 // Open the built-in viewer/editor (#70).
-                win.set_editor_line_numbers(line_numbers_for(&content).into());
+                win.set_editor_lines(editor_lines_for(&content));
                 win.set_editor_path(path.into());
                 win.set_editor_name(name.into());
                 win.set_editor_content(content.into());
@@ -401,6 +427,16 @@ pub(super) fn apply_session_event_to_window(
                     Some(i) => model.set_row_data(i, rec),
                     None => model.insert(0, rec), // newest at top
                 }
+                // Drive the breathing indicator on the Transfers toolbar button:
+                // `true` while any row is active (0) or preparing (3); flips back
+                // to `false` the moment the last transfer finishes (#breathing-light).
+                let has_active = (0..model.row_count()).any(|i| {
+                    model
+                        .row_data(i)
+                        .map(|r| r.state == 0 || r.state == 3)
+                        .unwrap_or(false)
+                });
+                win.set_has_active_transfers(has_active);
             }
         }
         SessionEvent::HostKeyPrompt {

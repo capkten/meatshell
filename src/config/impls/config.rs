@@ -58,8 +58,8 @@ pub fn data_dir() -> PathBuf {
 
 /// Directory for diagnostic logs (`error.log`). Kept *separate* from the config
 /// dir so logs don't clutter user data: portable-first → a `log/` folder beside
-/// the executable (a sibling of `config/`), falling back to a `log/` subdir
-/// under the per-user data dir when the exe dir is read-only (Program Files etc.)
+/// the executable (a sibling of `config/`). On Windows, the fallback is
+/// `%APPDATA%/meatshell/meatshell/log/log`, outside the config directory
 /// (#log-dir).
 pub fn log_dir() -> PathBuf {
     // Portable: <exe_dir>/log, sibling of the portable config/ folder.
@@ -71,11 +71,24 @@ pub fn log_dir() -> PathBuf {
             }
         }
     }
-    // Read-only exe dir → put logs in their own subdir under the per-user data
-    // dir (still not mixed in with sessions.json et al.).
-    let dir = data_dir().join("log");
+    // Resolve independently from portable configuration storage.
+    let dir = user_log_dir();
     let _ = fs::create_dir_all(&dir);
     dir
+}
+
+fn user_log_dir() -> PathBuf {
+    let config = legacy_data_dir().unwrap_or_else(|| std::env::temp_dir().join("meatshell"));
+    user_log_dir_from_config(&config, cfg!(target_os = "windows"))
+}
+
+fn user_log_dir_from_config(config: &Path, windows: bool) -> PathBuf {
+    if windows {
+        if let Some(base) = config.parent() {
+            return base.join("log").join("log");
+        }
+    }
+    config.join("log")
 }
 
 /// Pre-0.4.15 location: the per-user OS config dir
@@ -483,6 +496,12 @@ impl ConfigStore {
                             Self::try_decrypt(&key, session.private_key_inline.as_str())
                         {
                             session.private_key_inline = Secret::new(plain);
+                        }
+                        for trigger in &mut session.triggers {
+                            if let Some(plain) = Self::try_decrypt(&key, trigger.response.as_str())
+                            {
+                                trigger.response = Secret::new(plain);
+                            }
                         }
                     }
                     if let Some(plain) = Self::try_decrypt(&key, cfg.webdav_password.as_str()) {
@@ -1559,6 +1578,14 @@ impl ConfigStore {
                 let enc = Self::encrypt(&self.key, session.private_key_inline.as_str())?;
                 session.private_key_inline = Secret::new(enc);
             }
+            for trigger in &mut session.triggers {
+                if !trigger.response.is_empty()
+                    && !trigger.response.as_str().starts_with(Self::ENC_PREFIX)
+                {
+                    let enc = Self::encrypt(&self.key, trigger.response.as_str())?;
+                    trigger.response = Secret::new(enc);
+                }
+            }
         }
         if !disk.webdav_password.is_empty()
             && !disk.webdav_password.as_str().starts_with(Self::ENC_PREFIX)
@@ -1685,6 +1712,12 @@ impl ConfigStore {
                 let enc = Self::encrypt_export(s.private_key_inline.as_str())?;
                 s.private_key_inline = Secret::new(enc);
             }
+            for trigger in &mut s.triggers {
+                if !trigger.response.is_empty() {
+                    let enc = Self::encrypt_export(trigger.response.as_str())?;
+                    trigger.response = Secret::new(enc);
+                }
+            }
             // `last_used` is machine-local noise — don't carry it across.
             s.last_used = None;
         }
@@ -1737,6 +1770,15 @@ impl ConfigStore {
                     Self::try_decrypt(&self.key, s.private_key_inline.as_str())
                 {
                     s.private_key_inline = Secret::new(plain);
+                }
+                for trigger in &mut s.triggers {
+                    if let Some(plain) = Self::decrypt_export(trigger.response.as_str()) {
+                        trigger.response = Secret::new(plain);
+                    } else if let Some(plain) =
+                        Self::try_decrypt(&self.key, trigger.response.as_str())
+                    {
+                        trigger.response = Secret::new(plain);
+                    }
                 }
             }
             let dup = self.cache.sessions.iter().any(|x| {
@@ -2415,5 +2457,25 @@ mod tests {
         assert!(!store.reorder_session("a", -1));
         assert!(!store.reorder_session("x", 1));
         assert!(!store.reorder_session("nope", 1));
+    }
+}
+
+#[cfg(test)]
+mod log_path_tests {
+    use super::*;
+
+    #[test]
+    fn windows_user_logs_are_outside_config() {
+        let base = Path::new("profile").join("meatshell").join("meatshell");
+        assert_eq!(
+            user_log_dir_from_config(&base.join("config"), true),
+            base.join("log").join("log")
+        );
+    }
+
+    #[test]
+    fn unix_user_log_path_is_unchanged() {
+        let config = Path::new("home/.config/meatshell");
+        assert_eq!(user_log_dir_from_config(config, false), config.join("log"));
     }
 }

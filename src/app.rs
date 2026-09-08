@@ -7,8 +7,6 @@
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
 pub(crate) mod core;
-#[cfg(target_os = "macos")]
-mod dock_menu;
 #[cfg(windows)]
 mod jump_list;
 pub mod launch;
@@ -18,6 +16,7 @@ mod resource_ui;
 mod session_event;
 mod session_models;
 mod session_runtime;
+mod session_trigger;
 mod sftp_callbacks;
 mod sftp_ui;
 mod sidebar;
@@ -35,6 +34,7 @@ use self::resource_ui::*;
 use self::session_event::*;
 use self::session_models::*;
 use self::session_runtime::*;
+use self::session_trigger::*;
 use self::sftp_callbacks::*;
 use self::sftp_ui::*;
 use self::sidebar::*;
@@ -172,9 +172,10 @@ use crate::ssh::{
 use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
     bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
-    encode_command_bar_input, encode_pasted_text, key_to_pty_bytes, paste_requires_large_review,
-    should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset,
-    RenderGates, TabRenderGate, TermBuffer, TermBufferHandle, TermBuffers,
+    encode_command_bar_input, encode_mouse_event, encode_pasted_text, is_terminal_interrupt,
+    key_to_pty_bytes, paste_requires_large_review, should_drop_bare_ctrl_marker,
+    terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset, RenderGates, TabRenderGate,
+    TermBuffer, TermBufferHandle, TermBuffers,
 };
 #[cfg(test)]
 use crate::terminal::{
@@ -385,14 +386,6 @@ fn do_tab_render_flush(
 /// Number of samples kept for the sparkline.
 const NET_HISTORY_LEN: usize = 60;
 
-/// Set once by `run()`; lets a platform entry point outside the Slint
-/// callback tree (the macOS Dock menu) open a window. Only ever invoked from
-/// the UI/main thread.
-#[cfg(target_os = "macos")]
-thread_local! {
-    static NEW_WINDOW_HOOK: RefCell<Option<Rc<dyn Fn()>>> = RefCell::new(None);
-}
-
 // UI-thread handle to the process core, published by `run()` before the
 // event loop starts. Cross-thread callers (the single-instance IPC
 // listener) run a capture-less closure via `invoke_from_event_loop` and
@@ -400,22 +393,6 @@ thread_local! {
 // threads.
 thread_local! {
     static NEW_WINDOW_CORE: RefCell<Option<Rc<AppCore>>> = const { RefCell::new(None) };
-}
-
-#[cfg(target_os = "macos")]
-fn set_new_window_hook(f: Rc<dyn Fn()>) {
-    NEW_WINDOW_HOOK.with(|h| *h.borrow_mut() = Some(f));
-}
-
-/// Open a new window from a platform entry point (macOS Dock menu action).
-/// Runs on the main/UI thread; a no-op until `run()` installs the hook.
-#[cfg(target_os = "macos")]
-pub(crate) fn request_new_window() {
-    NEW_WINDOW_HOOK.with(|h| {
-        if let Some(f) = h.borrow().as_ref() {
-            f();
-        }
-    });
 }
 
 /// Embed the app icon PNG into the binary and set it as the X11 window icon.
@@ -560,33 +537,7 @@ pub fn run(intent: crate::app::launch::LaunchIntent) -> Result<()> {
     #[cfg(windows)]
     crate::app::jump_list::register_new_window_task();
 
-    // macOS Dock menu ("新建窗口"): install the new-window hook first so a
-    // Dock click can never race ahead of it. The NSApplication patching
-    // itself happens after the first window below, because AppKit asks the
-    // winit delegate for the Dock menu and that delegate only exists once
-    // the backend has built a window. Failures are warn-only and never
-    // block startup (see dock_menu.rs).
-    #[cfg(target_os = "macos")]
-    {
-        let core = core.clone();
-        set_new_window_hook(Rc::new(move || {
-            match open_window(core.clone(), true, None) {
-                Ok(window_id) => {
-                    if let Some(st) = core.window_states.borrow().get(&window_id) {
-                        if let Some(w) = st.weak.upgrade() {
-                            raise_to_front(&w);
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!("failed to open new window: {e:#}"),
-            }
-        }));
-    }
-
     open_window(core.clone(), false, None)?;
-
-    #[cfg(target_os = "macos")]
-    crate::app::dock_menu::install_dock_menu();
 
     // Publish the core to the UI thread so the IPC listener's
     // invoke_from_event_loop closures can open windows without capturing the
@@ -780,6 +731,22 @@ fn open_window(
         use i_slint_backend_winit::winit::window::ResizeDirection;
         let weak = proc_win.as_weak();
         proc_win.on_win_resize_se(move || {
+            if let Some(w) = weak.upgrade() {
+                w.window().with_winit_window(|ww| {
+                    let _ = ww.drag_resize_window(ResizeDirection::SouthEast);
+                });
+                schedule_slint_pointer_ungrab(weak.clone());
+            }
+        });
+    }
+    {
+        // Bottom-right resize grip on the main window (frameless mode only).
+        // #main-resize-grip: mirrors proc_window's grip so the main window
+        // gets the same OS-drag-resize-from-corner behavior when the OS title
+        // bar is hidden (custom-titlebar mode on Windows/Linux).
+        use i_slint_backend_winit::winit::window::ResizeDirection;
+        let weak = window.as_weak();
+        window.on_win_resize_se(move || {
             if let Some(w) = weak.upgrade() {
                 w.window().with_winit_window(|ww| {
                     let _ = ww.drag_resize_window(ResizeDirection::SouthEast);
@@ -1814,11 +1781,18 @@ fn open_window(
         window.on_set_welcome_as_sidebar(move |v| {
             // The property is two-way-bound through InterfacePanel and changing
             // it destroys/recreates the Welcome subtree that owns the Switch.
-            // Defer the *entire* transition until its callback has returned;
-            // deferring only refresh_panes still destroys the component tree
-            // recursively on Windows (#323).
+            // Persist first: saving config does not touch the Slint tree, and
+            // doing it synchronously means an immediate window close cannot
+            // lose the preference. Only the property/layout transition needs
+            // to wait until this Switch callback has returned (#323).
+            {
+                let mut s = store.borrow_mut();
+                s.set_welcome_as_sidebar(v);
+                if let Err(error) = s.save() {
+                    tracing::warn!("failed to persist welcome sidebar preference: {error:#}");
+                }
+            }
             let weak = weak.clone();
-            let store = store.clone();
             let layout = layout.clone();
             let content_size = content_size.clone();
             let tabs_model = tabs_model.clone();
@@ -1827,11 +1801,6 @@ fn open_window(
             slint::Timer::single_shot(std::time::Duration::ZERO, move || {
                 if let Some(w) = weak.upgrade() {
                     w.set_welcome_as_sidebar(v);
-                    {
-                        let mut s = store.borrow_mut();
-                        s.set_welcome_as_sidebar(v);
-                        let _ = s.save();
-                    }
                     {
                         let mut lay = layout.borrow_mut();
                         update_welcome_tab(&mut lay, v);
@@ -3449,6 +3418,10 @@ fn active_terminal_panel_rects(win: &AppWindow) -> Option<(String, LogicalRect, 
     ))
 }
 
+/// The SFTP file-list rectangle inside the active terminal panel. Kept for a
+/// future dedicated SFTP drop target; the shell-page drop currently accepts the
+/// whole terminal panel instead of just this region (#drag-onto-shell).
+#[allow(dead_code)]
 fn active_sftp_file_list_rect(win: &AppWindow) -> Option<LogicalRect> {
     let (_active, term, term_state) = active_terminal_panel_rects(win)?;
     if term_state.sftp_collapsed {
@@ -3517,8 +3490,9 @@ fn cursor_pos() -> Option<(i32, i32)> {
     }
 }
 
-/// Handle an OS file drop: if it landed over the SFTP file-list area of the
-/// active session tab, upload the file to that tab's current remote directory.
+/// Handle an OS file drop: if it landed over the terminal panel (the shell page)
+/// of the active session tab, upload the file to that tab's current remote
+/// directory.
 #[cfg(windows)]
 fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path::PathBuf) {
     let active = win.get_active_tab_id().to_string();
@@ -3536,11 +3510,14 @@ fn handle_file_drop(win: &AppWindow, sftp_handles: &SftpHandles, path: std::path
     // Drop point in logical client coordinates.
     let client_x = (cx - inner.x) as f32 / scale;
     let client_y = (cy - inner.y) as f32 / scale;
-    let Some(file_list) = active_sftp_file_list_rect(win) else {
+    // Accept drops anywhere over the whole terminal panel ("shell page"), so
+    // dragging a file onto the terminal uploads it to the session's current
+    // directory — not just onto the SFTP file list (#drag-onto-shell).
+    let Some((_active, term, _term_state)) = active_terminal_panel_rects(win) else {
         return;
     };
-    if !contains_logical(file_list, client_x, client_y) {
-        return; // dropped outside the file list — ignore
+    if !contains_logical(term, client_x, client_y) {
+        return; // dropped outside the terminal panel — ignore
     }
 
     let dir = active_sftp_path(win, &active);
@@ -3637,6 +3614,10 @@ fn wire_session_callbacks(
     // Session.forwards; opening the dialog (new/edit) resets it.
     let edit_forwards: Rc<RefCell<Vec<PortFwd>>> =
         Rc::new(RefCell::new(vec![blank_forward_draft()]));
+    let edit_triggers: Rc<RefCell<Vec<TriggerDraft>>> =
+        Rc::new(RefCell::new(vec![blank_trigger_draft()]));
+    let edit_trigger_secrets: Rc<RefCell<Vec<Secret>>> =
+        Rc::new(RefCell::new(vec![Secret::default()]));
     // on_connect_session moves the panes_model binding into its closure; the
     // rename handler below needs its own handle, so clone up front.
     let panes_model_rename = panes_model.clone();
@@ -3666,12 +3647,17 @@ fn wire_session_callbacks(
     // New session -> open dialog with blank draft.
     let weak = window.as_weak();
     let ef_new = edit_forwards.clone();
+    let et_new = edit_triggers.clone();
+    let ets_new = edit_trigger_secrets.clone();
     let store_ng = store.clone();
     window.on_new_session_clicked(move || {
         if let Some(w) = weak.upgrade() {
             *ef_new.borrow_mut() = vec![blank_forward_draft()];
+            *et_new.borrow_mut() = vec![blank_trigger_draft()];
+            *ets_new.borrow_mut() = vec![Secret::default()];
             w.set_session_groups(session_groups_model(&store_ng.borrow()));
             w.set_dialog_forwards(forward_model(&ef_new.borrow()));
+            w.set_dialog_triggers(trigger_model(&et_new.borrow()));
             let empty = Session::new_empty();
             let (jump_labels, jump_ids, jump_idx) =
                 jump_candidates(&store_ng.borrow(), &empty.id, "");
@@ -3702,6 +3688,7 @@ fn wire_session_callbacks(
             w.set_dialog_parity("none".into());
             w.set_dialog_flow("none".into());
             w.set_dialog_encoding("UTF-8".into());
+            w.set_dialog_vt100_drawing(false);
             w.set_dialog_disable_shell_integration(false);
             w.set_dialog_notes("".into());
             w.set_dialog_editing(false);
@@ -3884,6 +3871,8 @@ fn wire_session_callbacks(
         let weak = window.as_weak();
         let store = store.clone();
         let ef_edit = edit_forwards.clone();
+        let et_edit = edit_triggers.clone();
+        let ets_edit = edit_trigger_secrets.clone();
         window.on_edit_session(move |id: SharedString| {
             let id = id.to_string();
             let store = store.borrow();
@@ -3894,9 +3883,20 @@ fn wire_session_callbacks(
             if ef_edit.borrow().is_empty() {
                 ef_edit.borrow_mut().push(blank_forward_draft());
             }
+            *et_edit.borrow_mut() = trigger_drafts(&session.triggers);
+            *ets_edit.borrow_mut() = session
+                .triggers
+                .iter()
+                .map(|t| t.response.clone())
+                .collect();
+            if et_edit.borrow().is_empty() {
+                et_edit.borrow_mut().push(blank_trigger_draft());
+                ets_edit.borrow_mut().push(Secret::default());
+            }
             if let Some(w) = weak.upgrade() {
                 w.set_session_groups(session_groups_model(&store));
                 w.set_dialog_forwards(forward_model(&ef_edit.borrow()));
+                w.set_dialog_triggers(trigger_model(&et_edit.borrow()));
                 w.set_dialog_id(session.id.clone().into());
                 w.set_dialog_name(session.name.clone().into());
                 w.set_dialog_host(session.host.clone().into());
@@ -3927,6 +3927,7 @@ fn wire_session_callbacks(
                 w.set_dialog_parity(session.parity.clone().into());
                 w.set_dialog_flow(session.flow_control.clone().into());
                 w.set_dialog_encoding(session.encoding.clone().into());
+                w.set_dialog_vt100_drawing(session.vt100_drawing);
                 w.set_dialog_disable_shell_integration(session.disable_shell_integration);
                 w.set_dialog_notes(session.notes.clone().into());
                 w.set_dialog_editing(true);
@@ -4226,6 +4227,8 @@ fn wire_session_callbacks(
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         let edit_forwards = edit_forwards.clone();
+        let edit_triggers = edit_triggers.clone();
+        let edit_trigger_secrets = edit_trigger_secrets.clone();
         let registry = registry.clone();
         window.on_session_dialog_submit(move |draft: SessionDraft| {
             let id = draft.id.to_string();
@@ -4238,6 +4241,16 @@ fn wire_session_callbacks(
                     return;
                 }
             };
+            let triggers =
+                match validated_triggers(&edit_triggers.borrow(), &edit_trigger_secrets.borrow()) {
+                    Ok(triggers) => triggers,
+                    Err(message) => {
+                        if let Some(w) = weak.upgrade() {
+                            w.set_dialog_test_status(message.into());
+                        }
+                        return;
+                    }
+                };
             // The edit dialog never echoes the real password (issue #10): a blank
             // field while editing means "keep the existing password" rather than
             // "clear it".  Only overwrite when the user actually typed something.
@@ -4320,7 +4333,9 @@ fn wire_session_callbacks(
                 parity: draft.parity.to_string(),
                 flow_control: draft.flow_control.to_string(),
                 encoding: draft.encoding.to_string(),
+                vt100_drawing: draft.vt100_drawing,
                 forwards,
+                triggers,
                 disable_shell_integration: draft.disable_shell_integration,
                 notes: draft.notes.to_string(),
                 jump_session_id: draft.jump_session_id.to_string(),
@@ -4348,6 +4363,8 @@ fn wire_session_callbacks(
         let runtime = runtime.clone();
         let store = store.clone();
         let edit_forwards = edit_forwards.clone();
+        let edit_triggers = edit_triggers.clone();
+        let edit_trigger_secrets = edit_trigger_secrets.clone();
         window.on_session_dialog_test(move |draft: SessionDraft| {
             let kind = draft.kind.to_string();
             if kind == "serial" {
@@ -4389,7 +4406,17 @@ fn wire_session_callbacks(
                     return;
                 }
             };
-            let session = session_from_draft(&draft, existing.as_ref(), forwards);
+            let triggers =
+                match validated_triggers(&edit_triggers.borrow(), &edit_trigger_secrets.borrow()) {
+                    Ok(triggers) => triggers,
+                    Err(message) => {
+                        if let Some(w) = weak.upgrade() {
+                            w.set_dialog_test_status(message.into());
+                        }
+                        return;
+                    }
+                };
+            let session = session_from_draft(&draft, existing.as_ref(), forwards, triggers);
             let weak_done = weak.clone();
 
             if kind == "ssh" {
@@ -4521,15 +4548,9 @@ fn wire_session_callbacks(
         window.on_session_dialog_pick_key(move || {
             let mut dialog =
                 rfd::FileDialog::new().set_title(t("选择私钥文件", "Choose private key file"));
-            // OpenSSH's standard macOS key names (id_ed25519, id_rsa, …) have
-            // no extension. A native macOS extension filter makes those files
-            // visible but disabled, so leave the picker unfiltered there (#325).
-            // Other platforms retain the narrower existing filter.
-            #[cfg(not(target_os = "macos"))]
-            {
-                dialog =
-                    dialog.add_filter(t("SSH 私钥", "SSH private keys"), &["ppk", "pem", "key"]);
-            }
+            // OpenSSH's standard key names (id_ed25519, id_rsa, …) usually
+            // have no extension. Extension filters hide or disable those files
+            // in native pickers, so show every file on every platform (#393).
             // Start in ~/.ssh if it exists.
             if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().join(".ssh")) {
                 if home.is_dir() {
@@ -4589,6 +4610,53 @@ fn wire_session_callbacks(
         });
     }
 
+    // Session expect/send trigger editor (#212).
+    {
+        let weak = window.as_weak();
+        let triggers = edit_triggers.clone();
+        let secrets = edit_trigger_secrets.clone();
+        window.on_add_trigger(move || {
+            triggers.borrow_mut().push(blank_trigger_draft());
+            secrets.borrow_mut().push(Secret::default());
+            if let Some(w) = weak.upgrade() {
+                w.set_dialog_triggers(trigger_model(&triggers.borrow()));
+            }
+        });
+    }
+    {
+        let triggers = edit_triggers.clone();
+        window.on_update_trigger(move |index: i32, trigger: TriggerDraft| {
+            let i = index as usize;
+            let mut values = triggers.borrow_mut();
+            if i < values.len() {
+                values[i] = trigger;
+            }
+        });
+    }
+    {
+        let weak = window.as_weak();
+        let triggers = edit_triggers.clone();
+        let secrets = edit_trigger_secrets.clone();
+        window.on_delete_trigger(move |index: i32| {
+            let i = index as usize;
+            let mut values = triggers.borrow_mut();
+            let mut saved = secrets.borrow_mut();
+            if i < values.len() {
+                values.remove(i);
+            }
+            if i < saved.len() {
+                saved.remove(i);
+            }
+            if values.is_empty() {
+                values.push(blank_trigger_draft());
+                saved.push(Secret::default());
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_dialog_triggers(trigger_model(&values));
+            }
+        });
+    }
+
     // Connect session -> open a new terminal tab.
     {
         let weak = window.as_weak();
@@ -4637,8 +4705,9 @@ fn wire_session_callbacks(
                 SessionKind::Telnet => format!("telnet {}:{}", session.host, session.port),
                 SessionKind::Local => format!("local {}", session.name),
             };
-            // Serial / Telnet have no SFTP side-channel.
-            let has_sftp = session.kind == SessionKind::Ssh;
+            // Compatibility mode also suppresses the SFTP side-channel so
+            // bastions that only permit one proxied PTY connection stay alive.
+            let has_sftp = should_start_sftp(&session);
 
             // Seed the per-tab status so the sidebar shows "连接中 host" the
             // moment this tab becomes active (the `changed active-tab-id`
@@ -4686,6 +4755,7 @@ fn wire_session_callbacks(
                 scroll_max: 0,
                 scroll_offset: 0,
                 is_alt_screen: false,
+                mouse_tracked: false,
                 find_matches: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 selection: ModelRc::from(std::rc::Rc::new(VecModel::<TermMatch>::default())),
                 sftp_path: "/".into(),
@@ -4737,10 +4807,13 @@ fn wire_session_callbacks(
                     output_highlight,
                     custom_highlight_rules,
                     json_format_output: store.borrow().json_format_output(),
+                    vt100_drawing: session.vt100_drawing,
+                    charset: crate::terminal::CharsetTracker::default(),
                     interactive_echo_until: std::time::Instant::now(),
                     sel_anchor: None,
                     sel_focus: None,
                     sel_ranges: Vec::new(),
+                    mouse_tracked: false,
                     history: VecDeque::new(),
                     prev: Vec::new(),
                     view_offset: 0,
@@ -5637,16 +5710,7 @@ fn wire_key_input(
                     {
                         if let Some(h) = term_buf(&ctx.bufs, tab_id.as_str()) {
                             let mut b = h.lock().unwrap();
-                            let (rows, cols) = b.parser.screen().size();
-                            b.parser = vt100::Parser::new(rows, cols, 5000);
-                            b.history.clear();
-                            b.prev.clear();
-                            b.displayed_text.clear();
-                            b.view_offset = 0;
-                            b.sel_anchor = None;
-                            b.sel_focus = None;
-                            b.sel_ranges.clear();
-                            b.raw.clear();
+                            b.release_scrollback();
                         }
                     }
                     if let Some(st) =
@@ -5736,7 +5800,8 @@ fn wire_key_input(
             if !ctrl && !alt {
                 if let Some(c) = key.as_str().chars().next() {
                     let cp = c as u32;
-                    let is_standalone = matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B);
+                    let is_standalone = matches!(cp, 0x08 | 0x09 | 0x0A | 0x0D | 0x1B)
+                        || is_terminal_interrupt(key.as_str());
                     if key.as_str().chars().count() == 1
                         && (0x01..=0x1f).contains(&cp)
                         && !is_standalone
@@ -5778,7 +5843,8 @@ fn wire_key_input(
                     // because the user never pressed M.  Without this exemption
                     // the filter would silently drop the Enter, making it
                     // impossible to confirm nano's "File Name to Write:" prompt.
-                    let always_pass = matches!(cp, 0x09 | 0x0a | 0x0d);
+                    let always_pass = matches!(cp, 0x09 | 0x0a | 0x0d)
+                        || is_terminal_interrupt(key.as_str());
                     if !always_pass
                         && key.as_str().chars().count() == 1
                         && (0x01..=0x1a).contains(&cp)
@@ -6104,17 +6170,7 @@ fn wire_key_input(
             let tid = tab_id.to_string();
             if let Some(h) = term_buf(&bufs_clear, &tid) {
                 let mut buf = h.lock().unwrap();
-                let (rows, cols) = buf.parser.screen().size();
-                buf.parser = vt100::Parser::new(rows, cols, 5000);
-                buf.find_query.clear();
-                buf.history = VecDeque::new(); // recycle the session scrollback
-                buf.prev = Vec::new();
-                buf.view_offset = 0;
-                buf.sel_anchor = None;
-                buf.sel_focus = None;
-                buf.sel_ranges.clear();
-                buf.displayed_text = Vec::new();
-                buf.raw.clear();
+                buf.release_scrollback();
             }
             if let Some(win) = weak.upgrade() {
                 set_terminal_row(&win, &tid, |row| {
@@ -6463,6 +6519,51 @@ fn wire_key_input(
             }
         });
     }
+
+    // Mouse events forwarded to the PTY for mouse-tracking TUI apps (btop,
+    // htop, mc). The Slint side only calls this when the remote enabled a mouse
+    // protocol (mouse_protocol_mode != None), so a click inside e.g. btop
+    // highlights/activates the widget under the pointer instead of starting a
+    // local drag-selection. Returns true when bytes were actually written, so
+    // the caller can skip its own local handling.
+    {
+        let bufs_mouse = bufs.clone();
+        let handles_mouse = handles.clone();
+        window.on_terminal_mouse(
+            move |tab_id: SharedString, kind: i32, button: i32, row: i32, col: i32| -> bool {
+                let tid = tab_id.to_string();
+                let Some(bytes) = term_buf(&bufs_mouse, &tid).map(|h| {
+                    let buf = h.lock().unwrap();
+                    let screen = buf.parser.screen();
+                    let (rows, cols) = screen.size();
+                    if buf.mouse_tracked {
+                        let encoding = screen.mouse_protocol_encoding();
+                        let (btn, release) = match kind {
+                            1 => (button as u8, true),  // release
+                            2 => (35, false),           // drag motion with button held
+                            _ => (button as u8, false), // press
+                        };
+                        Some(encode_mouse_event(
+                            btn, release, col, row, cols, rows, encoding,
+                        ))
+                    } else {
+                        None
+                    }
+                }) else {
+                    return false;
+                };
+                let Some(bytes) = bytes else {
+                    return false;
+                };
+                if let Some(h) = handles_mouse.borrow().get(&tid) {
+                    h.send_raw(bytes);
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+    }
 }
 
 fn set_terminal_row(win: &AppWindow, tab_id: &str, mutator: impl Fn(&mut TerminalState)) {
@@ -6530,19 +6631,15 @@ fn should_drop_macos_bare_ctrl_marker(key: &str, ctrl: bool, is_macos: bool) -> 
 /// when true the four arrow keys must use SS3 sequences (`\x1bOA`…) instead
 /// of the default CSI sequences (`\x1b[A`…).  Full-screen apps like nano and
 /// vim set this mode on startup.
-/// Build the editor's line-number gutter text: "1\n2\n…\nN", one number per line
-/// of `content`, matching its (newline-separated) line count (#81).
-fn line_numbers_for(content: &str) -> String {
-    use std::fmt::Write;
-    let lines = content.split('\n').count().max(1);
-    let mut s = String::with_capacity(lines * 4);
-    for i in 1..=lines {
-        if i > 1 {
-            s.push('\n');
-        }
-        let _ = write!(s, "{i}");
-    }
-    s
+/// Preserve logical lines (including blank and trailing lines) for the gutter.
+/// Slint measures each line with the same wrapping and font as the editor.
+fn editor_lines_for(content: &str) -> ModelRc<SharedString> {
+    ModelRc::new(VecModel::from(
+        content
+            .split('\n')
+            .map(SharedString::from)
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Write `text` to the system clipboard. Call from a dedicated thread, never the
@@ -6754,3 +6851,7 @@ mod selection_tests;
 #[cfg(test)]
 #[path = "../tests/app/output_highlighting/mod.rs"]
 mod log_highlight_tests;
+
+#[cfg(test)]
+#[path = "../tests/app/text_editor/mod.rs"]
+mod text_editor_tests;

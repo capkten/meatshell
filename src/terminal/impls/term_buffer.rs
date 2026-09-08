@@ -23,6 +23,28 @@ fn terminal_query(sequence: &[u8]) -> Option<TerminalQuery> {
 }
 
 impl TermBuffer {
+    /// Release all retained terminal output and recreate the parser at the
+    /// current size. This is used when a session is disconnected or the user
+    /// explicitly clears the terminal, so a dead tab does not keep a large
+    /// scrollback allocation alive until it is closed.
+    pub(crate) fn release_scrollback(&mut self) {
+        let (rows, cols) = self.parser.screen().size();
+        self.parser = vt100::Parser::new(rows, cols, 5000);
+        self.find_query.clear();
+        self.history = std::collections::VecDeque::new();
+        self.prev = Vec::new();
+        self.view_offset = 0;
+        self.sel_anchor = None;
+        self.sel_focus = None;
+        self.sel_ranges.clear();
+        self.displayed_text = Vec::new();
+        self.csi_state = CsiState::Normal;
+        self.csi_pending = Vec::new();
+        self.raw = std::collections::VecDeque::new();
+        self.charset = crate::terminal::CharsetTracker::default();
+        self.mouse_tracked = false;
+    }
+
     // ---- Absolute-coordinate selection helpers (#18 follow-up) -------------
     //
     // The "combined" buffer is `history` (oldest first) followed by the live
@@ -314,6 +336,23 @@ impl TermBuffer {
                         self.csi_pending.clear();
                         self.csi_pending.push(byte);
                         self.csi_state = CsiState::Esc;
+                    } else if self.vt100_drawing && byte == 0x0e {
+                        // SO: shift output to G1 (#376). Swallowed before the
+                        // parser, which has no charset support.
+                        self.charset.shift_out();
+                    } else if self.vt100_drawing && byte == 0x0f {
+                        // SI: back to G0.
+                        self.charset.shift_in();
+                    } else if self.vt100_drawing {
+                        // DEC Special Graphics maps 0x60–0x7e (always standalone
+                        // ASCII in a UTF-8 stream) to box-drawing Unicode (#376).
+                        match self.charset.map(byte) {
+                            Some(ch) => {
+                                let mut buf = [0u8; 4];
+                                display.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            }
+                            None => display.push(byte),
+                        }
                     } else {
                         display.push(byte);
                     }
@@ -322,6 +361,16 @@ impl TermBuffer {
                     if byte == b'[' {
                         self.csi_pending.push(byte);
                         self.csi_state = CsiState::Csi;
+                    } else if byte == b']' {
+                        // OSC: keep buffering so its payload is never
+                        // charset-translated while DEC graphics is active.
+                        self.csi_pending.push(byte);
+                        self.csi_state = CsiState::Osc;
+                    } else if matches!(byte, b'(' | b')' | b'*' | b'+') {
+                        // SCS designator intro (`ESC ( 0`, …); the final byte
+                        // completes it (#376).
+                        self.csi_pending.push(byte);
+                        self.csi_state = CsiState::Designate(byte);
                     } else {
                         display.extend(self.csi_pending.drain(..));
                         if byte == 0x1b {
@@ -330,6 +379,46 @@ impl TermBuffer {
                             display.push(byte);
                             self.csi_state = CsiState::Normal;
                         }
+                    }
+                }
+                CsiState::Designate(set) => {
+                    if byte == 0x1b {
+                        // Malformed: a new escape interrupts the designator.
+                        // Pass the buffered bytes through and start over.
+                        display.extend(self.csi_pending.drain(..));
+                        self.csi_pending.push(byte);
+                        self.csi_state = CsiState::Esc;
+                    } else {
+                        self.csi_pending.push(byte);
+                        if self.vt100_drawing {
+                            self.charset.designate(set, byte);
+                        }
+                        display.extend(self.csi_pending.drain(..));
+                        self.csi_state = CsiState::Normal;
+                    }
+                }
+                CsiState::Osc => {
+                    self.csi_pending.push(byte);
+                    if byte == 0x07 {
+                        display.extend(self.csi_pending.drain(..));
+                        self.csi_state = CsiState::Normal;
+                    } else if byte == 0x1b {
+                        self.csi_state = CsiState::OscEsc;
+                    } else if self.csi_pending.len() > 4096 {
+                        // Malformed/unbounded OSC: stop buffering, same escape
+                        // hatch as the CSI arm below.
+                        display.extend(self.csi_pending.drain(..));
+                        self.csi_state = CsiState::Normal;
+                    }
+                }
+                CsiState::OscEsc => {
+                    self.csi_pending.push(byte);
+                    if byte == b'\\' {
+                        // ST terminator.
+                        display.extend(self.csi_pending.drain(..));
+                        self.csi_state = CsiState::Normal;
+                    } else {
+                        self.csi_state = CsiState::Osc;
                     }
                 }
                 CsiState::Csi => {
@@ -411,23 +500,36 @@ impl TermBuffer {
         self.feed_batched(bytes);
     }
 
-    /// Feed a (already HVP-rewritten) byte slice to vt100 in newline-bounded
-    /// batches, capturing scrolled-off lines into history after each (see the
-    /// `ingest` doc comment). Does NOT touch `self.raw`, so it is reused by both
-    /// live ingest and resize-reflow replay.
+    /// Feed a (already HVP-rewritten) byte slice to vt100 in bounded batches,
+    /// capturing scrolled-off lines into history after each (see the `ingest`
+    /// doc comment). Besides newlines, bound the approximate display width:
+    /// one very long physical line can wrap through many screens without ever
+    /// containing `\n` (#385). Does NOT touch `self.raw`, so it is reused by
+    /// both live ingest and resize-reflow replay.
     fn feed_batched(&mut self, bytes: &[u8]) {
-        let rows = self.parser.screen().size().0 as usize;
+        let (rows, cols) = self.parser.screen().size();
+        let rows = rows as usize;
         let batch_lines = (rows / 2).max(1);
+        let cell_budget = batch_lines.saturating_mul(cols as usize).max(1);
         let mut start = 0usize;
         let mut nl = 0usize;
+        let mut cells = 0usize;
         for i in 0..bytes.len() {
             if bytes[i] == b'\n' {
                 nl += 1;
-                if nl >= batch_lines {
-                    self.ingest_chunk(&bytes[start..=i]);
-                    start = i + 1;
-                    nl = 0;
-                }
+            } else if bytes[i] == b'\t' {
+                // A tab can advance up to eight terminal cells.
+                cells = cells.saturating_add(8);
+            } else if bytes[i] >= 0x20 && bytes[i] & 0xc0 != 0x80 {
+                // Count ASCII and UTF-8 leading bytes. Wide Unicode occupies at
+                // most two cells, and the half-screen budget leaves that margin.
+                cells = cells.saturating_add(1);
+            }
+            if nl >= batch_lines || cells >= cell_budget {
+                self.ingest_chunk(&bytes[start..=i]);
+                start = i + 1;
+                nl = 0;
+                cells = 0;
             }
         }
         if start < bytes.len() {
@@ -471,6 +573,15 @@ impl TermBuffer {
         self.feed_batched(&stream);
     }
 
+    /// Refresh the cached `mouse_tracked` flag from the parser's current mouse
+    /// protocol state (the remote app enables it with e.g. `\x1b[?1000h` /
+    /// `\x1b[?1002h`).  Kept as a cached bool so the UI hot path doesn't need
+    /// to lock the parser to decide how a click behaves.
+    fn sync_mouse_tracked(&mut self) {
+        self.mouse_tracked =
+            self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None;
+    }
+
     /// Process one bounded batch and capture any lines that scrolled off the top
     /// (skipped for alt-screen programs like vim/nano).
     fn ingest_chunk(&mut self, bytes: &[u8]) {
@@ -485,6 +596,7 @@ impl TermBuffer {
         let is_fullscreen_refresh = has_cursor_home && has_erase_display;
 
         self.parser.process(bytes);
+        self.sync_mouse_tracked();
         let (is_alt, rows, cols) = {
             let s = self.parser.screen();
             let (r, c) = s.size();
@@ -577,6 +689,7 @@ impl TermBuffer {
                 cursor_col: cur_col as i32,
                 rows_used,
                 is_alt,
+                mouse_tracked: self.mouse_tracked,
                 scroll_max: if is_alt { 0 } else { self.history.len() as i32 },
                 scroll_offset: 0,
             };
@@ -627,6 +740,7 @@ impl TermBuffer {
             cursor_col: 0,
             rows_used: win as i32,
             is_alt: false,
+            mouse_tracked: self.mouse_tracked,
             scroll_max: self.history.len() as i32,
             scroll_offset: self.view_offset as i32,
         }

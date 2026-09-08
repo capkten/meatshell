@@ -22,7 +22,7 @@ JVM 压到几十 MB 原生级别。
 ## 下载与安装
 
 每次打 `v*` 标签，GitHub Actions 会自动构建 **Windows / Linux / macOS** 三平台二进制，
-发布到 [Releases](https://github.com/jeff141/meatshell/releases) 页面。
+发布到 [Releases](https://github.com/yituorou/meatshell/releases) 页面。
 
 ### Windows
 
@@ -34,9 +34,13 @@ JVM 压到几十 MB 原生级别。
 tar -xzf meatshell-*-linux-x86_64.tar.gz
 cd meatshell-*-linux-x86_64
 ./meatshell                                  # 直接运行
-# 可选：装应用图标 + 启动器入口（Dock / 应用列表里显示图标，无需传参）
+# 可选：系统级安装程序、图标和启动器入口（需要 sudo）
 chmod +x install-linux.sh && ./install-linux.sh
 ```
+
+一键安装会将程序安装到 `/usr/local/bin/meatshell`，启动器安装到
+`/usr/local/share/applications/meatshell.desktop`，图标安装到
+`/usr/local/share/icons/hicolor/512x512/apps/meatshell.png`，并清理旧版 tar 包留下的用户级同名启动器。
 
 > 需要 glibc ≥ 2.35（Ubuntu 22.04+ / Debian 12+）。Wayland 下首次装完图标可能要注销重登一次。
 
@@ -70,6 +74,8 @@ open /Applications/meatshell.app
 
 > 若未移到 `/Applications`，把上面两条路径换成 `.app` 实际所在位置(如 `~/Downloads/meatshell.app`)即可。
 
+> 需要 macOS 11 Big Sur 或更高版本，支持 Apple Silicon 和 Intel Mac。
+
 > 从源码构建见下方 [运行](#运行)。
 
 ## 功能
@@ -87,7 +93,7 @@ open /Applications/meatshell.app
     / `~/.config/meatshell/sessions.json`（Linux）
     / `~/Library/Application Support/meatshell/sessions.json`（macOS）
 - [x] SSH（`russh`，纯 Rust）：密码 / 私钥 / 加密私钥（密码短语）
-- [x] SFTP 文件浏览 + 上传 / 下载（拖拽）+ 终端内 ZMODEM（`sz`）接收
+- [x] SFTP 文件浏览 + 上传 / 下载（拖拽）+ 终端内 ZMODEM（`sz` 下载 / `rz` 多文件上传）
 - [x] SSH 端口转发 / 隧道：本地 -L / 远程 -R / 动态 -D（SOCKS5）
 - [x] 快捷命令 + 命令输入框（可群发到所有会话）+ 命令历史
 - [x] 串口 / Telnet 会话
@@ -98,7 +104,7 @@ open /Applications/meatshell.app
 - [x] SFTP 图片预览、缩放、平移与翻页
 - [x] 已知主机（`known_hosts`）校验 + 首次连接确认
 - [x] 多标签页终端分屏
-- [x] 多窗口：Ctrl+Shift+N（macOS ⌘⇧N）或系统入口“新建窗口”（Windows 任务栏 / macOS Dock / Linux 桌面右键），Chrome 式单进程管理
+- [x] 多窗口：Ctrl+Shift+N（macOS ⌘⇧N）或系统入口“新建窗口”（Windows 任务栏 / Linux 桌面右键），Chrome 式单进程管理
 
 彩色 emoji 图形来自 [Twemoji](https://github.com/jdecked/twemoji)，按
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 使用；完整署名见

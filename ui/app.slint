@@ -18,7 +18,7 @@ import { Theme } from "theme.slint";
 import { Sidebar, DiskInfo, GpuInfo } from "sidebar.slint";
 import { TabBar, TabInfo } from "tabs.slint";
 import { Welcome, SessionInfo } from "welcome.slint";
-import { SessionDialog, SessionDraft, PortFwd } from "session_dialog.slint";
+import { SessionDialog, SessionDraft, PortFwd, TriggerDraft } from "session_dialog.slint";
 import { ConfirmDialog } from "confirm_dialog.slint";
 import { LabeledInput, PrimaryButton, GhostButton, DockExpandButton, IconButton, ToolStrip } from "widgets.slint";
 import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "terminal_view.slint";
@@ -58,6 +58,7 @@ export struct TerminalState {
     scroll-max: int,       // scrollback depth (max offset) — terminal scrollbar (#103)
     scroll-offset: int,    // current scrollback offset (0 = live bottom)
     is-alt-screen: bool,
+    mouse-tracked: bool,     // remote app wants mouse events (btop/htop/mc)
     find-matches: [TermMatch], // search-highlight rectangles
     selection: [TermMatch],    // drag-selection highlight rectangles
 
@@ -142,11 +143,80 @@ component IconBtn inherits Rectangle {
     in property <brush> icon-color: Theme.text-secondary;
     in property <string> tooltip;
     in property <bool> active;
+    // `breathe=true` makes the button add a separate pulse layer underneath
+    // the icon. Used by the Transfers button to signal in-flight transfers
+    // in the toolbar accent without breaking the icon's silhouette
+    // (#breathing-light). All other IconBtn instances leave this false.
+    //
+    // IMPORTANT — background structure split:
+    //   The previous implementation put `active`, hover and `breathe` into
+    //   one `background: ta.has-hover || root.active || root.breathe ? ...`
+    //   expression with a single `animate background { ...; iteration-count:
+    //   -1; ... }` declaration. That made every button with `active=true`
+    //   (which includes the toolbar Settings/Transfers buttons whenever
+    //   their popup is open) keep looping the pulse even though no transfer
+    //   was running, so the toolbar looked like it was always breathing.
+    //
+    //   To fix that, hover/active and breathe are now rendered on two
+    //   independent layers below, with animation only on the breathe layer
+    //   and only while `breathe=true` (#breathing-light).
+    in property <bool> breathe: false;
     callback clicked();
     width: 26px;
     height: 26px;
     border-radius: Theme.radius-sm;
-    background: ta.has-hover || root.active ? Theme.bg-hover : transparent;
+    // Base stays transparent; the two layers below paint onto this.
+    background: transparent;
+
+    // Layer 1 — static hover/active background (no animation, no looping).
+    // Replaces the previous `ta.has-hover || root.active` branch of the
+    // combined background expression so opening a popup no longer keeps the
+    // animate background loop running (#breathing-light).
+    static-bg := Rectangle {
+        x: 0px; y: 0px;
+        width: 100%; height: 100%;
+        border-radius: Theme.radius-sm;
+        background: ta.has-hover || root.active ? Theme.bg-hover : transparent;
+    }
+
+    // Layer 2 — breathing pulse, only while `breathe=true`.
+    // Re-tinted from `Theme.bg-hover` to `Theme.accent` (#v8-accent-breathe)
+    // so the pulse stays visible even when static-bg (Layer 1) is also
+    // painting `Theme.bg-hover` for an open popup. Two layers of
+    // `Theme.bg-hover` overlapped into one grey at every point of the opacity
+    // ramp, so the pulse was invisible once a popup opened. `Theme.accent` is
+    // the project's main accent (dark #4a90e2 / light #0071e3 / wallpaper-
+    // active = the picture's dominant colour) so the pulse reads as the
+    // toolbar accent instead of an alert strobe, and follows the active theme.
+    //
+    // WHY `visible` + `opacity` binding instead of `if root.breathe {…}`:
+    //   Slint's `animate` only fires on a *property change of an already-alive
+    //   element*. An element created by `if` appears with its initial opacity
+    //   already set, which is NOT a change, so the looping animation never
+    //   starts — that is exactly why "有传输任务却看不到脉冲" happened (the
+    //   layer was a static 0.5 square, never animating). Keeping the layer
+    //   always alive and flipping `visible` + `opacity` from false→true makes
+    //   opacity go 0 → 0.55, which *is* a change and starts the loop.
+    //   `visible: root.breathe` then hides it again when there is no transfer
+    //   so the (now-invisible) loop can't show through. Geometry is identical
+    //   to static-bg (Layer 1) so the pulse footprint equals the hover
+    //   footprint (#breathe-size-match).
+    breathe-layer := Rectangle {
+        x: 0px; y: 0px;
+        width: 100%; height: 100%;
+        border-radius: Theme.radius-sm;
+        background: Theme.accent;
+        visible: root.breathe;
+        opacity: root.breathe ? 0.55 : 0;
+        // 0.55 keeps the "low" end of the pulse unmistakably tinted without
+        // ever hitting full-saturation accent; direction: alternate ping-pongs
+        // 0 ↔ 0.55 → reads as a gentle breath, not a strobe (#v8-accent-breathe).
+        animate opacity {
+            duration: 1400ms;
+            iteration-count: -1;
+            direction: alternate;
+        }
+    }
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
@@ -180,6 +250,33 @@ component IconBtn inherits Rectangle {
             height: parent.height;
         }
     }
+
+    // (Removed) Combined background+animate declaration previously lived here:
+    //   background: ta.has-hover || root.active || root.breathe
+    //               ? Theme.bg-hover : transparent;
+    //   animate background {
+    //       duration: 1400ms;
+    //       iteration-count: -1;
+    //       direction: alternate;
+    //   }
+    // That single layer made every `active=true` button (toolbar Settings,
+    // Transfers, etc.) pulse forever as long as its popup was open. Replaced
+    // by the two static/breathing layers above so only `breathe=true`
+    // buttons animate, and they animate on a dedicated opacity layer
+    // (#breathing-light).
+    //
+    // (Removed) Previous breathe-layer declaration (#v8-accent-breathe):
+    //   if root.breathe : Rectangle {
+    //       ...
+    //       background: Theme.bg-hover;   // ← same colour as static-bg
+    //       opacity: 0.35;
+    //       animate opacity { duration: 1400ms; iteration-count: -1;
+    //                         direction: alternate; }
+    //   }
+    // Visually identical to "no pulse" once the popup was open, because the
+    // static-bg layer (above) is also painting `Theme.bg-hover`, so opacity
+    // ramps collapsed into a single grey. Retinted to `Theme.accent` so the
+    // pulse is visible against the grey backdrop in every state.
 }
 
 // One row in the keyboard-shortcuts dialog: a key chip + a description (#103).
@@ -358,6 +455,24 @@ export component AppWindow inherits Window {
     callback open-repo();                          // open the project's GitHub page
     in-out property <bool> shortcuts-open: false; // centered keyboard-shortcuts dialog (#103)
     in property <string> download-dir;      // preset SFTP download folder ("" = ask)
+    // Download (Transfers) popup size + resize-drag state. The popup is an
+    // embedded Rectangle (not a top-level window), so its resize is driven in
+    // pure Slint via a bottom-right grip — mirroring the interface dialog's
+    // #dl-resize grip so both popups share one resize affordance.
+    in-out property <length> dl-w: 350px;    // current popup width
+    in-out property <length> dl-h: 400px;    // current popup height
+    in-out property <bool> dl-resizing: false;
+    in-out property <length> dl-base-w;     // width captured when the drag started
+    in-out property <length> dl-base-h;     // height captured when the drag started
+    in-out property <length> dl-grab-x;     // pointer x (logical) when the drag started
+    in-out property <length> dl-grab-y;     // pointer y (logical) when the drag started
+    // `true` while at least one transfer is active or preparing; drives the
+    // breathing indicator on the toolbar Transfers button (#breathing-light).
+    in-out property <bool> has-active-transfers: false;
+    // Start an OS resize from the bottom-right grip; mirrors ProcWindow so the
+    // main window gets the same visual affordance when the OS frame is hidden
+    // (custom-titlebar mode on Windows/Linux, #main-resize-grip).
+    callback win-resize-se();
     // Process monitor is now a detachable top-level window (ProcWindow). Rust
     // shows/hides it in response to open-processes(); proc-list/proc-available
     // stay here as the live data source shared with that window (#23).
@@ -397,7 +512,7 @@ export component AppWindow inherits Window {
     property <bool> quick-external-send-enter;
     property <int> quick-external-sequence;
     in property <[string]> command-history;          // oldest first (newest last, #113)
-    in property <[string]> history-view;             // filtered dropdown, newest first (#101, #331)
+    in property <[string]> history-view;             // filtered dropdown, oldest first (newest last, #101)
     callback run-command(string /* tab-id */, string /* cmd */, bool /* to-all */);
     callback copy-text(string);                 // copy a history command (#96)
     callback delete-history(int /* index */);   // remove a history entry (#96)
@@ -670,7 +785,10 @@ export component AppWindow inherits Window {
     in-out property <string> editor-content;  // text, two-way with the input
     in-out property <bool> editor-readonly;   // view = true, edit = false
     in-out property <bool> editor-dirty: false; // edited since load
-    in-out property <string> editor-line-numbers; // newline-joined "1..N" from Rust (#81)
+    // Opening the dynamic editor and focusing its TextInput in the same event
+    // can re-enter Windows AccessKit while it is registering the new item tree.
+    property <bool> editor-focus-pending: false;
+    in-out property <[string]> editor-lines; // logical lines, measured with editor wrapping
     in-out property <string> editor-find-query;
     in-out property <string> editor-replace-text;
     in-out property <int> editor-match-count: 0;
@@ -745,6 +863,7 @@ export component AppWindow inherits Window {
     in-out property <string> dialog-parity: "none";
     in-out property <string> dialog-flow: "none";
     in-out property <string> dialog-encoding: "UTF-8";
+    in-out property <bool> dialog-vt100-drawing: false;
     in-out property <bool> dialog-disable-shell-integration: false;
     in-out property <string> dialog-notes;
     in-out property <string> dialog-test-status;
@@ -786,20 +905,29 @@ export component AppWindow inherits Window {
     callback session-dialog-pick-key();
     // Port forwards for the session being edited (#56).
     in-out property <[PortFwd]> dialog-forwards;
+    in-out property <[TriggerDraft]> dialog-triggers;
     callback add-forward();
     callback update-forward(int /* index */, PortFwd);
     callback delete-forward(int /* index */);
+    callback add-trigger();
+    callback update-trigger(int /* index */, TriggerDraft);
+    callback delete-trigger(int /* index */);
 
     callback tab-selected(string);
     callback tab-closed(string);
     callback new-tab-clicked();
     callback new-window-clicked();   // open another application window (#multi-window)
-    callback tab-reorder(int /* from-index */, int /* dir: -1 left / +1 right */);
     // Per-pane tab actions (v0.5): the int is the pane (leaf) id.
     callback pane-tab-selected(int /* pane-id */, string /* tab-id */);
     callback pane-tab-closed(int /* pane-id */, string /* tab-id */);
     callback pane-new-tab(int /* pane-id */);
-    callback pane-tab-reorder(int /* pane-id */, int /* from */, int /* dir */);
+    // Drag-to-reorder inside a pane's strip (#408), committed once on drop: move
+    // the tab at `from` to `to`, where `to` indexes the list with `from` removed.
+    callback pane-tab-move(int /* pane-id */, int /* from */, int /* to */);
+    // Where a tab dragged in from elsewhere would land in this pane's strip;
+    // -1 when the cursor left it. Rust remembers the last report and uses it when
+    // the drop lands on a tab strip (#408).
+    callback pane-tab-drop-index(int /* pane-id */, int /* index */);
     callback pane-focus(int /* pane-id */);
     callback cycle-tab(bool /* reverse */);
     // Split pane `pane-id`, peeling `tab-id` into a new pane on `dir`
@@ -816,9 +944,21 @@ export component AppWindow inherits Window {
     in-out property <string> tab-rename-id: "";
     in-out property <string> tab-rename-value: "";
     // Drag-to-split (v0.5): cursor moved / dropped while dragging `tab-id`, in
-    // pane-area coordinates. Rust hit-tests the pane + edge zone.
-    callback tab-drag-move(string /* tab-id */, length /* x */, length /* y */);
+    // pane-area coordinates. Rust hit-tests the pane + edge zone. `over-own-strip`
+    // means the source strip is already showing an insertion gap of its own, so no
+    // pane drop-zone must light up (#408).
+    callback tab-drag-move(string /* tab-id */, length /* x */, length /* y */,
+                           bool /* over-own-strip */);
     callback tab-drag-drop(string /* tab-id */, length /* x */, length /* y */);
+    // The drag ended without a drop (pointer grab lost, or an in-strip drag that
+    // landed back on its own slot): clear whatever highlight it put up (#408).
+    callback tab-drag-cancel();
+    // Live tab-drag cursor in pane-area coordinates, republished so every pane's
+    // tab strip can tell whether the drag is hovering over it (#408). Pane rects
+    // come from the model, so the hit-test below needs nothing from the layout.
+    property <bool> tab-drag-live;
+    property <length> tab-drag-px;
+    property <length> tab-drag-py;
     // Drop-zone highlight (set by Rust during a drag): the region the dropped
     // tab's new pane would occupy.
     in property <bool> drag-active;
@@ -917,6 +1057,8 @@ export component AppWindow inherits Window {
     // Wheel forwarded to an alt-screen program (#170): tab-id, dir (+1 up/-1 down), col, row.
     callback terminal-wheel(string, int, int, int);
     callback terminal-scroll-to(string /* tab-id */, int /* offset */); // scrollbar drag (#103)
+    // Mouse event forwarded to a mouse-tracking TUI app (#terminal-mouse).
+    callback terminal-mouse(string /* tab-id */, int /* kind */, int /* button */, int /* row */, int /* col */) -> bool;
     // Drag-selection lifecycle (grid row/col coordinates).
     callback term-select-start(string /* tab-id */, int /* row */, int /* col */, bool /* ctrl */, bool /* shift */);
     callback term-select-update(string /* tab-id */, int /* row */, int /* col */);
@@ -1595,25 +1737,42 @@ export component AppWindow inherits Window {
                         can-merge-pane: root.panes.length > 1;
                         tabs: pane.tabs;
                         active-id: pane.active-id;
+                        ext-drag-over: root.tab-drag-live
+                            && root.tab-drag-px >= pane.x
+                            && root.tab-drag-px <= pane.x + pane.w
+                            && root.tab-drag-py >= pane.y
+                            // The strip row is the TabBar's own 36px.
+                            && root.tab-drag-py <= pane.y + 36px;
+                        ext-drag-x: root.tab-drag-px - pane.x;
                         tab-selected(id) => { root.pane-tab-selected(pane.id, id); }
                         tab-closed(id) => { root.pane-tab-closed(pane.id, id); }
                         new-tab() => { root.pane-new-tab(pane.id); }
-                        tab-reorder(from-index, direction) => {
-                            root.pane-tab-reorder(pane.id, from-index, direction);
+                        tab-move(from-index, to-index) => {
+                            root.tab-drag-live = false;
+                            root.pane-tab-move(pane.id, from-index, to-index);
+                        }
+                        drop-index-changed(index) => {
+                            root.pane-tab-drop-index(pane.id, index);
                         }
                         tab-split(id, dir) => { root.pane-split(pane.id, id, dir); }
                         merge-pane() => { root.pane-merge(pane.id); }
                         tab-duplicate(id) => { root.tab-duplicate(id); }
                         tab-rename-request(id) => { root.tab-rename-request(id); }
-                        tab-drag-move(id, ax, ay) => {
-                            root.tab-drag-move(id,
-                                ax - pane-area.absolute-position.x,
-                                ay - pane-area.absolute-position.y);
+                        tab-drag-move(id, ax, ay, own-strip) => {
+                            root.tab-drag-px = ax - pane-area.absolute-position.x;
+                            root.tab-drag-py = ay - pane-area.absolute-position.y;
+                            root.tab-drag-live = true;
+                            root.tab-drag-move(id, root.tab-drag-px, root.tab-drag-py, own-strip);
                         }
                         tab-drag-drop(id, ax, ay) => {
+                            root.tab-drag-live = false;
                             root.tab-drag-drop(id,
                                 ax - pane-area.absolute-position.x,
                                 ay - pane-area.absolute-position.y);
+                        }
+                        tab-drag-cancel() => {
+                            root.tab-drag-live = false;
+                            root.tab-drag-cancel();
                         }
                     }
                 }
@@ -1699,6 +1858,7 @@ export component AppWindow inherits Window {
                         scroll-max: term.scroll-max;
                         scroll-offset: term.scroll-offset;
                         is-alt-screen: term.is-alt-screen;
+                        mouse-tracked: term.mouse-tracked;
                         find-matches: term.find-matches;
                         selection: term.selection;
                         sftp-panel-height: term.sftp-panel-height;
@@ -1851,6 +2011,7 @@ export component AppWindow inherits Window {
                         terminal-scroll(d) => { root.terminal-scroll(term.id, d); }
                         terminal-wheel(d, c, r) => { root.terminal-wheel(term.id, d, c, r); }
                         terminal-scroll-to(o) => { root.terminal-scroll-to(term.id, o); }
+                        terminal-mouse(kind, btn, r, c) => { root.terminal-mouse(term.id, kind, btn, r, c); }
                         select-start(r, c, ctrl, shift) => { root.term-select-start(term.id, r, c, ctrl, shift); }
                         select-update(r, c) => { root.term-select-update(term.id, r, c); }
                         select-end() => { root.term-select-end(term.id); }
@@ -2054,11 +2215,19 @@ export component AppWindow inherits Window {
     }
     IconBtn {
         x: root.width - 64px - root.toolbar-x-off; y: root.toolbar-y;
-        icon: "\u{E2C4}";
-        tooltip: root.lang-en ? "Download" : "下载";
+        icon: "\u{E8D5}";   // Material "swap_vert" — symmetrical up+down arrows, clearer "transfer" semantic
+        tooltip: @tr("Transfers manager");
         active: root.download-open;
+        // Pulse the button's own background instead of a separate dot in the
+        // corner; the dot was visually loud and broke the icon's silhouette
+        // (#breathing-light).
+        breathe: root.has-active-transfers;
         clicked => { root.download-open = !root.download-open; root.settings-open = false; }
     }
+    // (Removed) External breathing-dot Rectangle that previously sat on the
+    // top-left of the Transfers button. The pulse now lives on the IconBtn's
+    // own background via `breathe: root.has-active-transfers` above, so the
+    // icon stays clean and no stray dot shows over the toolbar (#breathing-light).
     IconBtn {
         x: root.width - 94px - root.toolbar-x-off; y: root.toolbar-y;
         icon: Theme.dark ? "\u{E518}" : "\u{E51C}";
@@ -2314,6 +2483,10 @@ export component AppWindow inherits Window {
                             TextInput {
                                 horizontal-stretch: 1;
                                 single-line: true;
+                                vertical-alignment: center;
+                                font-family: Theme.ui-font-family;
+                                font-size: Theme.fs-md;
+                                color: Theme.text-primary;
                                 text <=> root.editor-find-query;
                                 edited => {
                                     root.editor-find-position = -1;
@@ -2366,6 +2539,10 @@ export component AppWindow inherits Window {
                             TextInput {
                                 horizontal-stretch: 1;
                                 single-line: true;
+                                vertical-alignment: center;
+                                font-family: Theme.ui-font-family;
+                                font-size: Theme.fs-md;
+                                color: Theme.text-primary;
                                 text <=> root.editor-replace-text;
                             }
                             Rectangle {
@@ -2391,10 +2568,9 @@ export component AppWindow inherits Window {
                     Rectangle { height: 1px; background: Theme.border-subtle; }
 
                     // Text area: a line-number gutter on the left + the editor.
-                    // word-wrap is OFF so one logical line == one display line and
-                    // the numbers line up (long lines scroll horizontally); the
-                    // gutter is pinned horizontally but tracks the editor's
-                    // vertical scroll via ed-scroll.viewport-y (#81).
+                    // Wrap long lines to the visible editor width so text and
+                    // selection painting cannot overflow to the right (#387).
+                    // The gutter stays pinned and follows vertical scrolling.
                     Rectangle {
                         vertical-stretch: 1;
                         background: Theme.bg-root;
@@ -2404,38 +2580,95 @@ export component AppWindow inherits Window {
                                 width: 48px;
                                 background: Theme.bg-panel-alt;
                                 clip: true;
-                                Text {
-                                    x: 0;
+                                VerticalLayout {
                                     y: ed-scroll.viewport-y + 8px;
-                                    width: parent.width - 6px;
-                                    text: root.editor-line-numbers;
-                                    horizontal-alignment: right;
-                                    font-family: Theme.ui-font-family;
-                                    font-size: Theme.fs-md;
-                                    color: Theme.text-muted;
+                                    width: parent.width;
+                                    height: self.preferred-height;
+                                    spacing: 0px;
+                                    padding: 0px;
+                                    for line[index] in root.editor-lines: Rectangle {
+                                        height: line-measure.preferred-height;
+                                        // Use TextInput for identical font fallback,
+                                        // wrapping and empty-line metrics. The clipped
+                                        // measurement sits outside the visible gutter.
+                                        line-measure := TextInput {
+                                            x: parent.width;
+                                            width: edit-input.width;
+                                            height: self.preferred-height;
+                                            text: line;
+                                            read-only: true;
+                                            single-line: false;
+                                            wrap: char-wrap;
+                                            font-family: edit-input.font-family;
+                                            font-size: edit-input.font-size;
+                                        }
+                                        Text {
+                                            width: parent.width - 6px;
+                                            height: line-measure.preferred-height;
+                                            text: "\{index + 1}";
+                                            horizontal-alignment: right;
+                                            vertical-alignment: top;
+                                            font-family: edit-input.font-family;
+                                            font-size: edit-input.font-size;
+                                            color: Theme.text-muted;
+                                        }
+                                    }
                                 }
                             }
                             Rectangle { width: 1px; background: Theme.border-subtle; }
-                            ed-scroll := ScrollView {
-                                viewport-width: max(self.visible-width, edit-input.preferred-width + 16px);
-                                viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
-                                edit-input := TextInput {
-                                    x: 8px;
-                                    y: 8px;
-                                    width: max(parent.visible-width - 16px, self.preferred-width);
-                                    height: self.preferred-height;
-                                    text <=> root.editor-content;
-                                    read-only: root.editor-readonly;
-                                    single-line: false;
-                                    wrap: no-wrap;
-                                    color: Theme.text-primary;
-                                    font-family: Theme.ui-font-family;
-                                    font-size: Theme.fs-md;
-                                    edited => {
-                                        root.editor-dirty = true;
-                                        root.editor-recount(root.editor-content);
-                                        root.editor-match-count = root.editor-count-matches(
-                                            root.editor-content, root.editor-find-query);
+                            editor-viewport := Rectangle {
+                                horizontal-stretch: 1;
+                                clip: true;
+                                // TextInput owns the pointer grab while selecting
+                                // and ignores wheel events. Catch the rejected
+                                // wheel behind it and scroll the editor (#388).
+                                editor-wheel := TouchArea {
+                                    scroll-event(event) => {
+                                        ed-scroll.viewport-y = clamp(
+                                            ed-scroll.viewport-y + event.delta-y,
+                                            min(0px, ed-scroll.visible-height - ed-scroll.viewport-height),
+                                            0px);
+                                        accept
+                                    }
+                                }
+                                ed-scroll := ScrollView {
+                                    viewport-width: self.visible-width;
+                                    viewport-height: max(self.visible-height, edit-input.preferred-height + 16px);
+                                    edit-input := TextInput {
+                                        x: 8px;
+                                        y: 8px;
+                                        width: max(1px, ed-scroll.visible-width - 16px);
+                                        height: max(ed-scroll.visible-height - 16px, self.preferred-height);
+                                        text <=> root.editor-content;
+                                        read-only: root.editor-readonly;
+                                        single-line: false;
+                                        wrap: char-wrap;
+                                        color: Theme.text-primary;
+                                        font-family: Theme.ui-font-family;
+                                        font-size: Theme.fs-md;
+                                        page-height: ed-scroll.visible-height;
+                                        cursor-position-changed(position) => {
+                                            // Keep a keyboard/drag selection endpoint
+                                            // visible. During a pointer grab this also
+                                            // advances the viewport as the mouse moves
+                                            // beyond its top or bottom edge (#388).
+                                            let cursor-y = position.y + self.y + ed-scroll.viewport-y;
+                                            if (cursor-y < 12px) {
+                                                ed-scroll.viewport-y = min(0px,
+                                                    ed-scroll.viewport-y + 12px - cursor-y);
+                                            } else if (cursor-y > ed-scroll.visible-height - 12px) {
+                                                ed-scroll.viewport-y = max(
+                                                    min(0px, ed-scroll.visible-height - ed-scroll.viewport-height),
+                                                    ed-scroll.viewport-y
+                                                        - (cursor-y - ed-scroll.visible-height + 12px));
+                                            }
+                                        }
+                                        edited => {
+                                            root.editor-dirty = true;
+                                            root.editor-recount(root.editor-content);
+                                            root.editor-match-count = root.editor-count-matches(
+                                                root.editor-content, root.editor-find-query);
+                                        }
                                     }
                                 }
                             }
@@ -2478,8 +2711,18 @@ export component AppWindow inherits Window {
                     }
                 }
             }
-            // Focus the text the moment the editor opens.
-            init => { edit-input.focus(); }
+            // Defer focus until the next UI turn. Focusing directly from init
+            // re-enters Slint's Windows accessibility adapter and can panic
+            // with "RefCell already borrowed" (#386).
+            init => { root.editor-focus-pending = true; }
+            editor-focus-timer := Timer {
+                interval: 0ms;
+                running: root.editor-focus-pending;
+                triggered => {
+                    root.editor-focus-pending = false;
+                    edit-input.focus();
+                }
+            }
         }
     }
 
@@ -2499,8 +2742,8 @@ export component AppWindow inherits Window {
         // panel docks right/top) (#dock).
         x: parent.width - 364px - root.toolbar-x-off;
         y: (root.custom-titlebar ? 78px : 40px + root.titlebar-inset) + root.toolbar-y-off;
-        width: 350px;
-        height: 400px;
+        width: root.dl-w;
+        height: root.dl-h;
         visible: root.download-open;
         background: Theme.popup-bg;
         border-radius: Theme.radius-md;
@@ -2519,7 +2762,7 @@ export component AppWindow inherits Window {
 
             HorizontalLayout {
                 Text {
-                    text: @tr("Download settings");
+                    text: @tr("Transfers manager");
                     color: Theme.text-primary;
                     font-size: Theme.fs-md;
                     font-weight: 600;
@@ -2529,13 +2772,16 @@ export component AppWindow inherits Window {
                 Rectangle {
                     width: 20px; height: 20px;
                     border-radius: Theme.radius-sm;
-                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
+                    // Match ProcWindow's close button: red (#e81123) on hover,
+                    // white glyph, smooth 90ms transition (#close-hover-red).
+                    background: close-ta.has-hover ? #e81123 : transparent;
+                    animate background { duration: 90ms; }
                     close-ta := TouchArea {
                         mouse-cursor: pointer;
                         clicked => { root.download-open = false; }
                     }
                     Text { text: "\u{E5CD}"; font-family: "Material Icons";
-                           color: Theme.text-secondary; font-size: Theme.fs-sm;
+                           color: close-ta.has-hover ? white : Theme.text-secondary; font-size: Theme.fs-sm;
                            horizontal-alignment: center; vertical-alignment: center; }
                 }
             }
@@ -2640,7 +2886,14 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     spacing: 4px;
                                     Text {
-                                        text: (t.is-upload ? "↑ " : "↓ ") + t.name;
+                                        text: t.is-upload ? "\u{E5D8}" : "\u{E5DB}"; // up / down arrow
+                                        color: t.is-upload ? #639922 : #7c3aed;  // upload=green, download=accent purple
+                                        font-family: "Material Icons";
+                                        font-size: Theme.fs-md;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: t.name;
                                         color: Theme.text-primary;
                                         font-size: Theme.fs-xs;
                                         horizontal-stretch: 1;
@@ -2691,6 +2944,65 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // --- Bottom-right resize grip (#dl-resize) -------------------------
+        // Mirrors the interface dialog's grip: same Material "open_in_full"
+        // glyph + nwse-resize cursor, pure-Slint drag-resize (the popup is an
+        // embedded Rectangle, so OS drag_resize_window can't be used here).
+        Rectangle {
+            // #dl-resize: bottom-right resize grip — switched from
+            // "open_in_full" glyph to the 3-dot diagonal pattern used by
+            // ProcWindow (#grip-icon-3dots) so all three affordances share
+            // one visual. Background stays transparent even on hover so the
+            // hover state never paints a 16x16 grey block (which read as a
+            // "shadow"). Hover feedback is given by the 3 dots shifting to
+            // text-secondary below.
+            x: parent.width - 16px;
+            y: parent.height - 16px;
+            width: 16px;
+            height: 16px;
+            background: transparent;
+            // 保留原 \u{E3C2} open_in_full 视觉（注释保留以备切换） (#grip-icon-3dots)
+            // Text {
+            //     text: "\u{E3C2}";   // Material "open_in_full" — matches interface dialog grip
+            //     font-family: "Material Icons";
+            //     color: Theme.text-muted;
+            //     font-size: 14px;
+            //     horizontal-alignment: center;
+            //     vertical-alignment: center;
+            // }
+            // 替换为进程弹框(ProcWindow:457)同款 3 点对角手柄
+            Rectangle { x: parent.width - 5px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                        background: Theme.text-muted; }
+            Rectangle { x: parent.width - 9px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                        background: Theme.text-muted; }
+            Rectangle { x: parent.width - 5px;  y: parent.height - 9px;  width: 2px; height: 2px;
+                        background: Theme.text-muted; }
+            dl-resize-ta := TouchArea {
+                mouse-cursor: nwse-resize;
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.dl-resizing = true;
+                        root.dl-base-w = root.dl-w;
+                        root.dl-base-h = root.dl-h;
+                        root.dl-grab-x = self.absolute-position.x + self.mouse-x;
+                        root.dl-grab-y = self.absolute-position.y + self.mouse-y;
+                    } else if (e.kind == PointerEventKind.up) {
+                        root.dl-resizing = false;
+                    }
+                }
+                moved => {
+                    if (root.dl-resizing) {
+                        root.dl-w = clamp(
+                            round((root.dl-base-w + (self.absolute-position.x + self.mouse-x - root.dl-grab-x)) / 1px) * 1px,
+                            300px, 900px);
+                        root.dl-h = clamp(
+                            round((root.dl-base-h + (self.absolute-position.y + self.mouse-y - root.dl-grab-y)) / 1px) * 1px,
+                            320px, 900px);
                     }
                 }
             }
@@ -3106,12 +3418,15 @@ export component AppWindow inherits Window {
                     Rectangle {
                         width: 22px; height: 22px;
                         border-radius: Theme.radius-sm;
-                        background: qcm-close.has-hover ? Theme.bg-hover : transparent;
+                        // Match ProcWindow's close button: red (#e81123) on hover,
+                        // white glyph, smooth 90ms transition (#close-hover-red).
+                        background: qcm-close.has-hover ? #e81123 : transparent;
+                        animate background { duration: 90ms; }
                         qcm-close := TouchArea {
                             mouse-cursor: pointer;
                             clicked => { root.quick-cmd-manage-open = false; }
                         }
-                        Text { text: "\u{E5CD}"; font-family: "Material Icons"; color: Theme.text-secondary;
+                        Text { text: "\u{E5CD}"; font-family: "Material Icons"; color: qcm-close.has-hover ? white : Theme.text-secondary;
                                font-size: Theme.fs-md; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
@@ -3396,20 +3711,30 @@ export component AppWindow inherits Window {
             // Bottom-right resize grip. The chosen size is retained while the
             // application is running, and remains clamped to the main window.
             Rectangle {
-                x: parent.width - 18px;
-                y: parent.height - 18px;
-                width: 18px;
-                height: 18px;
-                background: qcm-resize-ta.has-hover || root.qcm-dialog-resizing
-                    ? Theme.bg-hover : transparent;
-                Text {
-                    text: "\u{E3C2}";
-                    font-family: "Material Icons";
-                    color: Theme.text-muted;
-                    font-size: 14px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+                // #qcm-resize: bottom-right resize grip — switched from
+                // "open_in_full" glyph to the 3-dot diagonal pattern used by
+                // ProcWindow (#grip-icon-3dots) so all affordances share one visual.
+                x: parent.width - 16px;
+                y: parent.height - 16px;
+                width: 16px;
+                height: 16px;
+                background: transparent;
+                // 保留原 \u{E3C2} open_in_full 视觉（注释保留以备切换） (#grip-icon-3dots)
+                // Text {
+                //     text: "\u{E3C2}";
+                //     font-family: "Material Icons";
+                //     color: Theme.text-muted;
+                //     font-size: 14px;
+                //     horizontal-alignment: center;
+                //     vertical-alignment: center;
+                // }
+                // 替换为进程弹框(ProcWindow:457)同款 3 点对角手柄
+                Rectangle { x: parent.width - 5px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                            background: Theme.text-muted; }
+                Rectangle { x: parent.width - 9px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                            background: Theme.text-muted; }
+                Rectangle { x: parent.width - 5px;  y: parent.height - 9px;  width: 2px; height: 2px;
+                            background: Theme.text-muted; }
                 qcm-resize-ta := TouchArea {
                     mouse-cursor: nwse-resize;
                     pointer-event(e) => {
@@ -3940,7 +4265,7 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 4px; padding-right: 4px;
                                 Text {
-                                    text: "github.com/jeff141/meatshell";
+                                    text: "github.com/yituorou/meatshell";
                                     color: Theme.accent;
                                     font-size: Theme.fs-sm;
                                     vertical-alignment: center;
@@ -3994,10 +4319,12 @@ export component AppWindow inherits Window {
         draft-parity <=> root.dialog-parity;
         draft-flow <=> root.dialog-flow;
         draft-encoding <=> root.dialog-encoding;
+        draft-vt100-drawing <=> root.dialog-vt100-drawing;
         draft-disable-shell-integration <=> root.dialog-disable-shell-integration;
         draft-notes <=> root.dialog-notes;
         test-status <=> root.dialog-test-status;
         forwards: root.dialog-forwards;
+        triggers: root.dialog-triggers;
         submit(draft) => { root.session-dialog-submit(draft); }
         test-connection(draft) => { root.session-dialog-test(draft); }
         cancel => { root.session-dialog-cancel(); }
@@ -4005,6 +4332,9 @@ export component AppWindow inherits Window {
         add-forward => { root.add-forward(); }
         update-forward(i, f) => { root.update-forward(i, f); }
         delete-forward(i) => { root.delete-forward(i); }
+        add-trigger => { root.add-trigger(); }
+        update-trigger(i, trigger) => { root.update-trigger(i, trigger); }
+        delete-trigger(i) => { root.delete-trigger(i); }
     }
 
     // --- Delete confirmation (#28) ----------------------------------------
@@ -4032,14 +4362,15 @@ export component AppWindow inherits Window {
     }
 
     // Multi-line paste can execute several shell commands at once. Keep the
-    // prompt explicit and require a button click; clicking the backdrop never
-    // accepts the paste (#262).
+    // prompt explicit; clicking the backdrop never accepts the paste (#262),
+    // while Enter provides the expected keyboard confirmation (#392).
     ConfirmDialog {
         width: parent.width;
         height: parent.height;
         is-open <=> root.paste-confirm-open;
         covered: root.confirm-close-open;
         dismiss-on-backdrop: false;
+        confirm-on-enter: true;
         title: root.lang-en ? "Confirm multi-line paste" : "确认多行粘贴";
         message: root.lang-en
             ? "The clipboard contains line breaks and may execute multiple commands. Review it before pasting."
@@ -4384,13 +4715,16 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 width: 24px; height: 24px;
                                 border-radius: Theme.radius-sm;
-                                background: if-close-ta.has-hover ? Theme.bg-hover : transparent;
+                                // Match ProcWindow's close button: red (#e81123) on hover,
+                                // white glyph, smooth 90ms transition (#close-hover-red).
+                                background: if-close-ta.has-hover ? #e81123 : transparent;
+                                animate background { duration: 90ms; }
                                 if-close-ta := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { root.interface-open = false; }
                                 }
                                 Text { text: "\u{E5CD}"; font-family: "Material Icons";
-                                       color: Theme.text-secondary; font-size: 15px;
+                                       color: if-close-ta.has-hover ? white : Theme.text-secondary; font-size: 15px;
                                        horizontal-alignment: center; vertical-alignment: center; }
                             }
                         }
@@ -4502,19 +4836,31 @@ export component AppWindow inherits Window {
                 }
             }
             Rectangle {
-                x: parent.width - 18px;
-                y: parent.height - 18px;
-                width: 18px;
-                height: 18px;
-                background: resize-ta.has-hover || root.ifd-resizing ? Theme.bg-hover : transparent;
-                Text {
-                    text: "\u{E3C2}";
-                    font-family: "Material Icons";
-                    color: Theme.text-muted;
-                    font-size: 14px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
+                // #ifd-resize: bottom-right resize grip — switched from
+                // "open_in_full" glyph to the 3-dot diagonal pattern used by
+                // ProcWindow (#grip-icon-3dots) so all three affordances share
+                // one visual.
+                x: parent.width - 16px;
+                y: parent.height - 16px;
+                width: 16px;
+                height: 16px;
+                background: transparent;
+                // 保留原 \u{E3C2} open_in_full 视觉（注释保留以备切换） (#grip-icon-3dots)
+                // Text {
+                //     text: "\u{E3C2}";
+                //     font-family: "Material Icons";
+                //     color: Theme.text-muted;
+                //     font-size: 14px;
+                //     horizontal-alignment: center;
+                //     vertical-alignment: center;
+                // }
+                // 替换为进程弹框(ProcWindow:457)同款 3 点对角手柄
+                Rectangle { x: parent.width - 5px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                            background: Theme.text-muted; }
+                Rectangle { x: parent.width - 9px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                            background: Theme.text-muted; }
+                Rectangle { x: parent.width - 5px;  y: parent.height - 9px;  width: 2px; height: 2px;
+                            background: Theme.text-muted; }
                 resize-ta := TouchArea {
                     mouse-cursor: nwse-resize;
                     pointer-event(e) => {
@@ -4541,5 +4887,32 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // --- Bottom-right resize grip (frameless platforms) -------------------
+    // #main-resize-grip: mirrors ProcWindow's grip so the main window has the
+    // same visual affordance + drag-resize behavior when the OS title bar is
+    // hidden (custom-titlebar mode). Only rendered in frameless mode; otherwise
+    // the OS frame already provides this corner.
+    if root.custom-titlebar : Rectangle {
+        width: 16px;
+        height: 16px;
+        x: root.width - self.width;
+        y: root.height - self.height;
+        TouchArea {
+            mouse-cursor: nwse-resize;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                    root.win-resize-se();
+                }
+            }
+        }
+        // Classic dotted resize grip (a diagonal of 2px dots, bottom-right).
+        Rectangle { x: parent.width - 5px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                    background: Theme.text-muted; }
+        Rectangle { x: parent.width - 9px;  y: parent.height - 5px;  width: 2px; height: 2px;
+                    background: Theme.text-muted; }
+        Rectangle { x: parent.width - 5px;  y: parent.height - 9px;  width: 2px; height: 2px;
+                    background: Theme.text-muted; }
     }
 }

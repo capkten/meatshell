@@ -24,7 +24,7 @@ the tens-of-MB range of a native binary.
 
 Every `v*` tag triggers a GitHub Actions build that produces native binaries for
 **Windows / Linux / macOS**, published on the
-[Releases](https://github.com/jeff141/meatshell/releases) page.
+[Releases](https://github.com/yituorou/meatshell/releases) page.
 
 ### Windows
 
@@ -36,10 +36,14 @@ Download `meatshell-*-windows-x86_64.zip`, unzip, and run `meatshell.exe`.
 tar -xzf meatshell-*-linux-x86_64.tar.gz
 cd meatshell-*-linux-x86_64
 ./meatshell                                  # run it directly
-# Optional: install the app icon + launcher entry (shows the icon in the dock /
-# app list — no argument needed, it finds the binary next to the script)
+# Optional: system-wide install of the binary, icon, and launcher (requires sudo)
 chmod +x install-linux.sh && ./install-linux.sh
 ```
+
+The installer places the binary at `/usr/local/bin/meatshell`, the launcher at
+`/usr/local/share/applications/meatshell.desktop`, and the icon at
+`/usr/local/share/icons/hicolor/512x512/apps/meatshell.png`. It also removes a
+stale same-named user launcher left by older tarball installers.
 
 > Requires glibc ≥ 2.35 (Ubuntu 22.04+ / Debian 12+). On Wayland you may need to
 > log out/in once after installing the icon.
@@ -75,6 +79,8 @@ open /Applications/meatshell.app
 
 > If you didn't move it to `/Applications`, point both paths above at wherever the `.app` actually is (e.g. `~/Downloads/meatshell.app`).
 
+> Requires macOS 11 Big Sur or later. Both Apple Silicon and Intel Macs are supported.
+
 > To build from source, see [Running](#running) below.
 
 ## Features
@@ -92,7 +98,7 @@ open /Applications/meatshell.app
     / `~/.config/meatshell/sessions.json` (Linux)
     / `~/Library/Application Support/meatshell/sessions.json` (macOS)
 - [x] SSH (`russh`, pure Rust): password / private key / encrypted key (passphrase)
-- [x] SFTP browser + upload / download (drag-and-drop) + in-terminal ZMODEM (`sz`) receive
+- [x] SFTP browser + upload / download (drag-and-drop) + in-terminal ZMODEM (`sz` download / `rz` multi-file upload)
 - [x] SSH port forwarding / tunnels: local -L / remote -R / dynamic -D (SOCKS5)
 - [x] Quick commands + command box (broadcast to all sessions) + command history
 - [x] Serial / Telnet sessions
@@ -103,7 +109,7 @@ open /Applications/meatshell.app
 - [x] SFTP image preview with zoom, pan, and navigation
 - [x] Known-hosts (`known_hosts`) verification + first-connect confirmation
 - [x] Split panes for tabbed terminals
-- [x] Multiple windows: Ctrl+Shift+N (macOS ⌘⇧N) or the system "New window" entry (Windows taskbar / macOS Dock / Linux desktop right-click), managed as a single Chrome-style process
+- [x] Multiple windows: Ctrl+Shift+N (macOS ⌘⇧N) or the system "New window" entry (Windows taskbar / Linux desktop right-click), managed as a single Chrome-style process
 
 Color emoji graphics are provided by [Twemoji](https://github.com/jdecked/twemoji)
 under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). See
