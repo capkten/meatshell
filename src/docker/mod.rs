@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub(crate) mod command;
+#[allow(dead_code)]
 mod model;
 #[allow(dead_code)]
 pub(crate) mod parse;
