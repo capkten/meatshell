@@ -50,3 +50,23 @@ Focused coverage includes local/welcome/Telnet/serial/SSH routing; filtered row/
 - Stale list and detail results are discarded after a target/generation or selection change.
 - The requested focused command includes `--lib`, but the current binary-only crate requires `--bin meatshell`.
 - Compilation, formatting, focused tests, and the full locked test suite are green; the repository-wide Clippy baseline remains the only known verification limitation.
+
+## Reviewer fix follow-up
+
+The acceptance review identified five controller/UI contract gaps. They were fixed in this follow-up without adding Task 6 lifecycle behavior:
+
+- `docker_summary` now selects the visible error from the active page, preserving independent container/image errors. Regression coverage verifies image-only and container-only failures on both tabs.
+- `DockerUiState.detail_error` and DockerWindow's `detail-error` property now preserve and display command, timeout/channel, permission, and parse causes. Successful details still render approved fields only, with `Config.Env` omitted.
+- Tab changes clear details, selected identity, and detail errors, so late detail results cannot remain visible across pages.
+- Docker container/image/detail `VecModel`s are retained in the DockerWindow property and updated with `set_vec` in place; replacement is used only for initial model installation. A focused identity test covers the in-place update helper.
+- DockerWindow now exposes filtered container/image counts; the controller updates them from the current query/filter view while sidebar counts remain raw snapshot counts.
+- `refresh_now` renders immediately after marking the state in flight, so loading is visible before the background request completes.
+
+### Follow-up verification
+
+- `cargo test --bin meatshell app::docker::tests`: passed, 14/14.
+- `cargo fmt --all -- --check`: passed after rustfmt normalization.
+- `cargo clippy --all-targets -- -D warnings`: remains nonzero only for the pre-existing repository baseline; no Task 5 Docker diagnostics remain.
+- Final post-review `cargo test --locked`: passed, 298/298.
+- Final post-review `cargo check`: passed with the existing unrelated dead-code warnings.
+- Final post-review strict Clippy still reports the same 77 pre-existing repository diagnostics; no reviewer-fix diagnostic was introduced.

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use slint::{ModelRc, VecModel};
+use slint::{Model, ModelRc, VecModel};
 use tokio::runtime::Runtime;
 
 use crate::docker::command::run_local;
@@ -37,6 +37,7 @@ pub(super) struct DockerUiState {
     pub snapshot: Option<DockerSnapshot>,
     pub container_error: Option<DockerError>,
     pub image_error: Option<DockerError>,
+    pub detail_error: Option<DockerError>,
     pub query: String,
     pub active_tab: DockerTab,
     pub filter: ContainerFilter,
@@ -60,6 +61,7 @@ impl DockerUiState {
             snapshot: None,
             container_error: None,
             image_error: None,
+            detail_error: None,
             query: String::new(),
             active_tab: DockerTab::Containers,
             filter: ContainerFilter::All,
@@ -80,12 +82,22 @@ impl DockerUiState {
         self.snapshot = None;
         self.container_error = None;
         self.image_error = None;
+        self.detail_error = None;
         self.query.clear();
         self.active_tab = DockerTab::Containers;
         self.filter = ContainerFilter::All;
         self.selected_id = None;
         self.details.clear();
         self.in_flight = false;
+    }
+
+    fn set_tab(&mut self, tab: DockerTab) {
+        if self.active_tab != tab {
+            self.active_tab = tab;
+            self.selected_id = None;
+            self.details.clear();
+            self.detail_error = None;
+        }
     }
 }
 
@@ -136,12 +148,12 @@ pub(super) fn docker_summary(state: &DockerUiState) -> DockerSummary {
     DockerSummary {
         target: target_label(&state.target),
         status: status_text(&state.status),
-        error: state
-            .container_error
-            .as_ref()
-            .or(state.image_error.as_ref())
-            .map(|e| e.message.clone())
-            .unwrap_or_default(),
+        error: match state.active_tab {
+            DockerTab::Containers => state.container_error.as_ref(),
+            DockerTab::Images => state.image_error.as_ref(),
+        }
+        .map(|e| e.message.clone())
+        .unwrap_or_default(),
         visible: !matches!(state.status, DockerStatus::NotInstalled),
         container_count,
         running_count,
@@ -229,6 +241,7 @@ impl DockerController {
             s.in_flight = true;
             (s.generation, s.target.clone())
         };
+        self.render();
         let state = self.state.clone();
         let main = self.main.clone();
         let window = self.window.clone();
@@ -283,7 +296,7 @@ impl DockerController {
         self.render();
     }
     pub(super) fn set_tab(&self, tab: DockerTab) {
-        self.state.lock().unwrap().active_tab = tab;
+        self.state.lock().unwrap().set_tab(tab);
         self.render();
     }
     pub(super) fn set_filter(&self, filter: ContainerFilter) {
@@ -309,6 +322,7 @@ impl DockerController {
             };
             s.selected_id = Some(id.clone());
             s.details.clear();
+            s.detail_error = None;
             (s.generation, s.target.clone(), request, tab)
         };
         let state = self.state.clone();
@@ -497,6 +511,7 @@ fn apply_snapshot(
     s.snapshot = result.snapshot;
     s.container_error = result.container_error;
     s.image_error = result.image_error;
+    s.detail_error = None;
     s.status = result.status;
     s.in_flight = false;
     drop(s);
@@ -518,17 +533,29 @@ fn apply_detail(
         || s.target != *target
         || s.selected_id.as_deref() != Some(selected_id)
         || s.active_tab != tab
-        || !successful(&result)
     {
         return;
     }
-    s.details = match tab {
-        DockerTab::Containers => parse_container_detail(&result.stdout)
-            .map(container_detail_rows)
-            .unwrap_or_default(),
-        DockerTab::Images => parse_image_detail(&result.stdout)
-            .map(image_detail_rows)
-            .unwrap_or_default(),
+    if !successful(&result) {
+        s.details.clear();
+        s.detail_error = Some(error_from_result(&result));
+    } else {
+        let parsed = match tab {
+            DockerTab::Containers => {
+                parse_container_detail(&result.stdout).map(container_detail_rows)
+            }
+            DockerTab::Images => parse_image_detail(&result.stdout).map(image_detail_rows),
+        };
+        match parsed {
+            Ok(details) => {
+                s.details = details;
+                s.detail_error = None;
+            }
+            Err(error) => {
+                s.details.clear();
+                s.detail_error = Some(error);
+            }
+        }
     };
     drop(s);
     render_state(state, main, window);
@@ -578,6 +605,13 @@ fn render_state(
         w.set_target(summary.target.clone().into());
         w.set_status(summary.status.clone().into());
         w.set_error(summary.error.clone().into());
+        w.set_detail_error(
+            s.detail_error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .unwrap_or_default()
+                .into(),
+        );
         w.set_loading(s.in_flight || matches!(s.status, DockerStatus::Loading));
         w.set_query(s.query.clone().into());
         w.set_active_tab(if s.active_tab == DockerTab::Containers {
@@ -590,11 +624,38 @@ fn render_state(
             ContainerFilter::Running => 1,
             ContainerFilter::Stopped => 2,
         });
-        w.set_containers(ModelRc::from(Rc::new(VecModel::from(docker_rows(&s)))));
-        w.set_images(ModelRc::from(Rc::new(VecModel::from(docker_image_rows(
-            &s,
-        )))));
-        w.set_details(ModelRc::from(Rc::new(VecModel::from(s.details))));
+        let container_rows = docker_rows(&s);
+        if let Some(model) = w
+            .get_containers()
+            .as_any()
+            .downcast_ref::<VecModel<DockerContainerRow>>()
+        {
+            update_vec_model(model, container_rows);
+        } else {
+            w.set_containers(ModelRc::from(Rc::new(VecModel::from(container_rows))));
+        }
+        let image_rows = docker_image_rows(&s);
+        if let Some(model) = w
+            .get_images()
+            .as_any()
+            .downcast_ref::<VecModel<DockerImageRow>>()
+        {
+            update_vec_model(model, image_rows);
+        } else {
+            w.set_images(ModelRc::from(Rc::new(VecModel::from(image_rows))));
+        }
+        if let Some(model) = w
+            .get_details()
+            .as_any()
+            .downcast_ref::<VecModel<DockerDetailRow>>()
+        {
+            update_vec_model(model, s.details.clone());
+        } else {
+            w.set_details(ModelRc::from(Rc::new(VecModel::from(s.details.clone()))));
+        }
+        let (filtered_container_count, filtered_image_count) = docker_filtered_counts(&s);
+        w.set_filtered_container_count(filtered_container_count);
+        w.set_filtered_image_count(filtered_image_count);
     }
     if let Some(w) = main.upgrade() {
         w.set_docker_visible(summary.visible);
@@ -605,6 +666,17 @@ fn render_state(
         w.set_docker_running_count(summary.running_count);
         w.set_docker_image_count(summary.image_count);
     }
+}
+
+fn docker_filtered_counts(state: &DockerUiState) -> (i32, i32) {
+    (
+        docker_rows(state).len() as i32,
+        docker_image_rows(state).len() as i32,
+    )
+}
+
+fn update_vec_model<T: Clone + 'static>(model: &VecModel<T>, rows: Vec<T>) {
+    model.set_vec(rows);
 }
 
 #[cfg(test)]
@@ -781,6 +853,115 @@ mod tests {
             result.image_error.unwrap().kind,
             DockerErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn summary_error_follows_active_page_error() {
+        let mut state = DockerUiState {
+            image_error: Some(DockerError {
+                kind: DockerErrorKind::DaemonUnavailable,
+                message: "image daemon unavailable".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(docker_summary(&state).error, "");
+        state.active_tab = DockerTab::Images;
+        assert_eq!(docker_summary(&state).error, "image daemon unavailable");
+
+        state.active_tab = DockerTab::Images;
+        state.image_error = None;
+        state.container_error = Some(DockerError {
+            kind: DockerErrorKind::PermissionDenied,
+            message: "container denied".into(),
+        });
+        assert_eq!(docker_summary(&state).error, "");
+        state.active_tab = DockerTab::Containers;
+        assert_eq!(docker_summary(&state).error, "container denied");
+    }
+
+    #[test]
+    fn detail_failure_preserves_command_or_parse_reason() {
+        let state = Arc::new(Mutex::new(DockerUiState {
+            snapshot: Some(snapshot_with_running_and_stopped_containers()),
+            selected_id: Some("running-id".into()),
+            ..Default::default()
+        }));
+        apply_detail(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            0,
+            &DockerTarget::Local,
+            "running-id",
+            DockerTab::Containers,
+            failed_result("permission denied"),
+        );
+        assert_eq!(
+            state.lock().unwrap().detail_error.as_ref().unwrap().message,
+            "permission denied"
+        );
+
+        apply_detail(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            0,
+            &DockerTarget::Local,
+            "running-id",
+            DockerTab::Containers,
+            DockerExecResult {
+                stdout: "not json".into(),
+                exit_code: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state.lock().unwrap().detail_error.as_ref().unwrap().kind,
+            DockerErrorKind::ParseFailed
+        );
+    }
+
+    #[test]
+    fn changing_tab_clears_detail_identity_and_rows() {
+        let mut state = DockerUiState {
+            active_tab: DockerTab::Containers,
+            selected_id: Some("running-id".into()),
+            details: vec![DockerDetailRow {
+                label: "ID".into(),
+                value: "running-id".into(),
+            }],
+            ..Default::default()
+        };
+        state.set_tab(DockerTab::Images);
+        assert_eq!(state.active_tab, DockerTab::Images);
+        assert!(state.selected_id.is_none());
+        assert!(state.details.is_empty());
+    }
+
+    #[test]
+    fn filtered_counts_follow_query_and_container_filter() {
+        let state = DockerUiState {
+            snapshot: Some(snapshot_with_running_and_stopped_containers()),
+            query: "nginx".into(),
+            filter: ContainerFilter::Running,
+            ..Default::default()
+        };
+        assert_eq!(docker_filtered_counts(&state), (1, 0));
+    }
+
+    #[test]
+    fn model_updates_keep_vec_model_identity() {
+        let model = Rc::new(VecModel::from(vec![DockerContainerRow {
+            id: "old".into(),
+            name: "old".into(),
+            image: "old".into(),
+            status: "old".into(),
+            created: "old".into(),
+        }]));
+        let before = Rc::as_ptr(&model);
+        update_vec_model(&model, vec![]);
+        assert_eq!(Rc::as_ptr(&model), before);
+        assert_eq!(model.row_count(), 0);
     }
 
     fn success_result() -> DockerExecResult {

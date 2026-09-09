@@ -24,6 +24,7 @@ export component DockerWindow inherits Window {
     in property <string> target;
     in property <string> status;
     in property <string> error;
+    in property <string> detail-error;
     in property <bool> loading;
     in property <[DockerContainerRow]> containers;
     in property <[DockerImageRow]> images;
@@ -31,6 +32,8 @@ export component DockerWindow inherits Window {
     in-out property <int> active-tab: 0;
     in-out property <string> query;
     in-out property <int> container-filter: 0;
+    in property <int> filtered-container-count;
+    in property <int> filtered-image-count;
     callback close();
     callback refresh();
     callback search-changed(string);
@@ -134,13 +137,13 @@ export component DockerWindow inherits Window {
                         width: 100px; border-radius: Theme.radius-sm;
                         background: root.active-tab == 0 ? Theme.bg-active : tab-cont.has-hover ? Theme.bg-hover : transparent;
                         tab-cont := TouchArea { mouse-cursor: pointer; clicked => { root.active-tab = 0; root.tab-changed(0); } }
-                        Text { text: @tr("Containers"); color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-size: Theme.fs-sm; }
+                        Text { text: @tr("Containers") + " (" + root.filtered-container-count + ")"; color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-size: Theme.fs-sm; }
                     }
                     Rectangle {
                         width: 80px; border-radius: Theme.radius-sm;
                         background: root.active-tab == 1 ? Theme.bg-active : tab-img.has-hover ? Theme.bg-hover : transparent;
                         tab-img := TouchArea { mouse-cursor: pointer; clicked => { root.active-tab = 1; root.tab-changed(1); } }
-                        Text { text: @tr("Images"); color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-size: Theme.fs-sm; }
+                        Text { text: @tr("Images") + " (" + root.filtered-image-count + ")"; color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-size: Theme.fs-sm; }
                     }
                     Rectangle { horizontal-stretch: 1; }
                     LineEdit {
@@ -213,6 +216,7 @@ export component DockerWindow inherits Window {
                         }
                     }
                 }
+                if root.detail-error != "" : Text { text: root.detail-error; color: Theme.danger; font-size: Theme.fs-sm; wrap: word-wrap; }
                 if root.details.length == 0 && root.containers.length == 0 && root.images.length == 0 && !root.loading && root.error == "" : Text { text: @tr("No data"); color: Theme.text-muted; font-size: Theme.fs-xs; }
             }
         }
