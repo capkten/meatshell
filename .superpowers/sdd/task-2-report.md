@@ -48,3 +48,14 @@
 - TDD RED: the three new Version, Containers, and Images remote-command tests failed with raw `{{json .}}` output before the fix.
 - TDD GREEN: `cargo test docker::command::tests` passed with 9 tests, including all three regression tests and the existing inspect quoting tests.
 - Follow-up verification: `cargo fmt --all -- --check`, `cargo check`, and `cargo test --locked` all passed; the locked suite reported 281/281 tests passing. The check/test commands retain only known unrelated dead-code warnings.
+
+## Strict verification evidence
+
+Executed in the requested order:
+
+1. `cargo fmt --all -- --check` — passed with exit code 0.
+2. `cargo clippy --all-targets -- -D warnings` — failed with exit code 101. Every reported finding was pre-existing and outside Task 2, including dead-code findings in `src/app/resource_ui.rs` and `src/resource/struct/system.rs`, argument-count/test-order findings in `src/app`, conversion/borrow findings in `src/app` and `src/terminal`, module-inception findings in existing module trees, and existing MSRV/SSH/terminal lint findings. No `src/docker` finding was reported.
+3. `cargo test --locked` — passed: 281 passed, 0 failed.
+4. `cargo check` — passed with exit code 0; it emitted only the same unrelated pre-existing dead-code warnings outside `src/docker`.
+
+No source changes were needed for this verification pass; Task 2’s committed source state remains intact.
