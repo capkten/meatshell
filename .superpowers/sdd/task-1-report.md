@@ -58,3 +58,26 @@ GREEN:
 - The repository’s prescribed focused command includes `--lib`, but this binary-only crate cannot run it; the equivalent filter without `--lib` was used and recorded above.
 - Full strict Clippy remains red because of pre-existing repository findings; fixing those would exceed Task 1 scope.
 - Detail fields containing nested Docker objects are represented as compact JSON text for downstream UI formatting; later tasks should keep that representation stable unless the UI contract explicitly changes.
+
+## Reviewer fix follow-up
+
+### Fix summary
+
+- `first_inspect_value` now scans an inspect array and returns the first object element, rather than requiring the first array element to be an object.
+- Added `parses_first_object_after_non_object_inspect_entry` covering a leading `null` before the valid inspect object.
+- Changed all Docker model struct fields from `pub` to the requested `pub(crate)` visibility.
+- Retained `ParseFailed` when an inspect array contains no object element.
+
+### Fix TDD evidence and validation
+
+- RED: the new regression test failed before the fix with `DockerError { kind: ParseFailed, message: "expected a non-empty inspect array" }`.
+- GREEN: `cargo test docker::parse::tests` passed, 8/8.
+- `cargo fmt --all -- --check`: passed.
+- `cargo check`: passed, with the repository’s existing warnings.
+- `cargo test --locked`: passed, 272/272.
+
+### Fix self-review
+
+- The parser now handles arbitrary non-object entries before the first inspect object and still rejects empty/all-non-object arrays without panicking.
+- The visibility change is limited to the Docker model fields and does not change the crate-visible API used by the focused tests.
+- No unrelated source or scratch files were changed or staged.

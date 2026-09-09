@@ -139,8 +139,7 @@ fn first_inspect_value(stdout: &str) -> Result<Value, DockerError> {
     match value {
         Value::Array(mut values) => values
             .drain(..)
-            .next()
-            .filter(Value::is_object)
+            .find(Value::is_object)
             .ok_or_else(|| parse_error("expected a non-empty inspect array".to_string())),
         Value::Object(value) => Ok(Value::Object(value)),
         _ => Err(parse_error(
@@ -280,6 +279,13 @@ mod tests {
         assert!(!detail.command.contains("SECRET"));
         assert!(!detail.mounts.contains("SECRET"));
         assert!(!detail.networks.contains("SECRET"));
+    }
+
+    #[test]
+    fn parses_first_object_after_non_object_inspect_entry() {
+        let stdout = r#"[null,{"Id":"container-id","Config":{"Image":"nginx:1.27"}}]"#;
+        let detail = parse_container_detail(stdout).expect("first object in inspect JSON");
+        assert_eq!(detail.id, "container-id");
     }
 
     #[test]
