@@ -39,13 +39,24 @@ pub(crate) fn remote_command(request: &DockerRequest) -> String {
         DockerRequest::InspectImage(id) => {
             vec!["image".to_string(), "inspect".to_string(), shell_quote(id)]
         }
-        _ => docker_args(request),
+        _ => docker_args(request)
+            .into_iter()
+            .map(remote_fixed_arg)
+            .collect(),
     };
     format!("docker {}", args.join(" "))
 }
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_fixed_arg(value: String) -> String {
+    if value == "{{json .}}" {
+        shell_quote(&value)
+    } else {
+        value
+    }
 }
 
 pub(crate) async fn run_local(request: DockerRequest) -> DockerExecResult {
@@ -143,6 +154,30 @@ mod tests {
     fn inspect_id_with_apostrophe_remains_shell_safe() {
         let command = remote_command(&DockerRequest::InspectContainer("a'b".into()));
         assert_eq!(command, "docker inspect --type container 'a'\\''b'");
+    }
+
+    #[test]
+    fn version_remote_command_keeps_json_template_as_one_argument() {
+        assert_eq!(
+            remote_command(&DockerRequest::Version),
+            "docker version --format '{{json .}}'"
+        );
+    }
+
+    #[test]
+    fn containers_remote_command_keeps_json_template_as_one_argument() {
+        assert_eq!(
+            remote_command(&DockerRequest::Containers),
+            "docker ps -a --no-trunc --format '{{json .}}'"
+        );
+    }
+
+    #[test]
+    fn images_remote_command_keeps_json_template_as_one_argument() {
+        assert_eq!(
+            remote_command(&DockerRequest::Images),
+            "docker image ls --no-trunc --format '{{json .}}'"
+        );
     }
 
     #[test]
