@@ -38,3 +38,18 @@
 - Existing Stats, network, disk, process, session, SFTP, and fork-specific behavior was left unchanged.
 - The Docker window consumes already-filtered models and does not execute commands or parse strings in Slint.
 - The only remaining concern is the repository-wide strict-Clippy baseline described above; it predates this UI-only task.
+
+## Review fixes
+
+- Changed the sidebar Docker status/error text from elision to word wrapping and allowed the summary block to grow when a full reason needs multiple lines, so permission, daemon, command, and parse failure messages remain available while short summaries stay compact.
+- Restricted the Docker window's `No data` placeholder to the genuinely empty loaded state: it no longer appears just because details are unselected while container or image rows exist.
+- Removed unused `GhostButton` and `Button` imports.
+
+## Ordered review verification
+
+The required sequence was run in this order:
+
+1. `cargo fmt --all -- --check` — PASS
+2. `cargo clippy --all-targets -- -D warnings` — FAIL on the pre-existing repository-wide lint baseline (77 binary-target errors and 79 test-target errors). No diagnostic was introduced by the Docker UI files or review fixes.
+3. `cargo test --locked` — PASS, 284 passed and 0 failed
+4. `cargo check` — PASS; existing dead-code warnings remain

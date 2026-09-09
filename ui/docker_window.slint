@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
-import { GhostButton, PrimaryButton } from "widgets.slint";
-import { LineEdit, Button } from "std-widgets.slint";
+import { PrimaryButton } from "widgets.slint";
+import { LineEdit } from "std-widgets.slint";
 
 export struct DockerContainerRow {
     id: string,
@@ -213,7 +213,7 @@ export component DockerWindow inherits Window {
                         }
                     }
                 }
-                if root.details.length == 0 && !root.loading && root.error == "" : Text { text: @tr("No data"); color: Theme.text-muted; font-size: Theme.fs-xs; }
+                if root.details.length == 0 && root.containers.length == 0 && root.images.length == 0 && !root.loading && root.error == "" : Text { text: @tr("No data"); color: Theme.text-muted; font-size: Theme.fs-xs; }
             }
         }
     }

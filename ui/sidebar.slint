@@ -407,7 +407,7 @@ component DockerBlock inherits Rectangle {
     callback show-docker();
 
     visible: root.visible-summary;
-    height: root.visible-summary ? 82px : 0px;
+    height: root.visible-summary ? max(82px, docker-content.preferred-height + 16px) : 0px;
     border-radius: Theme.radius-sm;
     background: docker-ta.has-hover ? Theme.bg-hover : transparent;
     docker-ta := TouchArea {
@@ -415,7 +415,7 @@ component DockerBlock inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.show-docker(); }
     }
-    VerticalLayout {
+    docker-content := VerticalLayout {
         padding: 8px;
         spacing: 3px;
         HorizontalLayout {
@@ -426,7 +426,7 @@ component DockerBlock inherits Rectangle {
             text: root.error != "" ? root.error : root.status;
             color: root.error != "" ? Theme.danger : Theme.text-secondary;
             font-size: Theme.fs-xs;
-            overflow: elide;
+            wrap: word-wrap;
         }
         Text {
             text: @tr("Containers") + ": " + root.container-count + "  (" + @tr("Running") + ": " + root.running-count + ")  ·  " + @tr("Images") + ": " + root.image-count;
