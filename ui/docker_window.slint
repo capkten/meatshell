@@ -1,0 +1,232 @@
+import { Theme } from "theme.slint";
+import { GhostButton, PrimaryButton } from "widgets.slint";
+import { LineEdit, Button } from "std-widgets.slint";
+
+export struct DockerContainerRow {
+    id: string,
+    name: string,
+    image: string,
+    status: string,
+    created: string,
+}
+
+export struct DockerImageRow {
+    id: string,
+    repository: string,
+    tag: string,
+    size: string,
+    created: string,
+}
+
+export struct DockerDetailRow { label: string, value: string }
+
+export component DockerWindow inherits Window {
+    in property <string> target;
+    in property <string> status;
+    in property <string> error;
+    in property <bool> loading;
+    in property <[DockerContainerRow]> containers;
+    in property <[DockerImageRow]> images;
+    in property <[DockerDetailRow]> details;
+    in-out property <int> active-tab: 0;
+    in-out property <string> query;
+    in-out property <int> container-filter: 0;
+    callback close();
+    callback refresh();
+    callback search-changed(string);
+    callback tab-changed(int);
+    callback filter-changed(int);
+    callback select-container(string);
+    callback select-image(string);
+    callback win-drag();
+    callback win-resize-east();
+    callback win-resize-se();
+
+    title: "meatshell — " + @tr("Docker Monitor");
+    icon: @image-url("../assets/icon.png");
+    in-out property <bool> dark-mode <=> Theme.dark;
+    in-out property <float> ui-scale <=> Theme.ui-scale;
+    in-out property <string> ui-font-family <=> Theme.ui-font-family;
+    in-out property <image> wallpaper-img <=> Theme.wallpaper;
+    in-out property <bool> wallpaper-active <=> Theme.wallpaper-active;
+    in-out property <color> wp-accent <=> Theme.wp-accent;
+    in-out property <color> wp-tint <=> Theme.wp-tint;
+    in property <bool> custom-titlebar;
+    no-frame: root.custom-titlebar;
+    default-font-family: Theme.ui-font-family;
+
+    min-width: 560px;
+    min-height: 360px;
+    preferred-width: 920px;
+    preferred-height: 620px;
+    background: Theme.window-base;
+
+    if Theme.wallpaper-active : Image {
+        width: parent.width;
+        height: parent.height;
+        source: Theme.wallpaper;
+        image-fit: cover;
+    }
+    Rectangle { width: parent.width; height: parent.height; background: Theme.bg-panel; }
+
+    VerticalLayout {
+        spacing: 0;
+
+        if root.custom-titlebar : Rectangle {
+            height: 36px;
+            background: Theme.bg-elevated;
+            drag := TouchArea {
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                        root.win-drag();
+                    }
+                }
+            }
+            HorizontalLayout {
+                padding-left: 12px;
+                spacing: 8px;
+                Image { source: @image-url("../assets/icon.png"); width: 16px; height: 16px; }
+                Text {
+                    text: @tr("Docker Monitor") + (root.target != "" ? "  ·  " + root.target : "");
+                    color: Theme.text-secondary;
+                    font-size: Theme.fs-sm;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Rectangle {
+                    width: 46px;
+                    background: close-ta.has-hover ? #e81123 : transparent;
+                    close-ta := TouchArea { mouse-cursor: pointer; clicked => { root.close(); } }
+                    Text {
+                        text: "\u{E5CD}";
+                        font-family: "Material Icons";
+                        color: close-ta.has-hover ? white : Theme.text-secondary;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        Flickable {
+            vertical-stretch: 1;
+            viewport-width: self.width;
+            viewport-height: max(self.height, body.preferred-height);
+            body := VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: @tr("Docker"); color: Theme.text-primary; font-size: Theme.fs-xl; font-weight: 700; }
+                    Text { text: root.target; color: Theme.text-muted; font-size: Theme.fs-sm; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    PrimaryButton { text: @tr("Refresh"); clicked => { root.refresh(); } }
+                }
+                if root.status != "" : Text { text: root.status; color: Theme.text-secondary; font-size: Theme.fs-xs; }
+                if root.error != "" : Text { text: root.error; color: Theme.danger; font-size: Theme.fs-sm; wrap: word-wrap; }
+                if root.loading : Text { text: @tr("Loading..."); color: Theme.text-muted; font-size: Theme.fs-sm; }
+
+                HorizontalLayout {
+                    height: 32px;
+                    spacing: 6px;
+                    Rectangle {
+                        width: 100px; border-radius: Theme.radius-sm;
+                        background: root.active-tab == 0 ? Theme.bg-active : tab-cont.has-hover ? Theme.bg-hover : transparent;
+                        tab-cont := TouchArea { mouse-cursor: pointer; clicked => { root.active-tab = 0; root.tab-changed(0); } }
+                        Text { text: @tr("Containers"); color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-size: Theme.fs-sm; }
+                    }
+                    Rectangle {
+                        width: 80px; border-radius: Theme.radius-sm;
+                        background: root.active-tab == 1 ? Theme.bg-active : tab-img.has-hover ? Theme.bg-hover : transparent;
+                        tab-img := TouchArea { mouse-cursor: pointer; clicked => { root.active-tab = 1; root.tab-changed(1); } }
+                        Text { text: @tr("Images"); color: Theme.text-primary; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; font-size: Theme.fs-sm; }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    LineEdit {
+                        width: 220px;
+                        placeholder-text: @tr("Search");
+                        text <=> root.query;
+                        edited(text) => { root.search-changed(text); }
+                    }
+                }
+
+                if root.active-tab == 0 : HorizontalLayout {
+                    height: 30px;
+                    spacing: 6px;
+                    Text { text: @tr("Containers"); color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; }
+                    for f in [{label: @tr("All"), value: 0}, {label: @tr("Running"), value: 1}, {label: @tr("Stopped"), value: 2}] : Rectangle {
+                        width: 72px; border-radius: Theme.radius-sm;
+                        background: root.container-filter == f.value ? Theme.bg-active : filter-ta.has-hover ? Theme.bg-hover : transparent;
+                        filter-ta := TouchArea { mouse-cursor: pointer; clicked => { root.container-filter = f.value; root.filter-changed(f.value); } }
+                        Text { text: f.label; color: Theme.text-secondary; font-size: Theme.fs-xs; horizontal-alignment: center; vertical-alignment: center; width: parent.width; height: parent.height; }
+                    }
+                }
+
+                if root.active-tab == 0 : VerticalLayout {
+                    spacing: 2px;
+                    if root.containers.length == 0 : Text { text: root.loading ? @tr("Loading...") : @tr("No results"); color: Theme.text-muted; font-size: Theme.fs-sm; }
+                    for c in root.containers : Rectangle {
+                        height: 34px; border-radius: Theme.radius-sm;
+                        background: row-ta.has-hover ? Theme.bg-hover : transparent;
+                        row-ta := TouchArea { mouse-cursor: pointer; clicked => { root.select-container(c.id); } }
+                        HorizontalLayout {
+                            padding-left: 8px; padding-right: 8px; spacing: 8px;
+                            Text { text: c.name; width: 150px; color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; overflow: elide; }
+                            Text { text: c.image; horizontal-stretch: 1; color: Theme.text-secondary; font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
+                            Text { text: c.status; width: 120px; color: Theme.text-secondary; font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
+                            Text { text: c.created; width: 130px; color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: right; }
+                        }
+                    }
+                }
+
+                if root.active-tab == 1 : VerticalLayout {
+                    spacing: 2px;
+                    if root.images.length == 0 : Text { text: root.loading ? @tr("Loading...") : @tr("No results"); color: Theme.text-muted; font-size: Theme.fs-sm; }
+                    for i in root.images : Rectangle {
+                        height: 34px; border-radius: Theme.radius-sm;
+                        background: image-ta.has-hover ? Theme.bg-hover : transparent;
+                        image-ta := TouchArea { mouse-cursor: pointer; clicked => { root.select-image(i.id); } }
+                        HorizontalLayout {
+                            padding-left: 8px; padding-right: 8px; spacing: 8px;
+                            Text { text: i.repository; horizontal-stretch: 1; color: Theme.text-primary; font-size: Theme.fs-sm; vertical-alignment: center; overflow: elide; }
+                            Text { text: i.tag; width: 110px; color: Theme.text-secondary; font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
+                            Text { text: i.size; width: 100px; color: Theme.text-secondary; font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: right; }
+                            Text { text: i.created; width: 130px; color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; horizontal-alignment: right; }
+                        }
+                    }
+                }
+
+                if root.details.length > 0 : Rectangle {
+                    background: Theme.bg-panel.with-alpha(0.75);
+                    border-radius: Theme.radius-md;
+                    border-width: 1px;
+                    border-color: Theme.border-subtle;
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 4px;
+                        Text { text: @tr("Details") + " (" + @tr("Read-only") + ")"; color: Theme.text-primary; font-size: Theme.fs-sm; font-weight: 600; }
+                        for d in root.details : HorizontalLayout {
+                            height: 24px; spacing: 8px;
+                            Text { text: d.label; width: 120px; color: Theme.text-muted; font-size: Theme.fs-xs; vertical-alignment: center; }
+                            Text { text: d.value; horizontal-stretch: 1; color: Theme.text-secondary; font-size: Theme.fs-xs; vertical-alignment: center; overflow: elide; }
+                        }
+                    }
+                }
+                if root.details.length == 0 && !root.loading && root.error == "" : Text { text: @tr("No data"); color: Theme.text-muted; font-size: Theme.fs-xs; }
+            }
+        }
+    }
+
+    if root.custom-titlebar : Rectangle {
+        width: 24px; height: root.height; x: root.width - self.width; z: 100;
+        TouchArea { mouse-cursor: ew-resize; pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.win-resize-east(); } } }
+    }
+    if root.custom-titlebar : Rectangle {
+        width: 16px; height: 16px; x: root.width - self.width; y: root.height - self.height; z: 101;
+        TouchArea { mouse-cursor: nwse-resize; pointer-event(e) => { if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) { root.win-resize-se(); } } }
+        Rectangle { x: parent.width - 5px; y: parent.height - 5px; width: 2px; height: 2px; background: Theme.text-muted; }
+        Rectangle { x: parent.width - 9px; y: parent.height - 5px; width: 2px; height: 2px; background: Theme.text-muted; }
+        Rectangle { x: parent.width - 5px; y: parent.height - 9px; width: 2px; height: 2px; background: Theme.text-muted; }
+    }
+}

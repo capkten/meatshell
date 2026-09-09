@@ -578,3 +578,57 @@ msgstr "Add trigger"
 
 msgid "When expected text appears, send the response automatically. Responses are stored encrypted."
 msgstr "When expected text appears, send the response automatically. Responses are stored encrypted."
+
+msgid "Docker Monitor"
+msgstr "Docker Monitor"
+
+msgid "Docker"
+msgstr "Docker"
+
+msgid "Containers"
+msgstr "Containers"
+
+msgid "Images"
+msgstr "Images"
+
+msgid "Search"
+msgstr "Search"
+
+msgid "All"
+msgstr "All"
+
+msgid "Running"
+msgstr "Running"
+
+msgid "Stopped"
+msgstr "Stopped"
+
+msgid "No results"
+msgstr "No results"
+
+msgid "No data"
+msgstr "No data"
+
+msgid "Permission denied"
+msgstr "Permission denied"
+
+msgid "Docker daemon unavailable"
+msgstr "Docker daemon unavailable"
+
+msgid "Docker is not installed"
+msgstr "Docker is not installed"
+
+msgid "ID"
+msgstr "ID"
+
+msgid "Created"
+msgstr "Created"
+
+msgid "Repository"
+msgstr "Repository"
+
+msgid "Tag"
+msgstr "Tag"
+
+msgid "Details"
+msgstr "Details"

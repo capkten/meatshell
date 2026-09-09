@@ -396,6 +396,47 @@ component StatsBlock inherits VerticalLayout {
     }
 }
 
+component DockerBlock inherits Rectangle {
+    in property <bool> visible-summary;
+    in property <string> target;
+    in property <string> status;
+    in property <string> error;
+    in property <int> container-count;
+    in property <int> running-count;
+    in property <int> image-count;
+    callback show-docker();
+
+    visible: root.visible-summary;
+    height: root.visible-summary ? 82px : 0px;
+    border-radius: Theme.radius-sm;
+    background: docker-ta.has-hover ? Theme.bg-hover : transparent;
+    docker-ta := TouchArea {
+        enabled: root.visible-summary;
+        mouse-cursor: pointer;
+        clicked => { root.show-docker(); }
+    }
+    VerticalLayout {
+        padding: 8px;
+        spacing: 3px;
+        HorizontalLayout {
+            Text { text: @tr("Docker"); color: Theme.text-primary; font-size: Theme.fs-sm; font-weight: 600; }
+            Text { text: root.target; color: Theme.text-muted; font-size: Theme.fs-xs; horizontal-stretch: 1; horizontal-alignment: right; overflow: elide; }
+        }
+        Text {
+            text: root.error != "" ? root.error : root.status;
+            color: root.error != "" ? Theme.danger : Theme.text-secondary;
+            font-size: Theme.fs-xs;
+            overflow: elide;
+        }
+        Text {
+            text: @tr("Containers") + ": " + root.container-count + "  (" + @tr("Running") + ": " + root.running-count + ")  ·  " + @tr("Images") + ": " + root.image-count;
+            color: Theme.text-muted;
+            font-size: Theme.fs-xs;
+            overflow: elide;
+        }
+    }
+}
+
 // Dual network graph (active tab on top, local below).
 component NetBlock inherits VerticalLayout {
     in property <string> net-top-up;
@@ -505,12 +546,20 @@ export component Sidebar inherits Rectangle {
     in property <bool> proc-available;   // a live remote session → show the process button (#23)
     in property <[GpuInfo]> gpus;
     in property <[ProcRow]> proc-summary;
+    in property <bool> docker-visible;
+    in property <string> docker-target;
+    in property <string> docker-status;
+    in property <string> docker-error;
+    in property <int> docker-container-count;
+    in property <int> docker-running-count;
+    in property <int> docker-image-count;
     // App version string, injected from Rust (env!("CARGO_PKG_VERSION")) so it
     // always matches Cargo.toml without hand-editing this file.
     in property <string> app-version;
     callback select-net-iface(string);
     callback show-system-info();         // open the system-information window
     callback show-processes();           // open the process monitor popup (#23)
+    callback show-docker();              // open the Docker monitor window
     callback copy-host(string);          // copy the connection IP/host to clipboard (#192)
     // Drag-to-dock: the header strip is a grab handle; coordinates are reported
     // in window space so the AppWindow can compute the target edge (#dock).
@@ -584,6 +633,16 @@ export component Sidebar inherits Rectangle {
                 show-system-info() => { root.show-system-info(); }
                 show-processes() => { root.show-processes(); }
             }
+            DockerBlock {
+                visible-summary: root.docker-visible;
+                target: root.docker-target;
+                status: root.docker-status;
+                error: root.docker-error;
+                container-count: root.docker-container-count;
+                running-count: root.docker-running-count;
+                image-count: root.docker-image-count;
+                show-docker() => { root.show-docker(); }
+            }
             Rectangle { height: 1px; background: Theme.border-subtle; }
             NetBlock {
                 net-top-up: root.net-top-up; net-top-down: root.net-top-down; net-top-history: root.net-top-history;
@@ -641,6 +700,16 @@ export component Sidebar inherits Rectangle {
                     proc-summary: root.proc-summary;
                     show-system-info() => { root.show-system-info(); }
                     show-processes() => { root.show-processes(); }
+                }
+                DockerBlock {
+                    visible-summary: root.docker-visible;
+                    target: root.docker-target;
+                    status: root.docker-status;
+                    error: root.docker-error;
+                    container-count: root.docker-container-count;
+                    running-count: root.docker-running-count;
+                    image-count: root.docker-image-count;
+                    show-docker() => { root.show-docker(); }
                 }
             }
             Rectangle { width: 1px; background: Theme.border-subtle; }

@@ -575,3 +575,57 @@ msgstr "添加触发器"
 
 msgid "When expected text appears, send the response automatically. Responses are stored encrypted."
 msgstr "出现期望文本时自动发送回复。回复内容会加密保存。"
+
+msgid "Docker Monitor"
+msgstr "Docker 监控"
+
+msgid "Docker"
+msgstr "Docker"
+
+msgid "Containers"
+msgstr "容器"
+
+msgid "Images"
+msgstr "镜像"
+
+msgid "Search"
+msgstr "搜索"
+
+msgid "All"
+msgstr "全部"
+
+msgid "Running"
+msgstr "运行中"
+
+msgid "Stopped"
+msgstr "已停止"
+
+msgid "No results"
+msgstr "无结果"
+
+msgid "No data"
+msgstr "暂无数据"
+
+msgid "Permission denied"
+msgstr "权限被拒绝"
+
+msgid "Docker daemon unavailable"
+msgstr "Docker 守护进程不可用"
+
+msgid "Docker is not installed"
+msgstr "未安装 Docker"
+
+msgid "ID"
+msgstr "ID"
+
+msgid "Created"
+msgstr "创建时间"
+
+msgid "Repository"
+msgstr "仓库"
+
+msgid "Tag"
+msgstr "标签"
+
+msgid "Details"
+msgstr "详情"

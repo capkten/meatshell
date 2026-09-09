@@ -25,9 +25,10 @@ import { TerminalView, TermSpan, TermMatch, QuickCmd, QuickDockPanel } from "ter
 import { SftpEntry, SftpTreeNode, TunnelInfo } from "sftp_panel.slint";
 import { ProcWindow, ProcRow } from "proc_window.slint";
 import { SystemInfoWindow, SysInfoRow, SysMetricRow, SysNetRow } from "system_info_window.slint";
+import { DockerWindow, DockerContainerRow, DockerImageRow, DockerDetailRow } from "docker_window.slint";
 import { InterfacePanel, OutputRuleItem, WslProfileInfo } from "interface_panel.slint";
 // Re-export so `slint::include_modules!` generates the detached Rust window types.
-export { ProcWindow, SystemInfoWindow }
+export { ProcWindow, SystemInfoWindow, DockerWindow }
 import { ComboBox, SpinBox, LineEdit, Button, ScrollView, CheckBox, Palette } from "std-widgets.slint";
 
 export { SessionInfo, SessionDraft, TabInfo, SftpEntry, SftpTreeNode, TunnelInfo, QuickCmd, PortFwd, WslProfileInfo }
@@ -487,6 +488,15 @@ export component AppWindow inherits Window {
     in-out property <bool> proc-sort-descending: true;
     callback open-system-info();
     in-out property <bool> system-info-window-open: false;
+    callback open-docker();
+    in-out property <bool> docker-visible: false;
+    in property <string> docker-target;
+    in property <string> docker-status;
+    in property <string> docker-error;
+    in property <int> docker-container-count;
+    in property <int> docker-running-count;
+    in property <int> docker-image-count;
+    in-out property <bool> docker-window-open: false;
     in property <bool> system-info-available; // connected Linux session only (#268)
     in property <[SysMetricRow]> sys-metrics;
     in property <[SysNetRow]> sys-net-rows;
@@ -1556,6 +1566,13 @@ export component AppWindow inherits Window {
                 swap-detail: root.swap-detail;
                 gpus: root.gpus;
                 proc-summary: root.proc-summary;
+                docker-visible: root.docker-visible;
+                docker-target: root.docker-target;
+                docker-status: root.docker-status;
+                docker-error: root.docker-error;
+                docker-container-count: root.docker-container-count;
+                docker-running-count: root.docker-running-count;
+                docker-image-count: root.docker-image-count;
                 net-top-up: root.net-top-up;
                 net-top-down: root.net-top-down;
                 net-top-history: root.net-top-history;
@@ -1572,6 +1589,7 @@ export component AppWindow inherits Window {
                 select-net-iface(i) => { root.select-net-iface(i); }
                 show-system-info() => { root.open-system-info(); }
                 show-processes() => { root.open-processes(); }
+                show-docker() => { root.open-docker(); }
                 copy-host(h) => { root.copy-text(h); }   // reuse the clipboard helper (#192)
                 // Drag the sidebar header to dock it to another edge. Coordinates
                 // arrive in window space; convert to dock-area-relative fractions.
