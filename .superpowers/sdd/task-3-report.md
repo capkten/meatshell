@@ -54,3 +54,19 @@ The required no-network transport test is present as `session_handle_can_enqueue
 - There is no live SSH integration fixture in the project, so channel-open, exec, remote-output, and timeout behavior is covered by implementation inspection and compilation rather than a network test.
 - The brief's `--lib` test command is incompatible with this binary-only crate; the equivalent binary test command is the valid focused evidence.
 - Strict clippy remains blocked by the pre-existing repository baseline and should be handled separately from Task 3.
+
+## Reviewer follow-up: abnormal SSH Docker channel termination
+
+The SSH Docker collector now tracks whether an `ExitStatus` message was seen. A `ChannelMsg::Close` or `channel.wait()` returning `None` without an exit status produces the collected output plus the clear stderr diagnostic `Docker command channel closed before exit status.` A valid zero or nonzero exit status remains authoritative, output bounds remain 4 MiB per stream, and the existing five-second timeout path is unchanged.
+
+Regression coverage is provided by the pure `docker_exec_result` helper tests in `src/ssh/impls/ssh.rs`:
+
+- `incomplete_docker_channel_reports_missing_exit_status`
+- `docker_exit_status_is_preserved_when_collection_completes`
+
+The required verification sequence was run in this order after the fix:
+
+1. `cargo fmt --all -- --check` — PASS.
+2. `cargo clippy --all-targets -- -D warnings` — FAIL, with the existing repository-wide non-Docker baseline (79 test-target and 77 binary-target diagnostics, including dead code, module inception, argument count, MSRV, and style findings). The Task 3 Docker helper and regression tests produced no clippy diagnostic.
+3. `cargo test --locked` — PASS, 284 passed, 0 failed.
+4. `cargo check` — PASS, with 11 existing dead-code warnings outside the Docker fix.
