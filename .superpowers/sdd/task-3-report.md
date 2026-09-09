@@ -2,32 +2,36 @@
 
 ## Status
 
-Implemented and verified in the focused commit.
+Task 3 is implemented in the focused code commit `aa7e92c` (`feat: run docker queries over active ssh sessions`). This takeover audited that commit in place, corrected the stale report, and preserved the unrelated pre-existing `.superpowers/brainstorm/` worktree entry.
 
-## Implementation
+## Requirements and implementation
 
-- Added `SessionCommand::DockerExec` carrying a `DockerRequest` and a dedicated oneshot reply channel.
-- Added `SessionHandle::docker_exec`, which enqueues the request without routing Docker output through `SessionEvent`, terminal rendering, or command history.
-- Added the SSH-only `run_remote_docker` helper. It reuses the authenticated `Arc<Handle<ClientHandler>>`, opens a short-lived session channel, executes `remote_command`, collects stdout/stderr independently up to 4 MiB, captures the exit status, and applies a 5-second timeout.
-- Channel-open, exec, collection, and timeout failures return a non-panicking `DockerExecResult` with useful stderr; timeout results set `timed_out`. Command arguments and Docker output are not logged.
-- Added exhaustive `DockerExec` handling to local, Telnet, and serial workers. Each returns an explicit unsupported-worker error and leaves existing raw input, resize, tunnel, process-control, close, and reader behavior unchanged.
+- `SessionCommand::DockerExec` carries a `DockerRequest` and a dedicated `oneshot::Sender<DockerExecResult>`.
+- `SessionHandle::docker_exec` enqueues that command and returns the receiver. Docker replies are not `SessionEvent`s, so Docker output cannot enter terminal rendering or command history.
+- `run_remote_docker` reuses the authenticated `Arc<russh::client::Handle<ClientHandler>>`; it never calls `execute_command` and therefore does not open a second SSH connection.
+- Each request opens a short-lived session channel, executes `remote_command`, collects stdout and stderr independently with a 4 MiB bound per stream, captures the exit status, and applies a five-second timeout covering channel open, exec, and collection.
+- Channel-open and exec failures return useful stderr text. Timeout results return useful stderr text and set `timed_out`; output is never logged.
+- Local, Telnet, and serial workers explicitly handle `DockerExec` with an explanatory unsupported-worker reply. Existing raw input, resize, tunnel, process-control, close, and reader behavior remains unchanged, and Docker target routing is unchanged.
+- The existing single `append_bounded` helper is reused; no duplicate helper remains in `src/ssh/impls/ssh.rs`.
 
-## TDD Evidence
+## TDD evidence
 
-1. Added `session_handle_can_enqueue_docker_request` before production implementation.
-2. The exact brief command, `cargo test session_handle_can_enqueue_docker_request --lib`, could not compile a test because this binary-only crate has no library target (`error: no library targets found in package 'meatshell'`).
-3. The equivalent crate test command, `cargo test session_handle_can_enqueue_docker_request`, then failed for the intended missing API: `SessionHandle::docker_exec` and `SessionCommand::DockerExec` did not exist.
-4. After implementing the API and worker branches, the focused test passed.
+The required no-network transport test is present as `session_handle_can_enqueue_docker_request` in `src/ssh/struct/event.rs`.
 
-## Verification
+- The exact brief command, `cargo test session_handle_can_enqueue_docker_request --lib`, cannot run in this repository because `meatshell` is binary-only: Cargo reports `error: no library targets found in package 'meatshell'`.
+- The equivalent valid command, `cargo test session_handle_can_enqueue_docker_request`, passes and exercises the real channel enqueue path without starting SSH.
+- The implementation was already present in the inherited focused commit when this takeover began, so the original missing-API RED transition was not replayed destructively. The prior executor's report recorded that RED transition; this report does not claim an independently reproduced missing-API failure.
 
-- `cargo fmt --all -- --check`: passed.
-- `cargo check`: passed.
-- `cargo test session_handle_can_enqueue_docker_request`: passed, 1 passed, 281 filtered.
-- `cargo test --locked`: passed, 282 passed, 0 failed.
-- `cargo clippy --all-targets -- -D warnings`: fails on the repository's pre-existing broad lint baseline (dead code, module inception, argument count, MSRV, and other unrelated findings). The Task 3 transport API's intentional unused warnings were explicitly suppressed because controller/UI wiring is out of scope for this task.
+## Verification results
 
-## Files Changed
+- `cargo fmt --all -- --check`: PASS.
+- `cargo test session_handle_can_enqueue_docker_request`: PASS, 1 passed, 0 failed, 281 filtered.
+- `cargo test --locked`: PASS, 282 passed, 0 failed.
+- `cargo check`: PASS, with 11 existing dead-code warnings outside the Task 3 behavior.
+- `cargo clippy --all-targets -- -D warnings`: FAILS on the existing repository-wide lint baseline. Findings include dead code, module inception, too many arguments, MSRV compatibility, and style lints across unrelated files; the Task 3 additions introduced no distinct clippy diagnostic.
+- No real SSH connection was used.
+
+## Files in the Task 3 change
 
 - `src/ssh/struct/command.rs`
 - `src/ssh/struct/event.rs`
@@ -37,16 +41,16 @@ Implemented and verified in the focused commit.
 - `src/terminal/impls/serial.rs`
 - `.superpowers/sdd/task-3-report.md`
 
-## Self-Review
+## Self-review
 
-- The SSH Docker path uses the existing authenticated handle and never calls `execute_command`, so it cannot create a second SSH connection.
-- Docker replies use a separate oneshot channel and cannot enter terminal output/history.
-- Output is bounded per stream and the timeout covers channel open, exec, and collection.
-- Non-SSH workers reply instead of dropping the new command, preserving exhaustive matching without changing Docker target selection.
-- No Slint/UI/controller code, `.superpowers/brainstorm`, or fork-specific behavior was changed.
+- The transport API compiles and has a no-network enqueue test.
+- The SSH worker uses the already authenticated handle and an isolated response channel.
+- Collection is bounded, timed, non-panicking, and keeps sensitive Docker arguments/output out of logs.
+- Non-SSH workers are exhaustive and reply instead of silently dropping the new command.
+- No app/UI wiring, session routing, fork-specific behavior, or `.superpowers/brainstorm/` content was changed.
 
 ## Concerns
 
-- No live SSH integration test was added because the brief requires a no-network transport test and no authenticated server fixture exists.
-- The requested `--lib` focused command is structurally incompatible with this binary-only crate; the equivalent binary test command supplied the RED/GREEN evidence.
-- Clippy remains red at the known repository baseline and should be revisited separately from Task 3.
+- There is no live SSH integration fixture in the project, so channel-open, exec, remote-output, and timeout behavior is covered by implementation inspection and compilation rather than a network test.
+- The brief's `--lib` test command is incompatible with this binary-only crate; the equivalent binary test command is the valid focused evidence.
+- Strict clippy remains blocked by the pre-existing repository baseline and should be handled separately from Task 3.
