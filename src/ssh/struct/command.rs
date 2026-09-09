@@ -1,4 +1,6 @@
 /// Commands posted to the worker task by the UI.
+use crate::docker::{DockerExecResult, DockerRequest};
+
 #[derive(Debug)]
 pub enum SessionCommand {
     /// Send raw bytes directly to the PTY (individual keystrokes, no modification).
@@ -21,6 +23,12 @@ pub enum SessionCommand {
         pid: u32,
         root_password: Option<crate::config::Secret>,
         reply: tokio::sync::oneshot::Sender<ProcessKillResult>,
+    },
+    /// Execute a Docker query on the already-authenticated SSH session.
+    #[allow(dead_code)]
+    DockerExec {
+        request: DockerRequest,
+        reply: tokio::sync::oneshot::Sender<DockerExecResult>,
     },
     /// Gracefully disconnect and drop the session.
     Close,

@@ -235,6 +235,12 @@ async fn run_serial(
                     .into(),
                 });
             }
+            SessionCommand::DockerExec { reply, .. } => {
+                let _ = reply.send(crate::docker::DockerExecResult {
+                    stderr: "The serial worker does not provide remote Docker execution.".into(),
+                    ..Default::default()
+                });
+            }
             SessionCommand::Close => break,
         }
     }

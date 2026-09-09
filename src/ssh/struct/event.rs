@@ -2,6 +2,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::config::PortForward;
+use crate::docker::{DockerExecResult, DockerRequest};
 use crate::resource::GpuSnapshot;
 
 use super::{
@@ -181,7 +182,41 @@ impl SessionHandle {
         rx
     }
 
+    #[allow(dead_code)]
+    pub fn docker_exec(
+        &self,
+        request: DockerRequest,
+    ) -> tokio::sync::oneshot::Receiver<DockerExecResult> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .commands
+            .send(SessionCommand::DockerExec { request, reply });
+        rx
+    }
+
     pub fn close(&self) {
         let _ = self.commands.send(SessionCommand::Close);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionHandle;
+    use crate::docker::DockerRequest;
+    use crate::ssh::SessionCommand;
+
+    #[tokio::test]
+    async fn session_handle_can_enqueue_docker_request() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = SessionHandle {
+            tab_id: "tab".into(),
+            commands: tx,
+            join: tokio::spawn(async {}),
+        };
+        let _reply = handle.docker_exec(DockerRequest::Version);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(SessionCommand::DockerExec { .. })
+        ));
     }
 }

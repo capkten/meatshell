@@ -1451,6 +1451,80 @@ fn append_bounded(target: &mut Vec<u8>, data: &[u8], limit: usize, truncated: &m
     *truncated |= take < data.len();
 }
 
+const DOCKER_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Execute one Docker query through an already-authenticated SSH connection.
+async fn run_remote_docker(
+    handle: &Arc<Handle<ClientHandler>>,
+    request: crate::docker::DockerRequest,
+) -> crate::docker::DockerExecResult {
+    let operation = async {
+        let mut channel = handle
+            .channel_open_session()
+            .await
+            .context("open Docker command channel")?;
+        let command = crate::docker::command::remote_command(&request);
+        channel
+            .exec(true, command.as_bytes())
+            .await
+            .context("execute Docker command")?;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = None;
+        let mut stdout_truncated = false;
+        let mut stderr_truncated = false;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => append_bounded(
+                    &mut stdout,
+                    &data,
+                    DOCKER_OUTPUT_LIMIT,
+                    &mut stdout_truncated,
+                ),
+                ChannelMsg::ExtendedData { data, .. } => append_bounded(
+                    &mut stderr,
+                    &data,
+                    DOCKER_OUTPUT_LIMIT,
+                    &mut stderr_truncated,
+                ),
+                ChannelMsg::ExitStatus { exit_status } => {
+                    exit_code = i32::try_from(exit_status).ok();
+                }
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+
+        let mut result = crate::docker::DockerExecResult {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            exit_code,
+            ..Default::default()
+        };
+        if stdout_truncated || stderr_truncated {
+            result
+                .stderr
+                .push_str("\nDocker output exceeded the 4 MiB limit.");
+        }
+        anyhow::Ok(result)
+    };
+
+    match tokio::time::timeout(DOCKER_TIMEOUT, operation).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => crate::docker::DockerExecResult {
+            stderr: error.to_string(),
+            ..Default::default()
+        },
+        Err(_) => crate::docker::DockerExecResult {
+            stderr: "Docker command timed out after 5 seconds.".into(),
+            timed_out: true,
+            ..Default::default()
+        },
+    }
+}
+
 const PROC_CMD: &[u8] = b"PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; while :; do echo __ME__; id -un 2>/dev/null; echo __PS__; top_rows=\"$(top -b -n 1 -w 240 2>/dev/null | sed -n '/^[[:space:]]*PID[[:space:]]/,$p' | head -n 65)\"; if [ -n \"$top_rows\" ]; then printf '%s\\n' \"$top_rows\"; else { ps -eo pid,user:32,pri,ni,vsz,rss,shr,stat,pcpu,pmem,time,args 2>/dev/null || ps -eo pid,user:32,pri,ni,vsz,rss,stat,pcpu,pmem,time,args 2>/dev/null || ps -eo pid,user:32,pcpu,pmem,args 2>/dev/null; } | head -n 201 | cut -c -240; fi; echo __PSTICK__; sleep 2; done\n";
 
 async fn run_session(
@@ -1863,6 +1937,13 @@ async fn run_session(
                         let exec_handle = handle.clone();
                         tokio::spawn(async move {
                             let result = kill_remote_process(exec_handle, pid, root_password).await;
+                            let _ = reply.send(result);
+                        });
+                    }
+                    Some(SessionCommand::DockerExec { request, reply }) => {
+                        let exec_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let result = run_remote_docker(&exec_handle, request).await;
                             let _ = reply.send(result);
                         });
                     }

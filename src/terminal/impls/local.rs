@@ -169,6 +169,12 @@ async fn run_local(
                     .into(),
                 });
             }
+            SessionCommand::DockerExec { reply, .. } => {
+                let _ = reply.send(crate::docker::DockerExecResult {
+                    stderr: "The local terminal does not provide remote Docker execution.".into(),
+                    ..Default::default()
+                });
+            }
             SessionCommand::Close => {
                 let _ = child.lock().unwrap().kill();
                 break;

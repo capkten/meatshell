@@ -188,6 +188,13 @@ async fn run_telnet(
                             message: t("Telnet 不支持远程进程操作", "Remote process control is unavailable for Telnet sessions").into(),
                         });
                     }
+                    Some(SessionCommand::DockerExec { reply, .. }) => {
+                        let _ = reply.send(crate::docker::DockerExecResult {
+                            stderr: "The Telnet worker does not provide remote Docker execution."
+                                .into(),
+                            ..Default::default()
+                        });
+                    }
                     Some(SessionCommand::Close) | None => break,
                 }
             }
