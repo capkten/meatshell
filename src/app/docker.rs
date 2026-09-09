@@ -147,17 +147,21 @@ pub(super) fn docker_summary(state: &DockerUiState) -> DockerSummary {
     let image_count = snapshot.map_or(0, |s| s.images.len()) as i32;
     DockerSummary {
         target: target_label(&state.target),
-        status: status_text(&state.status),
-        error: match state.active_tab {
-            DockerTab::Containers => state.container_error.as_ref(),
-            DockerTab::Images => state.image_error.as_ref(),
-        }
-        .map(|e| e.message.clone())
-        .unwrap_or_default(),
+        status: status_text(state),
+        error: active_page_error(state)
+            .map(|e| e.message.clone())
+            .unwrap_or_default(),
         visible: !matches!(state.status, DockerStatus::NotInstalled),
         container_count,
         running_count,
         image_count,
+    }
+}
+
+fn active_page_error(state: &DockerUiState) -> Option<&DockerError> {
+    match state.active_tab {
+        DockerTab::Containers => state.container_error.as_ref(),
+        DockerTab::Images => state.image_error.as_ref(),
     }
 }
 
@@ -167,15 +171,17 @@ fn target_label(target: &DockerTarget) -> String {
         DockerTarget::Remote { label, .. } => label.clone(),
     }
 }
-fn status_text(status: &DockerStatus) -> String {
-    match status {
+fn status_text(state: &DockerUiState) -> String {
+    match &state.status {
         DockerStatus::Loading => crate::i18n::t("正在加载 Docker…", "Loading Docker…").to_string(),
         DockerStatus::Ready => crate::i18n::t("Docker 已就绪", "Docker ready").to_string(),
         DockerStatus::Empty => crate::i18n::t("没有 Docker 数据", "No Docker data").to_string(),
         DockerStatus::NotInstalled => {
             crate::i18n::t("未找到 Docker", "Docker is not installed").to_string()
         }
-        DockerStatus::Error(e) => e.message.clone(),
+        DockerStatus::Error(_) => active_page_error(state)
+            .map(|e| e.message.clone())
+            .unwrap_or_else(|| crate::i18n::t("Docker 错误", "Docker error").to_string()),
     }
 }
 
@@ -877,6 +883,27 @@ mod tests {
         assert_eq!(docker_summary(&state).error, "");
         state.active_tab = DockerTab::Containers;
         assert_eq!(docker_summary(&state).error, "container denied");
+    }
+
+    #[test]
+    fn status_text_does_not_leak_inactive_page_error() {
+        let mut state = DockerUiState {
+            active_tab: DockerTab::Containers,
+            image_error: Some(DockerError {
+                kind: DockerErrorKind::DaemonUnavailable,
+                message: "image daemon unavailable".into(),
+            }),
+            status: DockerStatus::Error(DockerError {
+                kind: DockerErrorKind::DaemonUnavailable,
+                message: "image daemon unavailable".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(!docker_summary(&state)
+            .status
+            .contains("image daemon unavailable"));
+        state.active_tab = DockerTab::Images;
+        assert_eq!(docker_summary(&state).status, "image daemon unavailable");
     }
 
     #[test]

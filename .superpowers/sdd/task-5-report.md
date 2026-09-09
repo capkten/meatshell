@@ -2,7 +2,7 @@
 
 ## Status
 
-Task 5 is complete on `codex/docker-sidebar`. Task 6 timer/window-lifecycle and active-tab refresh wiring was intentionally not added.
+Task 5 is complete on `codex/docker-sidebar`. Target-routing `refresh_target` wiring is present; Task 6's periodic timer, visibility lifecycle, and active-tab refresh lifecycle work remain intentionally out of scope.
 
 ## Requirements implemented
 
@@ -41,7 +41,7 @@ Focused coverage includes local/welcome/Telnet/serial/SSH routing; filtered row/
 
 ## Self-review
 
-- No Task 6 timer, visibility pause, or active-tab refresh lifecycle behavior was introduced.
+- Target-routing refresh wiring is part of Task 5; Task 6's periodic timer, visibility pause, and active-tab refresh lifecycle behavior were not introduced.
 - No changes were made to `.superpowers/brainstorm/` or unrelated features.
 - Existing fork contracts for session notes, wallpaper, SFTP viewer, GPU monitoring, update URL, and russh pin remain untouched.
 - Filtering is performed against the retained snapshot and does not issue Docker commands; summary counts use the unfiltered snapshot while rendered rows use filtered models.
@@ -70,3 +70,17 @@ The acceptance review identified five controller/UI contract gaps. They were fix
 - Final post-review `cargo test --locked`: passed, 298/298.
 - Final post-review `cargo check`: passed with the existing unrelated dead-code warnings.
 - Final post-review strict Clippy still reports the same 77 pre-existing repository diagnostics; no reviewer-fix diagnostic was introduced.
+
+## Residual status-isolation fix
+
+- `DockerStatus::Error` status text is now derived from the active page error. An inactive page failure can no longer appear in the active page's global status line; when only the inactive page failed, a generic translated Docker error is shown instead.
+- Added `status_text_does_not_leak_inactive_page_error`, covering image-only failure while Containers is active and the reverse active-page behavior.
+- Target-routing refresh wiring remains documented as existing Task 5 behavior; Task 6 periodic timer/visibility lifecycle remains excluded.
+
+### Residual-fix verification
+
+- Focused Docker tests: passed, 15/15.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --all-targets -- -D warnings`: same 77 pre-existing repository diagnostics; no Task 5 diagnostics.
+- `cargo test --locked`: passed, 299/299.
+- `cargo check`: passed with existing unrelated dead-code warnings.
