@@ -1451,6 +1451,39 @@ fn append_bounded(target: &mut Vec<u8>, data: &[u8], limit: usize, truncated: &m
     *truncated |= take < data.len();
 }
 
+fn docker_exec_result(
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+    exit_status_seen: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> crate::docker::DockerExecResult {
+    let mut result = crate::docker::DockerExecResult {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+        ..Default::default()
+    };
+    if !exit_status_seen {
+        if !result.stderr.is_empty() {
+            result.stderr.push('\n');
+        }
+        result
+            .stderr
+            .push_str("Docker command channel closed before exit status.");
+    }
+    if stdout_truncated || stderr_truncated {
+        if !result.stderr.is_empty() {
+            result.stderr.push('\n');
+        }
+        result
+            .stderr
+            .push_str("Docker output exceeded the 4 MiB limit.");
+    }
+    result
+}
+
 const DOCKER_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1473,6 +1506,7 @@ async fn run_remote_docker(
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut exit_code = None;
+        let mut exit_status_seen = false;
         let mut stdout_truncated = false;
         let mut stderr_truncated = false;
         while let Some(message) = channel.wait().await {
@@ -1490,6 +1524,7 @@ async fn run_remote_docker(
                     &mut stderr_truncated,
                 ),
                 ChannelMsg::ExitStatus { exit_status } => {
+                    exit_status_seen = true;
                     exit_code = i32::try_from(exit_status).ok();
                 }
                 ChannelMsg::Close => break,
@@ -1497,18 +1532,14 @@ async fn run_remote_docker(
             }
         }
 
-        let mut result = crate::docker::DockerExecResult {
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        anyhow::Ok(docker_exec_result(
+            stdout,
+            stderr,
             exit_code,
-            ..Default::default()
-        };
-        if stdout_truncated || stderr_truncated {
-            result
-                .stderr
-                .push_str("\nDocker output exceeded the 4 MiB limit.");
-        }
-        anyhow::Ok(result)
+            exit_status_seen,
+            stdout_truncated,
+            stderr_truncated,
+        ))
     };
 
     match tokio::time::timeout(DOCKER_TIMEOUT, operation).await {
@@ -3804,5 +3835,43 @@ mod mfa_tests {
         ] {
             assert!(looks_like_mfa(p), "missed an MFA prompt: {p:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod docker_exec_tests {
+    use super::docker_exec_result;
+
+    #[test]
+    fn incomplete_docker_channel_reports_missing_exit_status() {
+        let result = docker_exec_result(
+            b"partial output".to_vec(),
+            Vec::new(),
+            None,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(result.stdout, "partial output");
+        assert!(result.exit_code.is_none());
+        assert!(result
+            .stderr
+            .contains("Docker command channel closed before exit status."));
+    }
+
+    #[test]
+    fn docker_exit_status_is_preserved_when_collection_completes() {
+        let result = docker_exec_result(
+            Vec::new(),
+            b"permission denied".to_vec(),
+            Some(23),
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(result.exit_code, Some(23));
+        assert_eq!(result.stderr, "permission denied");
     }
 }
