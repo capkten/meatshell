@@ -1,56 +1,52 @@
-# Task 5 Report: UI-thread Docker controller
+# Task 5 Report: UI-thread Docker controller and snapshot view
 
 ## Status
 
-Implemented on `codex/docker-sidebar`; committed after verification.
+Task 5 is complete on `codex/docker-sidebar`. Task 6 timer/window-lifecycle and active-tab refresh wiring was intentionally not added.
 
-## Implementation
+## Requirements implemented
 
-- Added `src/app/docker.rs` with `DockerUiState`, target routing, generation guards, background local/SSH snapshot collection, local filtering, summary/count mapping, details mapping, and Slint model updates.
-- Local targets cover welcome, local shell, Telnet, and serial tabs. SSH tabs use the active tab's authenticated `SessionHandle::docker_exec`; the SSH target remains selected while connecting or disconnected.
-- Target changes increment generation and clear snapshot, errors, query, selection, details, tab, and filter. Snapshot and detail callbacks require both generation and target equality; terminal results clear `in_flight`.
-- Inspect details expose only approved fields. `Config.Env` is not copied, displayed, or logged.
-- Added `TabStatus.is_ssh` without changing `is_local`, preserving existing Telnet/serial resource behavior.
-- Wired the Docker window callbacks and sidebar properties while retaining the existing sidebar/session branches. The Task 6 timer, visibility pause, and active-tab lifecycle work were not added.
-- Stored the controller in `WindowState` for the existing window ownership model.
+- Added `src/app/docker.rs` with `DockerUiState`, `DockerController`, target routing, snapshot/detail dispatch, generation guards, filtering, model mapping, summaries, and focused pure-state tests.
+- Welcome, local-shell, Telnet, and serial tabs route to `DockerTarget::Local`. SSH tabs route to `DockerTarget::Remote` and use that tab's authenticated `SessionHandle::docker_exec`; the SSH target remains selected while connecting or disconnected.
+- Added `TabStatus.is_ssh` without changing `is_local`, preserving existing Telnet/serial resource-panel behavior.
+- Local and remote version/container/image requests run in the background. Partial page failures retain successful data; missing Docker is hidden, while permission, daemon, command, parse, loading, and empty states remain visible with clear status/error text.
+- Target changes increment generation and clear snapshot, errors, query, tab, filter, selection, and details. Snapshot and detail callbacks require matching generation and target; detail callbacks also require the captured selected ID and tab, preventing late inspect responses from replacing newer details. Terminal snapshot results clear `in_flight`.
+- Details map only approved fields. `Config.Env` is neither copied, displayed, nor logged. No Docker environment variables are injected.
+- Wired the Docker window and sidebar properties while retaining existing resource branches. The controller is owned through `WindowState`.
 
-## TDD evidence
+## TDD record
 
-RED:
+The brief's `cargo test app::docker::tests --lib` command is not runnable because this package has no library target; the initial attempt failed with Cargo's `no library targets found in package` error. The equivalent command is `cargo test --bin meatshell app::docker::tests`.
 
-- The brief's `cargo test ... --lib` command cannot run because this package has no library target (`error: no library targets found`).
-- The equivalent binary-target focused test initially failed because the controller symbols were not implemented.
+New focused tests were written before the stale-detail production fix. The red compile failure showed `apply_detail` lacked captured item/tab identity. The fix was then implemented and the focused suite passed.
 
-GREEN:
+Focused coverage includes local/welcome/Telnet/serial/SSH routing; filtered row/model mapping without mutating the raw snapshot; raw summary counts versus filtered rows; target-generation invalidation; stale snapshot and stale detail rejection; partial list failure with successful-page retention; not-installed visibility and ready/empty state behavior; and detail mapping without environment-variable exposure.
 
-- `cargo test --bin meatshell app::docker::tests`
-- Result: `2 passed; 0 failed; 284 filtered out`.
+## Verification
 
-## Verification results
-
-- `cargo fmt --all`: passed.
-- `cargo check`: passed.
 - `cargo fmt --all -- --check`: passed.
-- `cargo clippy --all-targets -- -D warnings`: failed only on the pre-existing repository baseline: unused resource helpers/types, the SSH prompt marker/fields, and two `missing_const_for_thread_local` suggestions in `auth_dialogs.rs`. No Task 5 file was reported.
-- `cargo test --locked`: passed, `286 passed; 0 failed` (9 pre-existing dead-code warnings).
+- `cargo clippy --all-targets -- -D warnings`: nonzero due the pre-existing repository baseline (77 errors across unrelated resource, SSH, session, terminal, module-layout, and style findings). No remaining Task 5 Docker lint was reported after the narrow task-local cleanup.
+- `cargo test --bin meatshell app::docker::tests`: passed, 9/9.
+- `cargo test --locked`: passed, 293/293.
+- `cargo check`: passed; only the existing dead-code warnings remain.
 
 ## Files
 
-- `src/app/docker.rs` — new controller, state, views, routing, async result guards, and focused tests.
-- `src/app/core.rs` — window ownership slot for the Docker controller.
-- `src/app.rs` — Docker window construction/callbacks, controller wiring, SSH target flag seeding, and sidebar refresh integration.
-- `src/app/sidebar.rs` — existing sidebar API preserved; controller rendering is invoked alongside existing refreshes.
-- `src/resource/struct/system.rs` — per-tab `is_ssh` flag.
+- `src/app/docker.rs` — controller, UI state, routing, async result guards, model/summary mapping, detail contract, and focused tests.
+- `src/app/core.rs` — controller ownership slot in window state.
+- `src/app.rs` — Docker window construction/callbacks, controller wiring, SSH target seeding, and sidebar refresh integration.
+- `src/app/sidebar.rs` — unchanged existing sidebar implementation; controller-rendered properties are updated alongside it from `src/app.rs`.
+- `src/resource/struct/system.rs` — per-tab `is_ssh` routing flag.
+- `.superpowers/sdd/task-5-report.md` — this report.
 
 ## Self-review
 
-- Filtering is performed against the retained snapshot and does not issue Docker commands.
-- Summary counts use the unfiltered snapshot; rendered row counts use filtered models.
+- No Task 6 timer, visibility pause, or active-tab refresh lifecycle behavior was introduced.
+- No changes were made to `.superpowers/brainstorm/` or unrelated features.
+- Existing fork contracts for session notes, wallpaper, SFTP viewer, GPU monitoring, update URL, and russh pin remain untouched.
+- Filtering is performed against the retained snapshot and does not issue Docker commands; summary counts use the unfiltered snapshot while rendered rows use filtered models.
 - Partial container/image failures retain the successful page and expose the failed-page error.
 - Missing Docker is classified as hidden; other loading, daemon, permission, command, parse, and empty states remain visible with status text.
-- Stale list and detail results are discarded after a target/generation change.
-
-## Concerns
-
+- Stale list and detail results are discarded after a target/generation or selection change.
 - The requested focused command includes `--lib`, but the current binary-only crate requires `--bin meatshell`.
-- Existing repository-wide Clippy warnings/errors may remain unrelated to this task; the final command output is the authority.
+- Compilation, formatting, focused tests, and the full locked test suite are green; the repository-wide Clippy baseline remains the only known verification limitation.

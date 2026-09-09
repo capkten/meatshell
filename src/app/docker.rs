@@ -292,12 +292,13 @@ impl DockerController {
     }
 
     pub(super) fn select_item(&self, id: String) {
-        let (generation, target, request) = {
+        let (generation, target, request, tab) = {
             let mut s = self.state.lock().unwrap();
             let Some(snapshot) = s.snapshot.as_ref() else {
                 return;
             };
-            let request = match s.active_tab {
+            let tab = s.active_tab;
+            let request = match tab {
                 DockerTab::Containers if snapshot.containers.iter().any(|r| r.id == id) => {
                     DockerRequest::InspectContainer(id.clone())
                 }
@@ -306,9 +307,9 @@ impl DockerController {
                 }
                 _ => return,
             };
-            s.selected_id = Some(id);
+            s.selected_id = Some(id.clone());
             s.details.clear();
-            (s.generation, s.target.clone(), request)
+            (s.generation, s.target.clone(), request, tab)
         };
         let state = self.state.clone();
         let main = self.main.clone();
@@ -319,7 +320,9 @@ impl DockerController {
                 runtime.spawn(async move {
                     let result = run_local(request).await;
                     let _ = slint::invoke_from_event_loop(move || {
-                        apply_detail(&state, &main, &window, generation, &target, result)
+                        apply_detail(
+                            &state, &main, &window, generation, &target, &id, tab, result,
+                        )
                     });
                 });
             }
@@ -332,7 +335,9 @@ impl DockerController {
                 self.runtime.spawn(async move {
                     let result = receiver.await.unwrap_or_else(|_| channel_closed());
                     let _ = slint::invoke_from_event_loop(move || {
-                        apply_detail(&state, &main, &window, generation, &target, result)
+                        apply_detail(
+                            &state, &main, &window, generation, &target, &id, tab, result,
+                        )
                     });
                 });
             }
@@ -497,19 +502,27 @@ fn apply_snapshot(
     drop(s);
     render_state(state, main, window);
 }
+#[allow(clippy::too_many_arguments)]
 fn apply_detail(
     state: &Arc<Mutex<DockerUiState>>,
     main: &slint::Weak<AppWindow>,
     window: &slint::Weak<DockerWindow>,
     generation: u64,
     target: &DockerTarget,
+    selected_id: &str,
+    tab: DockerTab,
     result: DockerExecResult,
 ) {
     let mut s = state.lock().unwrap();
-    if s.generation != generation || s.target != *target || !successful(&result) {
+    if s.generation != generation
+        || s.target != *target
+        || s.selected_id.as_deref() != Some(selected_id)
+        || s.active_tab != tab
+        || !successful(&result)
+    {
         return;
     }
-    s.details = match s.active_tab {
+    s.details = match tab {
         DockerTab::Containers => parse_container_detail(&result.stdout)
             .map(container_detail_rows)
             .unwrap_or_default(),
@@ -600,10 +613,12 @@ mod tests {
     #[test]
     fn view_state_filters_rows_without_changing_raw_snapshot() {
         let snapshot = snapshot_with_running_and_stopped_containers();
-        let mut state = DockerUiState::default();
-        state.snapshot = Some(snapshot.clone());
-        state.query = "nginx".into();
-        state.filter = ContainerFilter::Running;
+        let state = DockerUiState {
+            snapshot: Some(snapshot.clone()),
+            query: "nginx".into(),
+            filter: ContainerFilter::Running,
+            ..Default::default()
+        };
         let rows = docker_rows(&state);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "web-nginx");
@@ -620,6 +635,183 @@ mod tests {
         });
         assert_eq!(state.generation, generation + 1);
         assert!(state.snapshot.is_none());
+    }
+
+    #[test]
+    fn target_routing_keeps_non_ssh_tabs_local() {
+        let statuses = crate::resource::TabStatuses::default();
+        statuses.lock().unwrap().insert(
+            "ssh".into(),
+            crate::resource::TabStatus {
+                host: "server".into(),
+                is_ssh: true,
+                ..Default::default()
+            },
+        );
+        statuses.lock().unwrap().insert(
+            "telnet".into(),
+            crate::resource::TabStatus {
+                host: "telnet-host".into(),
+                ..Default::default()
+            },
+        );
+        statuses.lock().unwrap().insert(
+            "serial".into(),
+            crate::resource::TabStatus {
+                host: "COM3".into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(target_for_tab("welcome", &statuses), DockerTarget::Local);
+        assert_eq!(target_for_tab("telnet", &statuses), DockerTarget::Local);
+        assert_eq!(target_for_tab("serial", &statuses), DockerTarget::Local);
+        assert_eq!(
+            target_for_tab("ssh", &statuses),
+            DockerTarget::Remote {
+                tab_id: "ssh".into(),
+                label: "server".into()
+            }
+        );
+    }
+
+    #[test]
+    fn summary_counts_raw_snapshot_and_hides_only_not_installed() {
+        let mut state = DockerUiState {
+            snapshot: Some(snapshot_with_running_and_stopped_containers()),
+            status: DockerStatus::Ready,
+            query: "nginx".into(),
+            filter: ContainerFilter::Running,
+            ..Default::default()
+        };
+        let summary = docker_summary(&state);
+        assert_eq!(summary.container_count, 2);
+        assert_eq!(summary.running_count, 1);
+        assert!(summary.visible);
+
+        state.status = DockerStatus::NotInstalled;
+        assert!(!docker_summary(&state).visible);
+    }
+
+    #[test]
+    fn image_rows_map_filtered_snapshot_values() {
+        let state = DockerUiState {
+            snapshot: Some(DockerSnapshot {
+                images: vec![crate::docker::DockerImageSummary {
+                    id: "sha256:abc".into(),
+                    repository: "nginx".into(),
+                    tag: "latest".into(),
+                    size: "42MB".into(),
+                    created: "today".into(),
+                }],
+                ..DockerSnapshot::default()
+            }),
+            query: "NGINX".into(),
+            ..Default::default()
+        };
+        let rows = docker_image_rows(&state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repository, "nginx");
+        assert_eq!(rows[0].tag, "latest");
+    }
+
+    #[test]
+    fn stale_snapshot_result_does_not_replace_new_target_state() {
+        let state = Arc::new(Mutex::new(DockerUiState::ready_for(DockerTarget::Local)));
+        let generation = state.lock().unwrap().generation;
+        state.lock().unwrap().begin_target(DockerTarget::Remote {
+            tab_id: "ssh".into(),
+            label: "server".into(),
+        });
+        state.lock().unwrap().in_flight = true;
+        apply_snapshot(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            generation,
+            &DockerTarget::Local,
+            SnapshotResult::from_results(success_result(), success_result(), success_result()),
+        );
+        let current = state.lock().unwrap();
+        assert!(current.snapshot.is_none());
+        assert!(current.in_flight);
+    }
+
+    #[test]
+    fn stale_detail_result_does_not_replace_new_selection() {
+        let state = Arc::new(Mutex::new(DockerUiState::ready_for(DockerTarget::Local)));
+        let target = DockerTarget::Local;
+        {
+            let mut s = state.lock().unwrap();
+            s.snapshot = Some(snapshot_with_running_and_stopped_containers());
+            s.selected_id = Some("stopped-id".into());
+        }
+        apply_detail(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            0,
+            &target,
+            "running-id",
+            DockerTab::Containers,
+            success_detail_result(),
+        );
+        assert!(state.lock().unwrap().details.is_empty());
+    }
+
+    #[test]
+    fn detail_rows_never_include_config_environment() {
+        let detail = parse_container_detail(
+            r#"[{"Id":"container-id","Config":{"Image":"nginx","Env":["SECRET=x"]}}]"#,
+        )
+        .unwrap();
+        let rows = container_detail_rows(detail);
+        assert!(rows.iter().all(|row| !row.value.contains("SECRET")));
+    }
+
+    #[test]
+    fn partial_list_failure_keeps_successful_page_and_reports_error() {
+        let result = SnapshotResult::from_results(
+            success_result(),
+            success_result_with_container(),
+            failed_result("permission denied"),
+        );
+        assert_eq!(result.snapshot.unwrap().containers.len(), 1);
+        assert_eq!(
+            result.image_error.unwrap().kind,
+            DockerErrorKind::PermissionDenied
+        );
+    }
+
+    fn success_result() -> DockerExecResult {
+        DockerExecResult {
+            exit_code: Some(0),
+            ..Default::default()
+        }
+    }
+
+    fn success_result_with_container() -> DockerExecResult {
+        DockerExecResult {
+            stdout: r#"{"ID":"id","Names":"web","Image":"nginx","State":"running"}"#.into(),
+            exit_code: Some(0),
+            ..Default::default()
+        }
+    }
+
+    fn failed_result(stderr: &str) -> DockerExecResult {
+        DockerExecResult {
+            stderr: stderr.into(),
+            exit_code: Some(1),
+            ..Default::default()
+        }
+    }
+
+    fn success_detail_result() -> DockerExecResult {
+        DockerExecResult {
+            stdout: r#"[{"Id":"running-id","Config":{"Image":"nginx"}}]"#.into(),
+            exit_code: Some(0),
+            ..Default::default()
+        }
     }
     fn snapshot_with_running_and_stopped_containers() -> DockerSnapshot {
         DockerSnapshot {
