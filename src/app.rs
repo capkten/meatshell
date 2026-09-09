@@ -7,6 +7,7 @@
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
 pub(crate) mod core;
+mod docker;
 #[cfg(windows)]
 mod jump_list;
 pub mod launch;
@@ -28,6 +29,7 @@ mod webdav;
 mod window;
 
 use self::auth_dialogs::*;
+use self::docker::*;
 use self::port_forward::*;
 use self::quick_commands::*;
 use self::resource_ui::*;
@@ -155,6 +157,7 @@ use crate::config::{
     is_reserved_session_group, named_display_groups, AuthMethod, ConfigStore, OutputHighlightRule,
     Secret, Session, SessionKind,
 };
+use crate::docker::{ContainerFilter, DockerTab};
 use crate::i18n::t;
 use crate::layout::{LogicalRect, TerminalWheelHit};
 use crate::resource::system::{format_bytes_per_sec, format_mem};
@@ -667,10 +670,12 @@ fn open_window(
     proc_win.set_sort_column("cpu".into());
     proc_win.set_sort_descending(true);
     let sys_win = Rc::new(SystemInfoWindow::new().context("failed to build system info window")?);
+    let docker_win = Rc::new(DockerWindow::new().context("failed to build Docker window")?);
     // Every fallible construction has now succeeded — register the window.
     // (cascade_origin above was captured before this point, as required.)
     let window_id = registry.register(window.as_weak());
     sys_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
+    docker_win.set_custom_titlebar(cfg!(not(target_os = "macos")));
     sys_win.set_metrics(ModelRc::from(sys_metrics_model.clone()));
     sys_win.set_nets(ModelRc::from(sys_net_rows_model.clone()));
     sys_win.set_disks(ModelRc::from(sys_disks_model.clone()));
@@ -1921,6 +1926,14 @@ fn open_window(
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
+    let docker_slot: Rc<RefCell<Option<Rc<DockerController>>>> = Rc::new(RefCell::new(None));
+    let docker = DockerController::new(
+        runtime.clone(),
+        handles.clone(),
+        window.as_weak(),
+        docker_win.as_weak(),
+    );
+    *docker_slot.borrow_mut() = Some(docker.clone());
 
     // Sorting and paging are client-side views over the latest bounded remote
     // process sample. Keep the AppWindow state authoritative so incoming
@@ -1998,6 +2011,7 @@ fn open_window(
             sys_win: sys_win.clone(),
             proc_weak: proc_win.as_weak(),
             sys_weak: sys_win.as_weak(),
+            docker: docker_slot.clone(),
         },
     );
 
@@ -2117,10 +2131,85 @@ fn open_window(
         let statuses = tab_statuses.clone();
         let local = local_snap.clone();
         let net = local_net_hist.clone();
+        let docker = docker.clone();
         window.on_refresh_sidebar(move || {
             if let Some(w) = weak.upgrade() {
+                docker.refresh_target(target_for_tab(&w.get_active_tab_id(), &statuses));
+                docker.render();
                 refresh_sidebar(&w, &statuses, &local, &net);
             }
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        let docker = docker.clone();
+        let statuses = tab_statuses.clone();
+        let local = local_snap.clone();
+        let net = local_net_hist.clone();
+        let docker_win = docker_win.clone();
+        window.on_open_docker(move || {
+            let Some(main) = weak.upgrade() else { return };
+            let target = target_for_tab(&main.get_active_tab_id(), &statuses);
+            docker.refresh_target(target);
+            docker_win.set_dark_mode(main.get_dark_mode());
+            docker_win.set_ui_scale(main.get_ui_scale());
+            docker_win.set_wallpaper_active(main.get_wallpaper_active());
+            docker_win.set_wallpaper_img(main.get_wallpaper_img());
+            main.set_docker_window_open(true);
+            docker.render();
+            refresh_sidebar(&main, &statuses, &local, &net);
+            let _ = docker_win.show();
+            docker_win.window().with_winit_window(|w| w.focus_window());
+        });
+    }
+
+    {
+        let docker_window_for_close = docker_win.clone();
+        docker_win.on_close({
+            let weak = window.as_weak();
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    w.set_docker_window_open(false);
+                }
+                let _ = docker_window_for_close.hide();
+            }
+        });
+        docker_win.on_refresh({
+            let docker = docker.clone();
+            move || docker.refresh_now()
+        });
+        docker_win.on_search_changed({
+            let docker = docker.clone();
+            move |q| docker.set_query(q.to_string())
+        });
+        docker_win.on_tab_changed({
+            let docker = docker.clone();
+            move |tab| {
+                docker.set_tab(if tab == 0 {
+                    DockerTab::Containers
+                } else {
+                    DockerTab::Images
+                })
+            }
+        });
+        docker_win.on_filter_changed({
+            let docker = docker.clone();
+            move |filter| {
+                docker.set_filter(match filter {
+                    1 => ContainerFilter::Running,
+                    2 => ContainerFilter::Stopped,
+                    _ => ContainerFilter::All,
+                })
+            }
+        });
+        docker_win.on_select_container({
+            let docker = docker.clone();
+            move |id| docker.select_item(id.to_string())
+        });
+        docker_win.on_select_image({
+            let docker = docker.clone();
+            move |id| docker.select_item(id.to_string())
         });
     }
 
@@ -2258,6 +2347,7 @@ fn open_window(
         let statuses = tab_statuses.clone();
         let local = local_snap.clone();
         let net = local_net_hist.clone();
+        let docker = docker.clone();
         window.on_select_net_iface(move |iface: SharedString| {
             let Some(w) = weak.upgrade() else { return };
             let active = w.get_active_tab_id().to_string();
@@ -2265,6 +2355,7 @@ fn open_window(
                 st.selected_iface = iface.to_string();
                 st.net_hist = vec![0.0; NET_HISTORY_LEN]; // reset graph for new NIC
             }
+            docker.render();
             refresh_sidebar(&w, &statuses, &local, &net);
         });
     }
@@ -2542,6 +2633,7 @@ fn open_window(
     let tick_statuses = tab_statuses.clone();
     let tick_local = local_snap.clone();
     let tick_net = local_net_hist.clone();
+    let tick_docker = docker.clone();
     let tick_activity = activity.clone();
     let mut bg_tick = 0u32;
     let timer = slint::Timer::default();
@@ -2579,6 +2671,7 @@ fn open_window(
             // Everything (status, CPU/mem/swap, both graphs) follows the
             // active tab; refresh_sidebar reads the stores we just updated.
             if sidebar_updates_visible(&window) {
+                tick_docker.render();
                 refresh_sidebar(&window, &tick_statuses, &tick_local, &tick_net);
             }
         },
@@ -4724,6 +4817,7 @@ fn wire_session_callbacks(
                     session_id: id.clone(),
                     state: 0,
                     is_local: session.kind == SessionKind::Local,
+                    is_ssh: session.kind == SessionKind::Ssh,
                     ..Default::default()
                 },
             );

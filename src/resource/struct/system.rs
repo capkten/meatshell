@@ -121,6 +121,9 @@ pub(crate) struct TabStatus {
     /// True for built-in local shell tabs (system:*). Those should show the
     /// local machine's resource panel, not the (empty) remote stats fields.
     pub(crate) is_local: bool,
+    /// True for SSH tabs. Telnet and serial tabs intentionally remain local
+    /// for Docker routing without changing their resource-panel behavior.
+    pub(crate) is_ssh: bool,
     pub(crate) cpu: f32,
     pub(crate) mem_used_kib: u64,
     pub(crate) mem_total_kib: u64,

@@ -75,6 +75,8 @@ pub struct WindowState {
     pub sys_win: Rc<SystemInfoWindow>,
     pub proc_weak: slint::Weak<ProcWindow>,
     pub sys_weak: slint::Weak<SystemInfoWindow>,
+    #[allow(dead_code)]
+    pub docker: Rc<RefCell<Option<Rc<super::docker::DockerController>>>>,
 }
 
 /// Open-window registry, generic over the window handle so it can be unit
