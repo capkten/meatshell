@@ -453,9 +453,13 @@ printf 'first_mode=%s\nfirst_registered=%s\nfirst_spec=%s\nsecond_mode=%s\nsecon
             let script = format!(
                 r#"
 probe_count=0
+registration_count=0
 complete() {{
     if [ "$1" = -p ] && [ "$2" = docker ]; then
         probe_count=$((probe_count + 1))
+    fi
+    if [ "$1" = -F ] && [ "$2" = __ms_docker_bash_complete ] && [ "$3" = docker ]; then
+        registration_count=$((registration_count + 1))
     fi
     builtin complete "$@"
 }}
@@ -468,8 +472,8 @@ eval {}
 second_mode=$__ms_docker_completion_mode
 second_registered=${{__ms_docker_completion_registered-<unset>}}
 second_spec=$(builtin complete -p docker)
-printf 'probe_count=%s\nfirst_mode=%s\nfirst_registered=%s\nfirst_spec=%s\nsecond_mode=%s\nsecond_registered=%s\nsecond_spec=%s\n' \
-    "$probe_count" "$first_mode" "$first_registered" "$first_spec" "$second_mode" "$second_registered" "$second_spec"
+printf 'probe_count=%s\nregistration_count=%s\nfirst_mode=%s\nfirst_registered=%s\nfirst_spec=%s\nsecond_mode=%s\nsecond_registered=%s\nsecond_spec=%s\n' \
+    "$probe_count" "$registration_count" "$first_mode" "$first_registered" "$first_spec" "$second_mode" "$second_registered" "$second_spec"
 "#,
                 shell_quote(DOCKER_COMPLETION_SETUP),
                 shell_quote(DOCKER_COMPLETION_SETUP)
@@ -483,6 +487,10 @@ printf 'probe_count=%s\nfirst_mode=%s\nfirst_registered=%s\nfirst_spec=%s\nsecon
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
                 stdout.contains("probe_count=1"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.lines().any(|line| line == "registration_count=1"),
                 "captured output: {stdout}"
             );
             assert!(
@@ -520,8 +528,10 @@ COMP_WORDS=(docker run ng)
 COMP_CWORD=2
 __ms_docker_bash_complete >"$DOCKER_COMPLETION_TEST_DIR/stdout" 2>"$DOCKER_COMPLETION_TEST_DIR/stderr"
 status=$?
-printf 'status=%s\nreply_count=%s\nstdout=%s\nstderr=%s\n' \
-    "$status" "${{#COMPREPLY[@]}}" "$(cat "$DOCKER_COMPLETION_TEST_DIR/stdout")" "$(cat "$DOCKER_COMPLETION_TEST_DIR/stderr")"
+stdout_bytes=$(wc -c <"$DOCKER_COMPLETION_TEST_DIR/stdout" | tr -d '[:space:]')
+stderr_bytes=$(wc -c <"$DOCKER_COMPLETION_TEST_DIR/stderr" | tr -d '[:space:]')
+printf 'status=%s\nreply_count=%s\nstdout_bytes=%s\nstderr_bytes=%s\n' \
+    "$status" "${{#COMPREPLY[@]}}" "$stdout_bytes" "$stderr_bytes"
 "#,
                 shell_quote(DOCKER_COMPLETION_SETUP)
             );
@@ -537,8 +547,14 @@ printf 'status=%s\nreply_count=%s\nstdout=%s\nstderr=%s\n' \
                 stdout.contains("reply_count=0"),
                 "captured output: {stdout}"
             );
-            assert!(stdout.contains("stdout=\n"), "captured output: {stdout}");
-            assert!(stdout.contains("stderr=\n"), "captured output: {stdout}");
+            assert!(
+                stdout.lines().any(|line| line == "stdout_bytes=0"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.lines().any(|line| line == "stderr_bytes=0"),
+                "captured output: {stdout}"
+            );
         }
 
         #[test]
