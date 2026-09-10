@@ -1485,7 +1485,18 @@ fn docker_exec_result(
 }
 
 const DOCKER_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
-const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DOCKER_TIMEOUT: std::time::Duration = crate::docker::command::DOCKER_COMMAND_TIMEOUT;
+
+fn docker_timeout_result() -> crate::docker::DockerExecResult {
+    crate::docker::DockerExecResult {
+        stderr: format!(
+            "Docker command timed out after {} seconds.",
+            DOCKER_TIMEOUT.as_secs()
+        ),
+        timed_out: true,
+        ..Default::default()
+    }
+}
 
 /// Execute one Docker query through an already-authenticated SSH connection.
 async fn run_remote_docker(
@@ -1548,11 +1559,7 @@ async fn run_remote_docker(
             stderr: error.to_string(),
             ..Default::default()
         },
-        Err(_) => crate::docker::DockerExecResult {
-            stderr: "Docker command timed out after 5 seconds.".into(),
-            timed_out: true,
-            ..Default::default()
-        },
+        Err(_) => docker_timeout_result(),
     }
 }
 
@@ -3840,7 +3847,25 @@ mod mfa_tests {
 
 #[cfg(test)]
 mod docker_exec_tests {
-    use super::docker_exec_result;
+    use super::{docker_exec_result, docker_timeout_result, DOCKER_TIMEOUT};
+
+    #[test]
+    fn docker_command_timeout_allows_large_remote_inventories() {
+        assert!(DOCKER_TIMEOUT >= std::time::Duration::from_secs(15));
+    }
+
+    #[test]
+    fn docker_timeout_error_matches_configured_budget() {
+        let result = docker_timeout_result();
+        assert!(result.timed_out);
+        assert_eq!(
+            result.stderr,
+            format!(
+                "Docker command timed out after {} seconds.",
+                DOCKER_TIMEOUT.as_secs()
+            )
+        );
+    }
 
     #[test]
     fn incomplete_docker_channel_reports_missing_exit_status() {

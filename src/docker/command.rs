@@ -5,6 +5,7 @@ use std::time::Duration;
 pub(crate) const CONTAINER_INSPECT_FORMAT: &str = "{{json .Id}}\t{{json .Config.Image}}\t{{json .Config.Cmd}}\t{{json .Created}}\t{{json .NetworkSettings.Ports}}\t{{json .Mounts}}\t{{json .NetworkSettings.Networks}}";
 pub(crate) const IMAGE_INSPECT_FORMAT: &str =
     "{{json .Id}}\t{{json .RepoTags}}\t{{json .Size}}\t{{json .Created}}";
+pub(crate) const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn docker_args(request: &DockerRequest) -> Vec<String> {
     match request {
@@ -82,7 +83,7 @@ fn remote_fixed_arg(value: String) -> String {
 
 pub(crate) async fn run_local(request: DockerRequest) -> DockerExecResult {
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        DOCKER_COMMAND_TIMEOUT,
         tokio::process::Command::new("docker")
             .args(docker_args(&request))
             .output(),
