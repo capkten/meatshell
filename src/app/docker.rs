@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use slint::{Model, ModelRc, VecModel};
+use slint::{Model, VecModel};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 
 use crate::docker::command::run_local;
@@ -44,6 +45,8 @@ pub(super) struct DockerUiState {
     pub selected_id: Option<String>,
     pub details: Vec<DockerDetailRow>,
     pub generation: u64,
+    pub snapshot_request_id: u64,
+    pub detail_request_id: u64,
     pub in_flight: bool,
 }
 
@@ -68,6 +71,8 @@ impl DockerUiState {
             selected_id: None,
             details: Vec::new(),
             generation: 0,
+            snapshot_request_id: 0,
+            detail_request_id: 0,
             in_flight: false,
         }
     }
@@ -83,12 +88,30 @@ impl DockerUiState {
         self.container_error = None;
         self.image_error = None;
         self.detail_error = None;
+        self.detail_request_id = self.detail_request_id.wrapping_add(1);
         self.query.clear();
         self.active_tab = DockerTab::Containers;
         self.filter = ContainerFilter::All;
         self.selected_id = None;
         self.details.clear();
         self.in_flight = false;
+    }
+
+    fn try_begin_snapshot_request(&mut self) -> Option<u64> {
+        if self.in_flight {
+            return None;
+        }
+        self.snapshot_request_id = self.snapshot_request_id.wrapping_add(1);
+        self.in_flight = true;
+        Some(self.snapshot_request_id)
+    }
+
+    fn begin_detail_request(&mut self, id: String) -> u64 {
+        self.detail_request_id = self.detail_request_id.wrapping_add(1);
+        self.selected_id = Some(id);
+        self.details.clear();
+        self.detail_error = None;
+        self.detail_request_id
     }
 
     pub(super) fn invalidate_target(&mut self, tab_id: &str) -> bool {
@@ -110,6 +133,7 @@ impl DockerUiState {
     fn set_tab(&mut self, tab: DockerTab) {
         if self.active_tab != tab {
             self.active_tab = tab;
+            self.detail_request_id = self.detail_request_id.wrapping_add(1);
             self.selected_id = None;
             self.details.clear();
             self.detail_error = None;
@@ -164,9 +188,7 @@ pub(super) fn docker_summary(state: &DockerUiState) -> DockerSummary {
     DockerSummary {
         target: target_label(&state.target),
         status: status_text(state),
-        error: active_page_error(state)
-            .map(|e| e.message.clone())
-            .unwrap_or_default(),
+        error: sidebar_error(state),
         visible: !matches!(state.status, DockerStatus::NotInstalled),
         container_count,
         running_count,
@@ -178,6 +200,24 @@ fn active_page_error(state: &DockerUiState) -> Option<&DockerError> {
     match state.active_tab {
         DockerTab::Containers => state.container_error.as_ref(),
         DockerTab::Images => state.image_error.as_ref(),
+    }
+}
+
+fn sidebar_error(state: &DockerUiState) -> String {
+    if let Some(error) = active_page_error(state) {
+        return error.message.clone();
+    }
+    match state.active_tab {
+        DockerTab::Containers => state
+            .image_error
+            .as_ref()
+            .map(|e| format!("Images: {}", e.message))
+            .unwrap_or_default(),
+        DockerTab::Images => state
+            .container_error
+            .as_ref()
+            .map(|e| format!("Containers: {}", e.message))
+            .unwrap_or_default(),
     }
 }
 
@@ -195,9 +235,7 @@ fn status_text(state: &DockerUiState) -> String {
         DockerStatus::NotInstalled => {
             crate::i18n::t("未找到 Docker", "Docker is not installed").to_string()
         }
-        DockerStatus::Error(_) => active_page_error(state)
-            .map(|e| e.message.clone())
-            .unwrap_or_else(|| crate::i18n::t("Docker 错误", "Docker error").to_string()),
+        DockerStatus::Error(_) => sidebar_error(state),
     }
 }
 
@@ -255,10 +293,12 @@ impl DockerController {
     }
 
     pub(super) fn refresh_now(&self) {
-        let (generation, target) = {
+        let (generation, target, request_id) = {
             let mut s = self.state.lock().unwrap();
-            s.in_flight = true;
-            (s.generation, s.target.clone())
+            let Some(request_id) = s.try_begin_snapshot_request() else {
+                return;
+            };
+            (s.generation, s.target.clone(), request_id)
         };
         self.render();
         let state = self.state.clone();
@@ -275,7 +315,7 @@ impl DockerController {
             DockerTarget::Remote { tab_id, .. } => {
                 let handles = self.handles.borrow();
                 let Some(handle) = handles.get(tab_id) else {
-                    self.apply_error(generation, target, "SSH session unavailable");
+                    self.apply_error(generation, target, request_id, "SSH session unavailable");
                     return;
                 };
                 Some(
@@ -305,7 +345,9 @@ impl DockerController {
                 }
             };
             let _ = slint::invoke_from_event_loop(move || {
-                apply_snapshot(&state, &main, &window, generation, &target, result)
+                apply_snapshot(
+                    &state, &main, &window, generation, &target, request_id, result,
+                )
             });
         });
     }
@@ -337,7 +379,7 @@ impl DockerController {
     }
 
     pub(super) fn select_item(&self, id: String) {
-        let (generation, target, request, tab) = {
+        let (generation, target, request, tab, request_id) = {
             let mut s = self.state.lock().unwrap();
             let Some(snapshot) = s.snapshot.as_ref() else {
                 return;
@@ -352,10 +394,8 @@ impl DockerController {
                 }
                 _ => return,
             };
-            s.selected_id = Some(id.clone());
-            s.details.clear();
-            s.detail_error = None;
-            (s.generation, s.target.clone(), request, tab)
+            let request_id = s.begin_detail_request(id.clone());
+            (s.generation, s.target.clone(), request, tab, request_id)
         };
         let state = self.state.clone();
         let main = self.main.clone();
@@ -367,7 +407,8 @@ impl DockerController {
                     let result = run_local(request).await;
                     let _ = slint::invoke_from_event_loop(move || {
                         apply_detail(
-                            &state, &main, &window, generation, &target, &id, tab, result,
+                            &state, &main, &window, generation, &target, &id, tab, request_id,
+                            result,
                         )
                     });
                 });
@@ -382,7 +423,8 @@ impl DockerController {
                     let result = receiver.await.unwrap_or_else(|_| channel_closed());
                     let _ = slint::invoke_from_event_loop(move || {
                         apply_detail(
-                            &state, &main, &window, generation, &target, &id, tab, result,
+                            &state, &main, &window, generation, &target, &id, tab, request_id,
+                            result,
                         )
                     });
                 });
@@ -390,13 +432,14 @@ impl DockerController {
         }
     }
 
-    fn apply_error(&self, generation: u64, target: DockerTarget, message: &str) {
+    fn apply_error(&self, generation: u64, target: DockerTarget, request_id: u64, message: &str) {
         apply_snapshot(
             &self.state,
             &self.main,
             &self.window,
             generation,
             &target,
+            request_id,
             SnapshotResult::fatal(message.into()),
         );
     }
@@ -447,7 +490,13 @@ impl SnapshotResult {
         let snapshot = Some(DockerSnapshot {
             containers,
             images,
-            fetched_at: None,
+            fetched_at: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .to_string(),
+            ),
         });
         let status = if container_error.is_none() && image_error.is_none() {
             if snapshot
@@ -512,14 +561,32 @@ fn error_from_result(r: &DockerExecResult) -> DockerError {
         } else {
             classify_failure(r)
         },
-        message: if r.timed_out {
-            "Docker command timed out".into()
-        } else if r.stderr.is_empty() {
-            r.stdout.clone()
-        } else {
-            r.stderr.clone()
-        },
+        message: normalized_error_message(r),
     }
+}
+
+fn normalized_error_message(r: &DockerExecResult) -> String {
+    if r.timed_out {
+        return "Docker command timed out".into();
+    }
+    let raw = if r.stderr.trim().is_empty() {
+        &r.stdout
+    } else {
+        &r.stderr
+    };
+    let concise = raw
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Docker command failed")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut message = concise.chars().take(200).collect::<String>();
+    if concise.chars().count() > 200 {
+        message.truncate(197);
+        message.push_str("...");
+    }
+    message
 }
 fn channel_closed() -> DockerExecResult {
     DockerExecResult {
@@ -534,10 +601,11 @@ fn apply_snapshot(
     window: &slint::Weak<DockerWindow>,
     generation: u64,
     target: &DockerTarget,
+    request_id: u64,
     result: SnapshotResult,
 ) {
     let mut s = state.lock().unwrap();
-    if s.generation != generation || s.target != *target {
+    if s.generation != generation || s.target != *target || s.snapshot_request_id != request_id {
         return;
     }
     s.snapshot = result.snapshot;
@@ -558,6 +626,7 @@ fn apply_detail(
     target: &DockerTarget,
     selected_id: &str,
     tab: DockerTab,
+    request_id: u64,
     result: DockerExecResult,
 ) {
     let mut s = state.lock().unwrap();
@@ -565,6 +634,7 @@ fn apply_detail(
         || s.target != *target
         || s.selected_id.as_deref() != Some(selected_id)
         || s.active_tab != tab
+        || s.detail_request_id != request_id
     {
         return;
     }
@@ -663,8 +733,6 @@ fn render_state(
             .downcast_ref::<VecModel<DockerContainerRow>>()
         {
             update_vec_model(model, container_rows);
-        } else {
-            w.set_containers(ModelRc::from(Rc::new(VecModel::from(container_rows))));
         }
         let image_rows = docker_image_rows(&s);
         if let Some(model) = w
@@ -673,8 +741,6 @@ fn render_state(
             .downcast_ref::<VecModel<DockerImageRow>>()
         {
             update_vec_model(model, image_rows);
-        } else {
-            w.set_images(ModelRc::from(Rc::new(VecModel::from(image_rows))));
         }
         if let Some(model) = w
             .get_details()
@@ -682,8 +748,6 @@ fn render_state(
             .downcast_ref::<VecModel<DockerDetailRow>>()
         {
             update_vec_model(model, s.details.clone());
-        } else {
-            w.set_details(ModelRc::from(Rc::new(VecModel::from(s.details.clone()))));
         }
         let (filtered_container_count, filtered_image_count) = docker_filtered_counts(&s);
         w.set_filtered_container_count(filtered_container_count);
@@ -834,6 +898,7 @@ mod tests {
             &slint::Weak::default(),
             generation,
             &DockerTarget::Local,
+            0,
             SnapshotResult::from_results(success_result(), success_result(), success_result()),
         );
         let current = state.lock().unwrap();
@@ -858,9 +923,115 @@ mod tests {
             &target,
             "running-id",
             DockerTab::Containers,
+            0,
             success_detail_result(),
         );
         assert!(state.lock().unwrap().details.is_empty());
+    }
+
+    #[test]
+    fn snapshot_request_identity_rejects_late_same_target_and_allows_next_refresh() {
+        let state = Arc::new(Mutex::new(DockerUiState::ready_for(DockerTarget::Local)));
+        let target = DockerTarget::Local;
+        let first = state.lock().unwrap().try_begin_snapshot_request().unwrap();
+        assert!(state.lock().unwrap().try_begin_snapshot_request().is_none());
+        state.lock().unwrap().in_flight = false;
+        let second = state.lock().unwrap().try_begin_snapshot_request().unwrap();
+        assert!(second > first);
+        apply_snapshot(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            0,
+            &target,
+            first,
+            SnapshotResult::from_results(
+                success_result(),
+                success_result_with_container(),
+                success_result(),
+            ),
+        );
+        assert!(state.lock().unwrap().snapshot.is_none());
+        apply_snapshot(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            0,
+            &target,
+            second,
+            SnapshotResult::from_results(
+                success_result(),
+                success_result_with_container(),
+                success_result(),
+            ),
+        );
+        let mut current = state.lock().unwrap();
+        assert!(current.snapshot.is_some());
+        assert!(!current.in_flight);
+        current.snapshot = None;
+        current.in_flight = false;
+        assert!(current.try_begin_snapshot_request().unwrap() > second);
+    }
+
+    #[test]
+    fn repeated_detail_request_identity_rejects_late_result() {
+        let state = Arc::new(Mutex::new(DockerUiState::ready_for(DockerTarget::Local)));
+        let target = DockerTarget::Local;
+        let first = state.lock().unwrap().begin_detail_request("id".into());
+        let second = state.lock().unwrap().begin_detail_request("id".into());
+        apply_detail(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            0,
+            &target,
+            "id",
+            DockerTab::Containers,
+            first,
+            success_detail_result(),
+        );
+        assert!(state.lock().unwrap().details.is_empty());
+        apply_detail(
+            &state,
+            &slint::Weak::default(),
+            &slint::Weak::default(),
+            0,
+            &target,
+            "id",
+            DockerTab::Containers,
+            second,
+            success_detail_result(),
+        );
+        assert!(!state.lock().unwrap().details.is_empty());
+    }
+
+    #[test]
+    fn successful_snapshot_records_fetch_time() {
+        let result =
+            SnapshotResult::from_results(success_result(), success_result(), success_result());
+        assert!(result.snapshot.unwrap().fetched_at.is_some());
+    }
+
+    #[test]
+    fn inactive_page_failure_is_actionable_in_sidebar_summary() {
+        let state = DockerUiState {
+            active_tab: DockerTab::Containers,
+            image_error: Some(DockerError {
+                kind: DockerErrorKind::PermissionDenied,
+                message: "access denied".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(docker_summary(&state).error, "Images: access denied");
+    }
+
+    #[test]
+    fn raw_docker_error_text_is_normalized_to_one_bounded_line() {
+        let result = failed_result("permission denied\nsecret implementation detail\n");
+        let error = error_from_result(&result);
+        assert_eq!(error.kind, DockerErrorKind::PermissionDenied);
+        assert_eq!(error.message, "permission denied");
+        assert!(error.message.len() <= 200);
     }
 
     #[test]
@@ -880,10 +1051,8 @@ mod tests {
 
     #[test]
     fn detail_rows_never_include_config_environment() {
-        let detail = parse_container_detail(
-            r#"[{"Id":"container-id","Config":{"Image":"nginx","Env":["SECRET=x"]}}]"#,
-        )
-        .unwrap();
+        let detail =
+            parse_container_detail("\"container-id\"\t\"nginx\"\t[]\t\"\"\t{}\t[]\t{}").unwrap();
         let rows = container_detail_rows(detail);
         assert!(rows.iter().all(|row| !row.value.contains("SECRET")));
     }
@@ -911,7 +1080,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(docker_summary(&state).error, "");
+        assert_eq!(
+            docker_summary(&state).error,
+            "Images: image daemon unavailable"
+        );
         state.active_tab = DockerTab::Images;
         assert_eq!(docker_summary(&state).error, "image daemon unavailable");
 
@@ -921,7 +1093,7 @@ mod tests {
             kind: DockerErrorKind::PermissionDenied,
             message: "container denied".into(),
         });
-        assert_eq!(docker_summary(&state).error, "");
+        assert_eq!(docker_summary(&state).error, "Containers: container denied");
         state.active_tab = DockerTab::Containers;
         assert_eq!(docker_summary(&state).error, "container denied");
     }
@@ -940,9 +1112,9 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(!docker_summary(&state)
+        assert!(docker_summary(&state)
             .status
-            .contains("image daemon unavailable"));
+            .contains("Images: image daemon unavailable"));
         state.active_tab = DockerTab::Images;
         assert_eq!(docker_summary(&state).status, "image daemon unavailable");
     }
@@ -962,6 +1134,7 @@ mod tests {
             &DockerTarget::Local,
             "running-id",
             DockerTab::Containers,
+            0,
             failed_result("permission denied"),
         );
         assert_eq!(
@@ -977,6 +1150,7 @@ mod tests {
             &DockerTarget::Local,
             "running-id",
             DockerTab::Containers,
+            0,
             DockerExecResult {
                 stdout: "not json".into(),
                 exit_code: Some(0),
@@ -1057,7 +1231,7 @@ mod tests {
 
     fn success_detail_result() -> DockerExecResult {
         DockerExecResult {
-            stdout: r#"[{"Id":"running-id","Config":{"Image":"nginx"}}]"#.into(),
+            stdout: "\"running-id\"\t\"nginx\"\t[]\t\"\"\t{}\t[]\t{}".into(),
             exit_code: Some(0),
             ..Default::default()
         }

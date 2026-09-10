@@ -2,6 +2,10 @@ use super::{DockerExecResult, DockerRequest};
 use std::io::ErrorKind;
 use std::time::Duration;
 
+pub(crate) const CONTAINER_INSPECT_FORMAT: &str = "{{json .Id}}\t{{json .Config.Image}}\t{{json .Config.Cmd}}\t{{json .Created}}\t{{json .NetworkSettings.Ports}}\t{{json .Mounts}}\t{{json .NetworkSettings.Networks}}";
+pub(crate) const IMAGE_INSPECT_FORMAT: &str =
+    "{{json .Id}}\t{{json .RepoTags}}\t{{json .Size}}\t{{json .Created}}";
+
 pub(crate) fn docker_args(request: &DockerRequest) -> Vec<String> {
     match request {
         DockerRequest::Version => ["version", "--format", "{{json .}}"]
@@ -21,24 +25,38 @@ pub(crate) fn docker_args(request: &DockerRequest) -> Vec<String> {
                 "inspect".into(),
                 "--type".into(),
                 "container".into(),
+                "--format".into(),
+                CONTAINER_INSPECT_FORMAT.into(),
                 id.clone(),
             ]
         }
-        DockerRequest::InspectImage(id) => vec!["image".into(), "inspect".into(), id.clone()],
+        DockerRequest::InspectImage(id) => vec![
+            "image".into(),
+            "inspect".into(),
+            "--format".into(),
+            IMAGE_INSPECT_FORMAT.into(),
+            id.clone(),
+        ],
     }
 }
 
 pub(crate) fn remote_command(request: &DockerRequest) -> String {
     let args = match request {
         DockerRequest::InspectContainer(id) => vec![
-            "inspect".to_string(),
-            "--type".to_string(),
-            "container".to_string(),
+            "inspect".into(),
+            "--type".into(),
+            "container".into(),
+            "--format".into(),
+            shell_quote(CONTAINER_INSPECT_FORMAT),
             shell_quote(id),
         ],
-        DockerRequest::InspectImage(id) => {
-            vec!["image".to_string(), "inspect".to_string(), shell_quote(id)]
-        }
+        DockerRequest::InspectImage(id) => vec![
+            "image".into(),
+            "inspect".into(),
+            "--format".into(),
+            shell_quote(IMAGE_INSPECT_FORMAT),
+            shell_quote(id),
+        ],
         _ => docker_args(request)
             .into_iter()
             .map(remote_fixed_arg)
@@ -52,7 +70,10 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn remote_fixed_arg(value: String) -> String {
-    if value == "{{json .}}" {
+    if matches!(
+        value.as_str(),
+        "{{json .}}" | CONTAINER_INSPECT_FORMAT | IMAGE_INSPECT_FORMAT
+    ) {
         shell_quote(&value)
     } else {
         value
@@ -124,36 +145,57 @@ mod tests {
         );
         assert_eq!(
             docker_args(&DockerRequest::InspectContainer("container-id".into())),
-            vec!["inspect", "--type", "container", "container-id"]
+            vec!["inspect", "--type", "container", "--format", "{{json .Id}}\t{{json .Config.Image}}\t{{json .Config.Cmd}}\t{{json .Created}}\t{{json .NetworkSettings.Ports}}\t{{json .Mounts}}\t{{json .NetworkSettings.Networks}}", "container-id"]
                 .into_iter()
                 .map(String::from)
                 .collect::<Vec<_>>()
         );
         assert_eq!(
             docker_args(&DockerRequest::InspectImage("image-id".into())),
-            vec!["image", "inspect", "image-id"]
-                .into_iter()
-                .map(String::from)
-                .collect::<Vec<_>>()
+            vec![
+                "image",
+                "inspect",
+                "--format",
+                "{{json .Id}}\t{{json .RepoTags}}\t{{json .Size}}\t{{json .Created}}",
+                "image-id"
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn inspect_id_is_quoted_in_remote_command() {
         let command = remote_command(&DockerRequest::InspectContainer("abc123".into()));
-        assert_eq!(command, "docker inspect --type container 'abc123'");
+        assert_eq!(command, "docker inspect --type container --format '{{json .Id}}\t{{json .Config.Image}}\t{{json .Config.Cmd}}\t{{json .Created}}\t{{json .NetworkSettings.Ports}}\t{{json .Mounts}}\t{{json .NetworkSettings.Networks}}' 'abc123'");
     }
 
     #[test]
     fn inspect_image_id_is_quoted_without_quoting_fixed_arguments() {
         let command = remote_command(&DockerRequest::InspectImage("image; echo unsafe".into()));
-        assert_eq!(command, "docker image inspect 'image; echo unsafe'");
+        assert_eq!(command, "docker image inspect --format '{{json .Id}}\t{{json .RepoTags}}\t{{json .Size}}\t{{json .Created}}' 'image; echo unsafe'");
     }
 
     #[test]
     fn inspect_id_with_apostrophe_remains_shell_safe() {
         let command = remote_command(&DockerRequest::InspectContainer("a'b".into()));
-        assert_eq!(command, "docker inspect --type container 'a'\\''b'");
+        assert_eq!(command, "docker inspect --type container --format '{{json .Id}}\t{{json .Config.Image}}\t{{json .Config.Cmd}}\t{{json .Created}}\t{{json .NetworkSettings.Ports}}\t{{json .Mounts}}\t{{json .NetworkSettings.Networks}}' 'a'\\''b'");
+    }
+
+    #[test]
+    fn inspect_templates_are_field_limited_and_never_request_environment() {
+        for request in [
+            DockerRequest::InspectContainer("id".into()),
+            DockerRequest::InspectImage("id".into()),
+        ] {
+            let args = docker_args(&request);
+            let format = args.iter().find(|arg| *arg == "--format").unwrap();
+            let template = args[args.iter().position(|arg| arg == format).unwrap() + 1].as_str();
+            assert!(!template.contains("{{json .}}"));
+            assert!(!template.contains("Env"));
+            assert!(!remote_command(&request).contains("Env"));
+        }
     }
 
     #[test]

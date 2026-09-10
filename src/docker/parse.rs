@@ -47,25 +47,25 @@ pub(crate) fn parse_image_rows(stdout: &str) -> Result<Vec<DockerImageSummary>, 
 }
 
 pub(crate) fn parse_container_detail(stdout: &str) -> Result<DockerContainerDetail, DockerError> {
-    let value = first_inspect_value(stdout)?;
+    let fields = restricted_inspect_fields(stdout, 7)?;
     Ok(DockerContainerDetail {
-        id: string_field(&value, "Id"),
-        image: nested_string(&value, &["Config", "Image"]),
-        command: value_to_text(value.pointer("/Config/Cmd")),
-        created: string_field(&value, "Created"),
-        ports: value_to_text(value.pointer("/NetworkSettings/Ports")),
-        mounts: value_to_text(value.pointer("/Mounts")),
-        networks: value_to_text(value.pointer("/NetworkSettings/Networks")),
+        id: value_to_text(fields.first()),
+        image: value_to_text(fields.get(1)),
+        command: value_to_text(fields.get(2)),
+        created: value_to_text(fields.get(3)),
+        ports: value_to_text(fields.get(4)),
+        mounts: value_to_text(fields.get(5)),
+        networks: value_to_text(fields.get(6)),
     })
 }
 
 pub(crate) fn parse_image_detail(stdout: &str) -> Result<DockerImageDetail, DockerError> {
-    let value = first_inspect_value(stdout)?;
+    let fields = restricted_inspect_fields(stdout, 4)?;
     Ok(DockerImageDetail {
-        id: string_field(&value, "Id"),
-        repository_tags: value_to_text(value.get("RepoTags")),
-        size: value_to_text(value.get("Size")),
-        created: string_field(&value, "Created"),
+        id: value_to_text(fields.first()),
+        repository_tags: value_to_text(fields.get(1)),
+        size: value_to_text(fields.get(2)),
+        created: value_to_text(fields.get(3)),
     })
 }
 
@@ -133,19 +133,21 @@ fn parse_object(line: &str) -> Result<Value, DockerError> {
     }
 }
 
-fn first_inspect_value(stdout: &str) -> Result<Value, DockerError> {
-    let value: Value =
-        serde_json::from_str(stdout).map_err(|error| parse_error(error.to_string()))?;
-    match value {
-        Value::Array(mut values) => values
-            .drain(..)
-            .find(Value::is_object)
-            .ok_or_else(|| parse_error("expected a non-empty inspect array".to_string())),
-        Value::Object(value) => Ok(Value::Object(value)),
-        _ => Err(parse_error(
-            "expected an inspect object or array".to_string(),
-        )),
+fn restricted_inspect_fields(stdout: &str, expected: usize) -> Result<Vec<Value>, DockerError> {
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() != expected {
+            continue;
+        }
+        let parsed = fields
+            .into_iter()
+            .map(|field| serde_json::from_str(field).map_err(|e| parse_error(e.to_string())))
+            .collect::<Result<Vec<Value>, _>>()?;
+        return Ok(parsed);
     }
+    Err(parse_error(
+        "expected restricted Docker inspect fields".into(),
+    ))
 }
 
 fn string_field(value: &Value, key: &str) -> String {
@@ -154,17 +156,6 @@ fn string_field(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
-}
-
-fn nested_string(value: &Value, path: &[&str]) -> String {
-    let mut current = value;
-    for key in path {
-        current = match current.get(*key) {
-            Some(value) => value,
-            None => return String::new(),
-        };
-    }
-    current.as_str().unwrap_or_default().to_string()
 }
 
 fn normalize_name(name: &str) -> String {
@@ -269,13 +260,14 @@ mod tests {
 
     #[test]
     fn parses_inspect_details_without_exposing_environment() {
-        let stdout = r#"[{"Id":"container-id","Config":{"Image":"nginx:1.27","Cmd":["nginx","-g","daemon off;"],"Env":["SECRET=do-not-copy"]},"Created":"2026-09-08T10:00:00Z","NetworkSettings":{"Ports":{"80/tcp":[{"HostPort":"8080"}]},"Networks":{"default":{"IPAddress":"172.20.0.2"}}},"Mounts":[{"Source":"/data","Destination":"/var/lib"}]}]"#;
+        let stdout = "\"container-id\"\t\"nginx:1.27\"\t[\"nginx\",\"-g\",\"daemon off;\"]\t\"2026-09-08T10:00:00Z\"\t{\"80/tcp\":[{\"HostPort\":\"8080\"}]}\t[{\"Source\":\"/data\",\"Destination\":\"/var/lib\"}]\t{\"default\":{\"IPAddress\":\"172.20.0.2\"}}";
         let detail = parse_container_detail(stdout).expect("valid container inspect JSON");
         assert_eq!(detail.id, "container-id");
         assert_eq!(detail.image, "nginx:1.27");
         assert!(detail.command.contains("nginx"));
         assert!(detail.mounts.contains("/var/lib"));
         assert!(detail.networks.contains("172.20.0.2"));
+        assert!(!stdout.contains("Env"));
         assert!(!detail.command.contains("SECRET"));
         assert!(!detail.mounts.contains("SECRET"));
         assert!(!detail.networks.contains("SECRET"));
@@ -283,7 +275,7 @@ mod tests {
 
     #[test]
     fn parses_first_object_after_non_object_inspect_entry() {
-        let stdout = r#"[null,{"Id":"container-id","Config":{"Image":"nginx:1.27"}}]"#;
+        let stdout = "null\n\"container-id\"\t\"nginx:1.27\"\t[]\t\"\"\t{}\t[]\t{}";
         let detail = parse_container_detail(stdout).expect("first object in inspect JSON");
         assert_eq!(detail.id, "container-id");
     }
@@ -296,6 +288,15 @@ mod tests {
         );
         assert_eq!(
             parse_image_detail("[]").unwrap_err().kind,
+            DockerErrorKind::ParseFailed
+        );
+    }
+
+    #[test]
+    fn rejects_unrestricted_inspect_objects_instead_of_parsing_them() {
+        let unrestricted = r#"[{"Id":"id","Config":{"Image":"nginx","Env":["SECRET=x"]}}]"#;
+        assert_eq!(
+            parse_container_detail(unrestricted).unwrap_err().kind,
             DockerErrorKind::ParseFailed
         );
     }

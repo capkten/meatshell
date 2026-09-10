@@ -87,3 +87,26 @@ Only this report file was changed by Task 7. No feature code or tests required a
 2. Live local Docker and SSH Docker acceptance checks remain unperformed because this verification host has no Docker executable and no suitable SSH Docker server. A release candidate should repeat the brief's local and SSH manual scenarios on provisioned hosts before release sign-off.
 
 Within the available environment, Task 7 found no concrete Docker regression requiring code changes.
+
+## Final-fix follow-up (2026-09-10)
+
+The whole-branch review identified and fixed the following blockers:
+
+- Container and image inspect requests now use fixed tab-separated JSON templates containing only the approved ID/image/command/created/ports/mounts/networks or ID/repository-tags/size/created fields. The parser accepts only that restricted field shape and rejects unrestricted inspect objects. Command, parser, and UI-path tests prove no `Env` field is requested, transported, parsed, or displayed.
+- Snapshot requests now carry a monotonic request identity and are deduplicated while one is in flight. Late same-target results are rejected while target/generation guards remain active; tests also prove a later refresh is allowed after completion.
+- Detail requests now carry a monotonic identity, so reselecting the same item cannot be overwritten by an older inspect result. Existing target/generation/tab/selected-ID guards remain active.
+- Sidebar errors now retain a concise page label when the inactive page is the only failing page.
+- Docker stderr is normalized to one line and bounded to 200 characters before reaching UI state; timeout and useful reason handling remain intact.
+- Successful snapshots now populate `fetched_at`, and the detached Docker window retains its shared VecModel instances without fallback replacement.
+
+### Final-fix verification
+
+- Initial red regression run: 6 expected failures in the old unrestricted command/parser expectations, confirming the security tests exercised the defect.
+- `cargo fmt --all -- --check`: PASS, exit 0.
+- `cargo clippy --all-targets -- -D warnings`: FAIL, exit 101, repository baseline only. The first post-fix run exposed three Docker-specific `needless_else` diagnostics caused by removing fallback model replacement; those branches were removed. A clean path-filtered rerun reported `DOCKER_CLIPPY_DIAGNOSTICS=NONE`; remaining Clippy failures are the pre-existing repository diagnostics.
+- `cargo test --locked docker`: PASS, 46 passed, 0 failed, 264 filtered out.
+- `cargo test --locked`: PASS, 310 passed, 0 failed, 0 ignored.
+- `cargo check`: PASS, exit 0, with the existing 11 dead-code warnings and no Docker-specific warning.
+- `git diff --check`: PASS.
+
+Final-fix changed files: `src/docker/command.rs`, `src/docker/parse.rs`, `src/app/docker.rs`, and this report. `.superpowers/brainstorm/` was not touched. Live Docker/SSH acceptance remains unavailable on this host because Docker and a test SSH Docker server are not provisioned; this remains the only environment-based release limitation in addition to the repository Clippy baseline.
