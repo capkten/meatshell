@@ -5,14 +5,15 @@ fn dynamic_sidebar_visible(active: bool, collapsed: bool) -> bool {
 }
 
 pub(super) fn docker_refresh_needed(
-    _dynamic_ui_active: bool,
+    docker_surface_allowed: bool,
     sidebar_visible: bool,
     window_open: bool,
 ) -> bool {
-    // `dynamic_ui_active` describes the main window only. A detached Docker
-    // window remains a live user-visible surface when the main window is
-    // unfocused, minimized, or occluded, so its open state must stand alone.
-    sidebar_visible || window_open
+    // The first argument is deliberately not main-window focus: callers pass
+    // the non-zen allowance for Docker surfaces. This keeps a visible detached
+    // window live while the main window is unfocused/minimized/occluded, but
+    // still pauses every Docker surface in zen mode.
+    docker_surface_allowed && (sidebar_visible || window_open)
 }
 
 #[cfg(test)]
@@ -22,8 +23,7 @@ mod docker_lifecycle_tests {
     #[test]
     fn docker_refresh_is_needed_only_when_sidebar_or_window_is_visible() {
         assert!(docker_refresh_needed(true, false, true));
-        assert!(docker_refresh_needed(false, true, true));
-        assert!(docker_refresh_needed(false, false, true));
+        assert!(!docker_refresh_needed(false, true, true));
         assert!(!docker_refresh_needed(true, false, false));
     }
 
@@ -32,7 +32,13 @@ mod docker_lifecycle_tests {
         assert!(docker_refresh_needed(true, true, false));
         assert!(docker_refresh_needed(true, false, true));
         assert!(docker_refresh_needed(true, true, true));
-        assert!(!docker_refresh_needed(false, false, false));
+        assert!(!docker_refresh_needed(true, false, false));
+    }
+
+    #[test]
+    fn docker_refresh_is_paused_in_zen_mode_even_when_window_is_open() {
+        assert!(!docker_refresh_needed(false, false, true));
+        assert!(!docker_refresh_needed(false, true, true));
     }
 }
 

@@ -1494,6 +1494,7 @@ fn open_window(
     {
         let weak = window.as_weak();
         let store = store.clone();
+        let docker_weak = docker_win.as_weak();
         window.on_set_ui_scale(move |percent: i32| {
             let clamped = (percent.max(0) as u32).clamp(80, 200);
             {
@@ -1503,6 +1504,9 @@ fn open_window(
             }
             if let Some(w) = weak.upgrade() {
                 w.set_ui_scale(clamped as f32 / 100.0);
+                if let Some(docker) = docker_weak.upgrade() {
+                    sync_docker_theme(&w, &docker);
+                }
             }
         });
     }
@@ -2166,7 +2170,7 @@ fn open_window(
                 let needs_refresh = docker.begin_target(target) || docker.target_needs_refresh();
                 if needs_refresh
                     && docker_refresh_needed(
-                        w.get_dynamic_ui_active() && !w.get_zen_mode(),
+                        !w.get_zen_mode(),
                         sidebar_updates_visible(&w),
                         w.get_docker_window_open(),
                     )
@@ -2208,7 +2212,7 @@ fn open_window(
             if let Some(w) = weak.upgrade() {
                 if w.get_active_tab_id() == tab_id
                     && docker_refresh_needed(
-                        w.get_dynamic_ui_active() && !w.get_zen_mode(),
+                        !w.get_zen_mode(),
                         sidebar_updates_visible(&w),
                         w.get_docker_window_open(),
                     )
@@ -2766,7 +2770,7 @@ fn open_window(
             // Everything (status, CPU/mem/swap, both graphs) follows the
             // active tab; refresh_sidebar reads the stores we just updated.
             if docker_refresh_needed(
-                window.get_dynamic_ui_active() && !window.get_zen_mode(),
+                !window.get_zen_mode(),
                 sidebar_updates_visible(&window),
                 window.get_docker_window_open(),
             ) {
@@ -2794,7 +2798,7 @@ fn open_window(
                 return;
             };
             if docker_refresh_needed(
-                w.get_dynamic_ui_active() && !w.get_zen_mode(),
+                !w.get_zen_mode(),
                 sidebar_updates_visible(&w),
                 w.get_docker_window_open(),
             ) {

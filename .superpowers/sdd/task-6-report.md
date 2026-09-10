@@ -125,3 +125,48 @@ cargo test app::sidebar::docker_lifecycle_tests
 ```
 
 The follow-up is committed as a focused fix to the Task 6 implementation.
+
+## Re-review follow-up
+
+### Findings and fixes
+
+- Restored an explicit zen gate in `docker_refresh_needed`. Its first
+  argument is now the Docker surface's non-zen allowance, not main-window
+  focus/activity. The timer and lifecycle callbacks pass `!zen_mode`, so a
+  detached visible DockerWindow continues refreshing through main-window
+  unfocused, minimized, or occluded states, while zen mode pauses it. The
+  sidebar visibility argument remains independently derived from
+  `sidebar_updates_visible`.
+- Added explicit pure coverage for zen mode with an open detached window and
+  retained the visible/hidden transition cases.
+- Extended `on_set_ui_scale` to synchronize the retained DockerWindow through
+  `sync_docker_theme`, including related scale/theme properties.
+
+### Re-review verification
+
+Focused lifecycle tests:
+
+```
+cargo test app::sidebar::docker_lifecycle_tests
+3 passed; 0 failed
+```
+
+Required order:
+
+```
+cargo fmt --all -- --check
+passed
+
+cargo clippy --all-targets -- -D warnings
+failed only on the known repository-wide pre-existing baseline; no Task 6
+diagnostics after the fix
+
+cargo test --locked
+303 passed; 0 failed
+
+cargo check
+passed
+```
+
+The strict Clippy baseline was not changed; unrelated lints were intentionally
+left out of this focused fix. The re-review fix is committed separately.
