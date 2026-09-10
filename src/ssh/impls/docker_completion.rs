@@ -6,13 +6,35 @@ pub(crate) const DOCKER_COMPLETION_SETUP: &str = r#"if [ -z "${__ms_docker_compl
             __ms_docker_completion_mode=fallback
         fi
     elif [ -n "$ZSH_VERSION" ]; then
+        __ms_docker_zsh_native=0
         if (( ${+_comps[docker]} )); then
+            __ms_docker_zsh_native=1
+        else
+            if (( ${+_patcomps} )); then
+                for __ms_docker_pattern in ${(k)_patcomps}; do
+                    if [[ docker = ${~__ms_docker_pattern} ]]; then
+                        __ms_docker_zsh_native=1
+                        break
+                    fi
+                done
+            fi
+            if (( __ms_docker_zsh_native == 0 )) && (( ${+_postpatcomps} )); then
+                for __ms_docker_pattern in ${(k)_postpatcomps}; do
+                    if [[ docker = ${~__ms_docker_pattern} ]]; then
+                        __ms_docker_zsh_native=1
+                        break
+                    fi
+                done
+            fi
+        fi
+        if (( __ms_docker_zsh_native )); then
             __ms_docker_completion_mode=native
         elif command -v compdef >/dev/null 2>&1 && (( ${+_comps} )); then
             __ms_docker_completion_mode=fallback
         else
             __ms_docker_completion_mode=unavailable
         fi
+        unset __ms_docker_zsh_native __ms_docker_pattern
     else
         __ms_docker_completion_mode=unavailable
     fi
@@ -22,8 +44,19 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
     __ms_docker_completion_registered=1
 
     __ms_docker_option_takes_value() {
-        case "$1" in
-            --name|-e|--env|--env-file|-h|--hostname|-l|--label|--mount|--network|--publish|-p|--volume|-v|--workdir|-w|--user|-u|--restart|--platform|--entrypoint|--stop-timeout|--memory|--cpus|--pull|--signal|-s|--time|-t|--since|--tail|--until|--format|-f|--type|--detach-keys)
+        case "$1:$2" in
+            run:--name|run:-e|run:--env|run:--env-file|run:-h|run:--hostname|run:-l|run:--label|run:--mount|run:--network|run:--publish|run:-p|run:--volume|run:-v|run:--workdir|run:-w|run:--user|run:-u|run:--restart|run:--platform|run:--entrypoint|run:--stop-timeout|run:--memory|run:--cpus|run:--pull|run:--detach-keys|exec:-e|exec:--env|exec:--env-file|exec:--workdir|exec:-w|exec:--user|exec:-u|exec:--detach-keys|start:--detach-keys|stop:--signal|stop:-s|stop:--time|stop:-t|logs:--since|logs:--tail|logs:--until|inspect:--format|inspect:-f|inspect:--type)
+                return 0
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    }
+
+    __ms_docker_option_is_boolean() {
+        case "$1:$2" in
+            run:-d|run:--detach|run:-i|run:--interactive|run:-t|run:--tty|run:--rm|run:--init|run:--privileged|run:--read-only|run:-it|run:-ti|run:-di|run:-id|run:-dit|run:-dti|run:-tid|exec:-d|exec:--detach|exec:-i|exec:--interactive|exec:-t|exec:--tty|exec:--privileged|exec:-it|exec:-ti|exec:-di|exec:-id|start:-a|start:--attach|start:-i|start:--interactive|rm:-f|rm:--force|rm:-l|rm:--link|rm:-v|rm:--volumes|logs:-f|logs:--follow|logs:-t|logs:--timestamps|logs:--details|inspect:-s|inspect:--size)
                 return 0
                 ;;
             *)
@@ -41,7 +74,7 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
                         [ -n "$image" ] && printf "%s\n" "$image"
                         ;;
                 esac
-            done
+            done || :
     }
 
     __ms_docker_containers() {
@@ -49,7 +82,7 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
             while IFS="	" read -r container_id container_name; do
                 [ -n "$container_id" ] && printf "%s\n" "$container_id"
                 [ -n "$container_name" ] && printf "%s\n" "$container_name"
-            done
+            done || :
     }
 
     __ms_docker_candidates() {
@@ -64,7 +97,7 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
                 {
                     __ms_docker_images
                     __ms_docker_containers
-                } | LC_ALL=C sort -u
+                } | LC_ALL=C sort -u 2>/dev/null || :
                 ;;
         esac
     }
@@ -94,8 +127,11 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
                 end_options=1
                 continue
             fi
-            if [ "$end_options" -eq 0 ] && __ms_docker_option_takes_value "$token"; then
+            if [ "$end_options" -eq 0 ] && __ms_docker_option_takes_value "$subcommand" "$token"; then
                 expecting_value=1
+                continue
+            fi
+            if [ "$end_options" -eq 0 ] && __ms_docker_option_is_boolean "$subcommand" "$token"; then
                 continue
             fi
             if [ "$end_options" -eq 0 ] && [ "${token#-}" != "$token" ]; then
@@ -114,7 +150,10 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
             run)
                 [ "$positional_count" -eq 0 ] && candidate_kind=image
                 ;;
-            exec|start|stop|rm|logs)
+            exec|logs)
+                [ "$positional_count" -eq 0 ] && candidate_kind=container
+                ;;
+            start|stop|rm)
                 candidate_kind=container
                 ;;
             inspect)
@@ -128,7 +167,8 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
 
         local candidates
         candidates="$(__ms_docker_candidates "$candidate_kind")"
-        COMPREPLY=( $(compgen -W "$candidates" -- "$current") )
+        COMPREPLY=( $(compgen -W "$candidates" -- "$current" || :) )
+        return 0
     }
 
     _ms_docker_zsh_complete() {
@@ -155,8 +195,11 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
                 end_options=1
                 continue
             fi
-            if [ "$end_options" -eq 0 ] && __ms_docker_option_takes_value "$token"; then
+            if [ "$end_options" -eq 0 ] && __ms_docker_option_takes_value "$subcommand" "$token"; then
                 expecting_value=1
+                continue
+            fi
+            if [ "$end_options" -eq 0 ] && __ms_docker_option_is_boolean "$subcommand" "$token"; then
                 continue
             fi
             if [ "$end_options" -eq 0 ] && [ "${token#-}" != "$token" ]; then
@@ -175,7 +218,10 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
             run)
                 [ "$positional_count" -eq 0 ] && candidate_kind=image
                 ;;
-            exec|start|stop|rm|logs)
+            exec|logs)
+                [ "$positional_count" -eq 0 ] && candidate_kind=container
+                ;;
+            start|stop|rm)
                 candidate_kind=container
                 ;;
             inspect)
@@ -189,7 +235,8 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
 
         local candidates
         candidates="$(__ms_docker_candidates "$candidate_kind")"
-        compadd -Q -- ${(f)candidates}
+        compadd -Q -- ${(f)candidates} || :
+        return 0
     }
 
     if [ -n "$BASH_VERSION" ]; then
@@ -231,6 +278,8 @@ mod tests {
     #[test]
     fn zsh_native_probe_reads_comps_registry_without_compdef_query() {
         assert!(DOCKER_COMPLETION_SETUP.contains("${+_comps[docker]}"));
+        assert!(DOCKER_COMPLETION_SETUP.contains("${(k)_patcomps}"));
+        assert!(DOCKER_COMPLETION_SETUP.contains("${(k)_postpatcomps}"));
         assert!(!DOCKER_COMPLETION_SETUP.contains("compdef -p docker"));
     }
 
@@ -370,6 +419,22 @@ fi
         }
 
         #[test]
+        fn bash_run_accepts_common_boolean_options_before_the_image() {
+            assert_eq!(
+                bash_candidates(&["docker", "run", "--rm", "ng"], 3),
+                vec!["nginx:latest".to_string()]
+            );
+        }
+
+        #[test]
+        fn bash_exec_accepts_the_common_interactive_option_bundle() {
+            assert_eq!(
+                bash_candidates(&["docker", "exec", "-it", "we"], 3),
+                vec!["web".to_string()]
+            );
+        }
+
+        #[test]
         fn bash_exec_completes_container_prefix() {
             assert_eq!(
                 bash_candidates(&["docker", "exec", "we"], 2),
@@ -395,6 +460,45 @@ fi
         #[test]
         fn bash_run_stops_image_completion_after_the_image_position() {
             assert!(bash_candidates(&["docker", "run", "nginx", "sh"], 3).is_empty());
+        }
+
+        #[test]
+        fn bash_exec_stops_container_completion_after_the_container_position() {
+            assert!(bash_candidates(&["docker", "exec", "web", "wo"], 3).is_empty());
+        }
+
+        #[test]
+        fn bash_logs_stops_container_completion_after_the_container_position() {
+            assert!(bash_candidates(&["docker", "logs", "web", "wo"], 3).is_empty());
+        }
+
+        #[test]
+        fn bash_stop_skips_the_timeout_option_value() {
+            assert_eq!(
+                bash_candidates(&["docker", "stop", "-t", "10", "wo"], 4),
+                vec!["worker".to_string()]
+            );
+        }
+
+        #[test]
+        fn bash_inspect_accepts_the_size_boolean_option() {
+            assert_eq!(
+                bash_candidates(&["docker", "inspect", "-s", "ng"], 3),
+                vec!["nginx:latest".to_string()]
+            );
+        }
+
+        #[test]
+        fn bash_does_not_complete_an_option_value() {
+            assert!(bash_candidates(&["docker", "run", "--name", ""], 3).is_empty());
+        }
+
+        #[test]
+        fn bash_stops_treating_options_specially_after_double_dash() {
+            assert_eq!(
+                bash_candidates(&["docker", "run", "--", "ng"], 3),
+                vec!["nginx:latest".to_string()]
+            );
         }
 
         #[test]
@@ -530,6 +634,7 @@ printf 'probe_count=%s\nregistration_count=%s\nfirst_mode=%s\nfirst_registered=%
             let script = format!(
                 r#"
 eval {}
+set -e
 COMP_WORDS=(docker run ng)
 COMP_CWORD=2
 __ms_docker_bash_complete >"$DOCKER_COMPLETION_TEST_DIR/stdout" 2>"$DOCKER_COMPLETION_TEST_DIR/stderr"
@@ -681,6 +786,57 @@ printf 'compdef_calls=%s\nfirst_mode=%s\nfirst_binding=%s\nsecond_mode=%s\nbindi
             );
             assert!(
                 stdout.contains("registered_present=0"),
+                "captured output: {stdout}"
+            );
+        }
+
+        #[test]
+        fn zsh_native_pattern_binding_is_detected_without_replacement_when_available() {
+            let available = Command::new("zsh")
+                .args(["-fc", "exit 0"])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            if !available {
+                eprintln!("skipped zsh native-pattern test: zsh is unavailable");
+                return;
+            }
+
+            let script = format!(
+                r#"
+typeset -A _comps _patcomps
+native_docker_complete() {{ return 0 }}
+_patcomps['docker*']=native_docker_complete
+compdef_calls=0
+compdef() {{
+    compdef_calls=$((compdef_calls + 1))
+    _comps[docker]="$1"
+}}
+eval {}
+first_mode=$__ms_docker_completion_mode
+first_registered=${{__ms_docker_completion_registered-<unset>}}
+printf 'compdef_calls=%s\nfirst_mode=%s\nfirst_registered=%s\n' \
+    "$compdef_calls" "$first_mode" "$first_registered"
+"#,
+                shell_quote(DOCKER_COMPLETION_SETUP)
+            );
+            let output = run_zsh(&script, false);
+            assert!(
+                output.status.success(),
+                "zsh native-pattern harness failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("compdef_calls=0"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_mode=native"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_registered=<unset>"),
                 "captured output: {stdout}"
             );
         }
