@@ -26,6 +26,7 @@ use crate::resource::GpuSnapshot;
 #[cfg(test)]
 const DCU_PROBE: &str = "(bash -lc 'rocm-smi --showpids' || /opt/rocm/bin/rocm-smi --showpids || /usr/local/rocm/bin/rocm-smi --showpids || /usr/local/bin/rocm-smi --showpids)";
 
+use super::docker_completion::DOCKER_COMPLETION_SETUP;
 use super::structs::*;
 
 struct RuntimeTrigger {
@@ -212,7 +213,12 @@ const PROMPT_SETUP_PREFIX: &str = "test -z \"$FISH_VERSION\"";
 const PROMPT_SETUP_SUFFIX: &str = "__ms7'";
 const PROMPT_SETUP_HISTORY_MARKER: &str = "__MEATSHELL_INTERNAL_SETUP_1";
 const PROMPT_SETUP_DONE: &str = "\u{1b}]699;ready\u{07}";
-const PROMPT_BODY: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; : __MEATSHELL_INTERNAL_SETUP_1; if [ -n \"$BASH_VERSION\" ]; then __md=\"$(history 2>/dev/null | { __md=\"\"; while read -r __mn __mr; do case \"$__mr\" in *\"__ms7()\"*\"PROMPT_COMMAND=\"*) __mn=\"${__mn%\\*}\"; __md=\"$__mn $__md\";; esac; done; printf \"%s\" \"$__md\"; })\"; for __mn in $__md; do history -d \"$__mn\" 2>/dev/null; done; unset __md __mn __mr; fi; __cl=\"$(fc -ln -1 2>/dev/null)\"; printf \"\\033]699;ready\\007\"; __ms7'";
+const PROMPT_BODY_PREFIX: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; : __MEATSHELL_INTERNAL_SETUP_1; if [ -n \"$BASH_VERSION\" ]; then __md=\"$(history 2>/dev/null | { __md=\"\"; while read -r __mn __mr; do case \"$__mr\" in *\"__ms7()\"*\"PROMPT_COMMAND=\"*) __mn=\"${__mn%\\*}\"; __md=\"$__mn $__md\";; esac; done; printf \"%s\" \"$__md\"; })\"; for __mn in $__md; do history -d \"$__mn\" 2>/dev/null; done; unset __md __mn __mr; fi; __cl=\"$(fc -ln -1 2>/dev/null)\"; ";
+const PROMPT_BODY_SUFFIX: &str = "printf \"\\033]699;ready\\007\"; __ms7'";
+
+fn prompt_body() -> String {
+    format!("{PROMPT_BODY_PREFIX}{DOCKER_COMPLETION_SETUP}; {PROMPT_BODY_SUFFIX}")
+}
 const PROMPT_SHELL_PROBE: &[u8] = b"if [ -n \"$BASH_VERSION\" ]; then printf '__MEATSHELL_SHELL__:bash\\n'; elif [ -n \"$ZSH_VERSION\" ]; then printf '__MEATSHELL_SHELL__:zsh\\n'; else printf '__MEATSHELL_SHELL__:other\\n'; fi";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1732,7 +1738,7 @@ async fn run_session(
     // The echoed setup line is discarded through the private OSC 699 completion
     // marker emitted after installation (see the suppress block below), so zsh
     // redraws and soft wrapping cannot make the internal command visible.
-    let prompt_setup = format!(" {}\r", PROMPT_BODY);
+    let prompt_setup = format!(" {}\r", prompt_body());
     // --- Remote resource monitor (separate exec channel) ----------------
     // A tiny remote loop streams /proc/stat + /proc/meminfo every 2s; we parse
     // it into CPU% / mem / swap for the sidebar.  Best-effort: if the channel
@@ -3309,9 +3315,9 @@ fn _assert_handle_send() {
 #[cfg(test)]
 mod prompt_setup_echo_tests {
     use super::{
-        bound_prompt_setup_echo, prompt_setup_echo_end, prompt_setup_supported,
+        bound_prompt_setup_echo, prompt_body, prompt_setup_echo_end, prompt_setup_supported,
         strip_late_prompt_setup_echo, strip_pending_prompt_setup_echo, strip_prompt_setup_echo,
-        take_after_prompt_setup_done, PROMPT_BODY, PROMPT_SETUP_DONE, PROMPT_SETUP_HISTORY_MARKER,
+        take_after_prompt_setup_done, PROMPT_SETUP_DONE, PROMPT_SETUP_HISTORY_MARKER,
         PROMPT_SETUP_PREFIX,
     };
 
@@ -3334,45 +3340,58 @@ mod prompt_setup_echo_tests {
 
     #[test]
     fn bash_setup_removes_current_and_stale_history_entries() {
-        assert!(PROMPT_BODY.contains(PROMPT_SETUP_HISTORY_MARKER));
-        assert!(PROMPT_BODY.contains("history 2>/dev/null"));
-        assert!(PROMPT_BODY.contains("__ms7()"));
-        assert!(PROMPT_BODY.contains("history -d \"$__mn\""));
+        let body = prompt_body();
+        assert!(body.contains(PROMPT_SETUP_HISTORY_MARKER));
+        assert!(body.contains("history 2>/dev/null"));
+        assert!(body.contains("__ms7()"));
+        assert!(body.contains("history -d \"$__mn\""));
         // Re-prime command capture only after deleting the setup entry, so the
         // previous real user command does not get reported as newly executed.
-        assert!(PROMPT_BODY.find("history -d").unwrap() < PROMPT_BODY.rfind("__cl=").unwrap());
-        assert!(PROMPT_BODY.contains("699;ready"));
+        assert!(body.find("history -d").unwrap() < body.rfind("__cl=").unwrap());
+        assert!(body.contains("699;ready"));
     }
 
     #[test]
     fn prompt_setup_latches_docker_completion_mode_once() {
-        assert!(PROMPT_BODY.contains("__ms_docker_completion_mode"));
-        assert!(PROMPT_BODY.contains("complete -p docker"));
-        assert!(PROMPT_BODY.contains("__ms_docker_completion_registered"));
-        assert!(PROMPT_BODY.contains("__ms_docker_completion_mode=fallback"));
+        let body = prompt_body();
+        assert!(body.contains("__ms_docker_completion_mode"));
+        assert!(body.contains("complete -p docker"));
+        assert!(body.contains("__ms_docker_completion_registered"));
+        assert!(body.contains("__ms_docker_completion_mode=fallback"));
     }
 
     #[test]
     fn prompt_setup_covers_the_supported_docker_resource_commands() {
+        let body = prompt_body();
         for command in ["run", "exec", "start", "stop", "rm", "logs", "inspect"] {
             assert!(
-                PROMPT_BODY.contains(command),
+                body.contains(command),
                 "Docker completion setup is missing command {command}"
             );
         }
-        assert!(PROMPT_BODY.contains("docker image ls"));
-        assert!(PROMPT_BODY.contains("docker ps -a"));
+        assert!(body.contains("docker image ls"));
+        assert!(body.contains("docker ps -a"));
     }
 
     #[test]
     fn docker_completion_setup_runs_before_the_existing_ready_marker() {
-        let completion = PROMPT_BODY
+        let body = prompt_body();
+        let completion = body
             .find("__ms_docker_completion_mode")
             .expect("completion mode marker");
-        let ready = PROMPT_BODY
-            .find("699;ready")
-            .expect("prompt setup ready marker");
+        let ready = body.find("699;ready").expect("prompt setup ready marker");
         assert!(completion < ready);
+    }
+
+    #[test]
+    fn composed_prompt_body_keeps_docker_setup_inside_hidden_eval_before_ready() {
+        let body = prompt_body();
+        let completion = body
+            .find("__ms_docker_completion_mode")
+            .expect("Docker completion setup");
+        let ready = body.find("699;ready").expect("setup ready marker");
+        assert!(completion < ready);
+        assert!(!body.contains("docker image ls\n"));
     }
 
     #[test]
