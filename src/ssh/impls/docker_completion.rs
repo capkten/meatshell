@@ -240,4 +240,353 @@ mod tests {
         assert!(DOCKER_COMPLETION_SETUP.contains("docker ps -a"));
         assert!(DOCKER_COMPLETION_SETUP.contains("2>/dev/null"));
     }
+
+    #[cfg(unix)]
+    mod unix_shell_tests {
+        use super::DOCKER_COMPLETION_SETUP;
+        use std::ffi::OsString;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::{Command, Output};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+        const FAKE_DOCKER: &str = r#"#!/bin/sh
+if [ "${DOCKER_COMPLETION_FAIL:-0}" = 1 ]; then
+    exit 23
+elif [ "$1" = image ] && [ "$2" = ls ]; then
+    printf '%s\n' 'nginx:latest' 'node:20'
+elif [ "$1" = ps ] && [ "$2" = -a ]; then
+    printf '%s\t%s\n' 'abc123' 'web' 'def456' 'worker'
+fi
+"#;
+
+        struct FakeDocker {
+            dir: PathBuf,
+            path: OsString,
+        }
+
+        impl FakeDocker {
+            fn new() -> Self {
+                let suffix = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+                let dir = std::env::temp_dir().join(format!(
+                    "meatshell-docker-completion-{}-{suffix}",
+                    std::process::id()
+                ));
+                fs::create_dir(&dir).expect("create fake Docker directory");
+
+                let docker = dir.join("docker");
+                fs::write(&docker, FAKE_DOCKER).expect("write fake Docker executable");
+                fs::set_permissions(&docker, fs::Permissions::from_mode(0o755))
+                    .expect("make fake Docker executable");
+
+                let mut path = OsString::from(&dir);
+                if let Some(existing) = std::env::var_os("PATH") {
+                    path.push(":");
+                    path.push(existing);
+                }
+
+                Self { dir, path }
+            }
+
+            fn run(&self, script: &str, fail: bool) -> Output {
+                Command::new("bash")
+                    .arg("-c")
+                    .arg(script)
+                    .env("PATH", &self.path)
+                    .env("DOCKER_COMPLETION_FAIL", if fail { "1" } else { "0" })
+                    .env("DOCKER_COMPLETION_TEST_DIR", &self.dir)
+                    .output()
+                    .expect("start bash completion harness")
+            }
+
+            fn run_zsh(&self, script: &str, fail: bool) -> Output {
+                Command::new("zsh")
+                    .args(["-fc", script])
+                    .env("PATH", &self.path)
+                    .env("DOCKER_COMPLETION_FAIL", if fail { "1" } else { "0" })
+                    .env("DOCKER_COMPLETION_TEST_DIR", &self.dir)
+                    .output()
+                    .expect("start zsh completion harness")
+            }
+        }
+
+        impl Drop for FakeDocker {
+            fn drop(&mut self) {
+                fs::remove_dir_all(&self.dir).expect("remove fake Docker directory");
+            }
+        }
+
+        fn shell_quote(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "'\\''"))
+        }
+
+        fn run_bash(script: &str, fail: bool) -> Output {
+            let fixture = FakeDocker::new();
+            fixture.run(script, fail)
+        }
+
+        fn run_zsh(script: &str, fail: bool) -> Output {
+            let fixture = FakeDocker::new();
+            fixture.run_zsh(script, fail)
+        }
+
+        fn bash_candidates(words: &[&str], current_index: usize) -> Vec<String> {
+            let words = words
+                .iter()
+                .map(|word| shell_quote(word))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let script = format!(
+                "eval {}\nCOMP_WORDS=({words})\nCOMP_CWORD={current_index}\n__ms_docker_bash_complete\nprintf '%s\\n' \"${{COMPREPLY[@]}}\"",
+                shell_quote(DOCKER_COMPLETION_SETUP)
+            );
+            let output = run_bash(&script, false);
+            assert!(
+                output.status.success(),
+                "bash completion failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        #[test]
+        fn bash_run_completes_image_prefix() {
+            assert_eq!(
+                bash_candidates(&["docker", "run", "ng"], 2),
+                vec!["nginx:latest".to_string()]
+            );
+        }
+
+        #[test]
+        fn bash_exec_completes_container_prefix() {
+            assert_eq!(
+                bash_candidates(&["docker", "exec", "we"], 2),
+                vec!["web".to_string()]
+            );
+        }
+
+        #[test]
+        fn bash_inspect_merges_container_and_image_candidates() {
+            assert_eq!(
+                bash_candidates(&["docker", "inspect", ""], 2),
+                vec![
+                    "abc123".to_string(),
+                    "def456".to_string(),
+                    "nginx:latest".to_string(),
+                    "node:20".to_string(),
+                    "web".to_string(),
+                    "worker".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn bash_run_stops_image_completion_after_the_image_position() {
+            assert!(bash_candidates(&["docker", "run", "nginx", "sh"], 3).is_empty());
+        }
+
+        #[test]
+        fn native_completion_latches_without_replacing_or_reinstalling_it() {
+            let script = format!(
+                r#"
+native_docker_complete() {{ COMPREPLY=(native); }}
+complete -F native_docker_complete docker
+eval {}
+first_mode=$__ms_docker_completion_mode
+first_registered=${{__ms_docker_completion_registered-<unset>}}
+first_spec=$(builtin complete -p docker)
+complete -r docker
+eval {}
+second_mode=$__ms_docker_completion_mode
+second_registered=${{__ms_docker_completion_registered-<unset>}}
+set +e
+second_spec=$(builtin complete -p docker 2>&1)
+second_status=$?
+set -e
+printf 'first_mode=%s\nfirst_registered=%s\nfirst_spec=%s\nsecond_mode=%s\nsecond_registered=%s\nsecond_spec=%s\nsecond_status=%s\n' \
+    "$first_mode" "$first_registered" "$first_spec" "$second_mode" "$second_registered" "$second_spec" "$second_status"
+"#,
+                shell_quote(DOCKER_COMPLETION_SETUP),
+                shell_quote(DOCKER_COMPLETION_SETUP)
+            );
+            let output = run_bash(&script, false);
+            assert!(
+                output.status.success(),
+                "native latch harness failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("first_mode=native"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_registered=<unset>"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_spec=complete -F native_docker_complete docker"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_mode=native"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_registered=<unset>"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_status=1"),
+                "captured output: {stdout}"
+            );
+        }
+
+        #[test]
+        fn fallback_completion_latches_without_repeating_native_probe() {
+            let script = format!(
+                r#"
+probe_count=0
+complete() {{
+    if [ "$1" = -p ] && [ "$2" = docker ]; then
+        probe_count=$((probe_count + 1))
+    fi
+    builtin complete "$@"
+}}
+builtin complete -r docker 2>/dev/null || true
+eval {}
+first_mode=$__ms_docker_completion_mode
+first_registered=${{__ms_docker_completion_registered-<unset>}}
+first_spec=$(builtin complete -p docker)
+eval {}
+second_mode=$__ms_docker_completion_mode
+second_registered=${{__ms_docker_completion_registered-<unset>}}
+second_spec=$(builtin complete -p docker)
+printf 'probe_count=%s\nfirst_mode=%s\nfirst_registered=%s\nfirst_spec=%s\nsecond_mode=%s\nsecond_registered=%s\nsecond_spec=%s\n' \
+    "$probe_count" "$first_mode" "$first_registered" "$first_spec" "$second_mode" "$second_registered" "$second_spec"
+"#,
+                shell_quote(DOCKER_COMPLETION_SETUP),
+                shell_quote(DOCKER_COMPLETION_SETUP)
+            );
+            let output = run_bash(&script, false);
+            assert!(
+                output.status.success(),
+                "fallback latch harness failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("probe_count=1"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_mode=fallback"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_registered=1"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_spec=complete -F __ms_docker_bash_complete docker"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_mode=fallback"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_registered=1"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_spec=complete -F __ms_docker_bash_complete docker"),
+                "captured output: {stdout}"
+            );
+        }
+
+        #[test]
+        fn failed_docker_query_returns_no_candidates_or_shell_output() {
+            let script = format!(
+                r#"
+eval {}
+COMP_WORDS=(docker run ng)
+COMP_CWORD=2
+__ms_docker_bash_complete >"$DOCKER_COMPLETION_TEST_DIR/stdout" 2>"$DOCKER_COMPLETION_TEST_DIR/stderr"
+status=$?
+printf 'status=%s\nreply_count=%s\nstdout=%s\nstderr=%s\n' \
+    "$status" "${{#COMPREPLY[@]}}" "$(cat "$DOCKER_COMPLETION_TEST_DIR/stdout")" "$(cat "$DOCKER_COMPLETION_TEST_DIR/stderr")"
+"#,
+                shell_quote(DOCKER_COMPLETION_SETUP)
+            );
+            let output = run_bash(&script, true);
+            assert!(
+                output.status.success(),
+                "failed-query harness failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.contains("status=0"), "captured output: {stdout}");
+            assert!(
+                stdout.contains("reply_count=0"),
+                "captured output: {stdout}"
+            );
+            assert!(stdout.contains("stdout=\n"), "captured output: {stdout}");
+            assert!(stdout.contains("stderr=\n"), "captured output: {stdout}");
+        }
+
+        #[test]
+        fn zsh_smoke_completes_container_prefix_when_available() {
+            let available = Command::new("zsh")
+                .args(["-fc", "exit 0"])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            if !available {
+                eprintln!("skipped zsh smoke test: zsh is unavailable");
+                return;
+            }
+
+            let script = format!(
+                r#"
+compdef() {{
+    [ "$1" = -p ] && return 1
+    return 0
+}}
+compadd() {{
+    local candidate
+    for candidate in "$@"; do
+        case "$candidate" in
+            -Q|--) ;;
+            *) [[ "$candidate" == "$words[$CURRENT]"* ]] && print -r -- "$candidate" ;;
+        esac
+    done
+}}
+eval {}
+words=(docker exec we)
+CURRENT=3
+_ms_docker_zsh_complete
+"#,
+                shell_quote(DOCKER_COMPLETION_SETUP)
+            );
+            let output = run_zsh(&script, false);
+            assert!(
+                output.status.success(),
+                "zsh smoke harness failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .collect::<Vec<_>>(),
+                vec!["web"]
+            );
+        }
+    }
 }
