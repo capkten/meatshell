@@ -627,6 +627,7 @@ _ms_docker_zsh_complete
             let script = format!(
                 r#"
 typeset -A _comps
+native_docker_complete() {{ return 0 }}
 _comps[docker]=native_docker_complete
 compdef_calls=0
 compdef() {{
@@ -637,11 +638,16 @@ compdef() {{
 eval {}
 first_mode=$__ms_docker_completion_mode
 first_binding=$_comps[docker]
+unset '_comps[docker]'
 eval {}
 second_mode=$__ms_docker_completion_mode
-second_binding=$_comps[docker]
-printf 'compdef_calls=%s\nfirst_mode=%s\nfirst_binding=%s\nsecond_mode=%s\nsecond_binding=%s\n' \
-    "$compdef_calls" "$first_mode" "$first_binding" "$second_mode" "$second_binding"
+binding_present=0
+(( ${{+_comps[docker]}} )) && binding_present=1
+registered_present=0
+[ -n "${{__ms_docker_completion_registered+x}}" ] && registered_present=1
+printf 'compdef_calls=%s\nfirst_mode=%s\nfirst_binding=%s\nsecond_mode=%s\nbinding_present=%s\nregistered_present=%s\n' \
+    "$compdef_calls" "$first_mode" "$first_binding" "$second_mode" \
+    "$binding_present" "$registered_present"
 "#,
                 shell_quote(DOCKER_COMPLETION_SETUP),
                 shell_quote(DOCKER_COMPLETION_SETUP)
@@ -670,7 +676,11 @@ printf 'compdef_calls=%s\nfirst_mode=%s\nfirst_binding=%s\nsecond_mode=%s\nsecon
                 "captured output: {stdout}"
             );
             assert!(
-                stdout.contains("second_binding=native_docker_complete"),
+                stdout.contains("binding_present=0"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("registered_present=0"),
                 "captured output: {stdout}"
             );
         }
