@@ -1,5 +1,4 @@
-pub(crate) const DOCKER_COMPLETION_SETUP: &str = r#"
-if [ -z "${__ms_docker_completion_mode+x}" ]; then
+pub(crate) const DOCKER_COMPLETION_SETUP: &str = r#"if [ -z "${__ms_docker_completion_mode+x}" ]; then
     if [ -n "$BASH_VERSION" ]; then
         if complete -p docker >/dev/null 2>&1; then
             __ms_docker_completion_mode=native
@@ -198,8 +197,7 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
     elif [ -n "$ZSH_VERSION" ]; then
         compdef _ms_docker_zsh_complete docker
     fi
-fi
-"#;
+fi"#;
 
 #[cfg(test)]
 mod tests {
@@ -209,6 +207,12 @@ mod tests {
     fn setup_is_safe_to_embed_in_the_existing_single_quoted_eval() {
         assert!(!DOCKER_COMPLETION_SETUP.contains('\''));
         assert!(DOCKER_COMPLETION_SETUP.contains("__ms_docker_completion_mode"));
+    }
+
+    #[test]
+    fn setup_has_no_boundary_newlines_for_prompt_composition() {
+        assert!(!DOCKER_COMPLETION_SETUP.starts_with('\n'));
+        assert!(!DOCKER_COMPLETION_SETUP.ends_with('\n'));
     }
 
     #[test]
