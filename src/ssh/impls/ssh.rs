@@ -3345,6 +3345,37 @@ mod prompt_setup_echo_tests {
     }
 
     #[test]
+    fn prompt_setup_latches_docker_completion_mode_once() {
+        assert!(PROMPT_BODY.contains("__ms_docker_completion_mode"));
+        assert!(PROMPT_BODY.contains("complete -p docker"));
+        assert!(PROMPT_BODY.contains("__ms_docker_completion_registered"));
+        assert!(PROMPT_BODY.contains("__ms_docker_completion_mode=fallback"));
+    }
+
+    #[test]
+    fn prompt_setup_covers_the_supported_docker_resource_commands() {
+        for command in ["run", "exec", "start", "stop", "rm", "logs", "inspect"] {
+            assert!(
+                PROMPT_BODY.contains(command),
+                "Docker completion setup is missing command {command}"
+            );
+        }
+        assert!(PROMPT_BODY.contains("docker image ls"));
+        assert!(PROMPT_BODY.contains("docker ps -a"));
+    }
+
+    #[test]
+    fn docker_completion_setup_runs_before_the_existing_ready_marker() {
+        let completion = PROMPT_BODY
+            .find("__ms_docker_completion_mode")
+            .expect("completion mode marker");
+        let ready = PROMPT_BODY
+            .find("699;ready")
+            .expect("prompt setup ready marker");
+        assert!(completion < ready);
+    }
+
+    #[test]
     fn completion_marker_hides_corrupted_large_zsh_redraws() {
         let mut buffered = "cst test -z redraw\r".repeat(5000);
         buffered.push_str(PROMPT_SETUP_DONE);
