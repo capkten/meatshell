@@ -6,9 +6,9 @@ pub(crate) const DOCKER_COMPLETION_SETUP: &str = r#"if [ -z "${__ms_docker_compl
             __ms_docker_completion_mode=fallback
         fi
     elif [ -n "$ZSH_VERSION" ]; then
-        if command -v compdef >/dev/null 2>&1 && compdef -p docker >/dev/null 2>&1; then
+        if (( ${+_comps[docker]} )); then
             __ms_docker_completion_mode=native
-        elif command -v compdef >/dev/null 2>&1; then
+        elif command -v compdef >/dev/null 2>&1 && (( ${+_comps} )); then
             __ms_docker_completion_mode=fallback
         else
             __ms_docker_completion_mode=unavailable
@@ -226,6 +226,12 @@ mod tests {
         assert!(DOCKER_COMPLETION_SETUP.contains("__ms_docker_completion_registered"));
         assert!(DOCKER_COMPLETION_SETUP.contains("__ms_docker_completion_mode=native"));
         assert!(DOCKER_COMPLETION_SETUP.contains("__ms_docker_completion_mode=fallback"));
+    }
+
+    #[test]
+    fn zsh_native_probe_reads_comps_registry_without_compdef_query() {
+        assert!(DOCKER_COMPLETION_SETUP.contains("${+_comps[docker]}"));
+        assert!(!DOCKER_COMPLETION_SETUP.contains("compdef -p docker"));
     }
 
     #[test]
@@ -571,6 +577,7 @@ printf 'status=%s\nreply_count=%s\nstdout_bytes=%s\nstderr_bytes=%s\n' \
 
             let script = format!(
                 r#"
+typeset -A _comps
 compdef() {{
     [ "$1" = -p ] && return 1
     return 0
@@ -602,6 +609,69 @@ _ms_docker_zsh_complete
                     .lines()
                     .collect::<Vec<_>>(),
                 vec!["web"]
+            );
+        }
+
+        #[test]
+        fn zsh_native_binding_is_detected_without_replacement_when_available() {
+            let available = Command::new("zsh")
+                .args(["-fc", "exit 0"])
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false);
+            if !available {
+                eprintln!("skipped zsh native-binding test: zsh is unavailable");
+                return;
+            }
+
+            let script = format!(
+                r#"
+typeset -A _comps
+_comps[docker]=native_docker_complete
+compdef_calls=0
+compdef() {{
+    compdef_calls=$((compdef_calls + 1))
+    [ "$1" = -p ] && return 1
+    _comps[docker]="$1"
+}}
+eval {}
+first_mode=$__ms_docker_completion_mode
+first_binding=$_comps[docker]
+eval {}
+second_mode=$__ms_docker_completion_mode
+second_binding=$_comps[docker]
+printf 'compdef_calls=%s\nfirst_mode=%s\nfirst_binding=%s\nsecond_mode=%s\nsecond_binding=%s\n' \
+    "$compdef_calls" "$first_mode" "$first_binding" "$second_mode" "$second_binding"
+"#,
+                shell_quote(DOCKER_COMPLETION_SETUP),
+                shell_quote(DOCKER_COMPLETION_SETUP)
+            );
+            let output = run_zsh(&script, false);
+            assert!(
+                output.status.success(),
+                "zsh native-binding harness failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("compdef_calls=0"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_mode=native"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("first_binding=native_docker_complete"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_mode=native"),
+                "captured output: {stdout}"
+            );
+            assert!(
+                stdout.contains("second_binding=native_docker_complete"),
+                "captured output: {stdout}"
             );
         }
     }
