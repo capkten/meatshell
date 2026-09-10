@@ -1,3 +1,5 @@
+#[path = "impls/docker_completion.rs"]
+mod docker_completion;
 #[path = "impls/known_hosts.rs"]
 pub(crate) mod known_hosts;
 #[path = "impls/ppk.rs"]
