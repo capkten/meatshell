@@ -676,6 +676,15 @@ fn open_window(
     proc_win.set_sort_descending(true);
     let sys_win = Rc::new(SystemInfoWindow::new().context("failed to build system info window")?);
     let docker_win = Rc::new(DockerWindow::new().context("failed to build Docker window")?);
+    let docker_containers_model: Rc<VecModel<DockerContainerRow>> = Rc::new(VecModel::default());
+    let docker_images_model: Rc<VecModel<DockerImageRow>> = Rc::new(VecModel::default());
+    let docker_details_model: Rc<VecModel<DockerDetailRow>> = Rc::new(VecModel::default());
+    window.set_docker_containers(ModelRc::from(docker_containers_model.clone()));
+    window.set_docker_images(ModelRc::from(docker_images_model.clone()));
+    window.set_docker_details(ModelRc::from(docker_details_model.clone()));
+    docker_win.set_containers(ModelRc::from(docker_containers_model));
+    docker_win.set_images(ModelRc::from(docker_images_model));
+    docker_win.set_details(ModelRc::from(docker_details_model));
     // Every fallible construction has now succeeded — register the window.
     // (cascade_origin above was captured before this point, as required.)
     let window_id = registry.register(window.as_weak());
@@ -1519,6 +1528,7 @@ fn open_window(
         let store = store.clone();
         let bufs_wp = bufs.clone();
         let proc_weak = proc_win.as_weak();
+        let docker_weak = docker_win.as_weak();
         let registry = registry.clone();
         window.on_set_wallpaper(move |id: SharedString| {
             let id = id.to_string();
@@ -1531,6 +1541,9 @@ fn open_window(
                 // Keep an already-open process window in sync with the change.
                 if let Some(p) = proc_weak.upgrade() {
                     sync_proc_theme(&w, &p);
+                }
+                if let Some(docker) = docker_weak.upgrade() {
+                    sync_docker_theme(&w, &docker);
                 }
             }
             {
@@ -1556,6 +1569,7 @@ fn open_window(
         let store = store.clone();
         let bufs_wp = bufs.clone();
         let proc_weak = proc_win.as_weak();
+        let docker_weak = docker_win.as_weak();
         window.on_pick_wallpaper_file(move || {
             let picked = rfd::FileDialog::new()
                 .set_title("选择壁纸 / Choose wallpaper")
@@ -1567,6 +1581,9 @@ fn open_window(
                     apply_wallpaper(&w, &store.borrow(), &bufs_wp, &id, false);
                     if let Some(p) = proc_weak.upgrade() {
                         sync_proc_theme(&w, &p);
+                    }
+                    if let Some(docker) = docker_weak.upgrade() {
+                        sync_docker_theme(&w, &docker);
                     }
                 }
                 let mut s = store.borrow_mut();
@@ -1589,6 +1606,7 @@ fn open_window(
         let store = store.clone();
         let sessions_model = sessions_model.clone();
         let bufs = bufs.clone();
+        let docker_weak = docker_win.as_weak();
         registry.add_config_listener(
             window_id,
             Rc::new(move || {
@@ -1597,6 +1615,9 @@ fn open_window(
                 sync_sessions_for_window(&weak, &store.borrow(), &sessions_model);
                 // Re-apply the theme to the chrome AND every open terminal buffer.
                 apply_dark_mode(&w, &bufs, theme_pref_is_dark(&store.borrow()));
+                if let Some(docker) = docker_weak.upgrade() {
+                    sync_docker_theme(&w, &docker);
+                }
                 // Language translations are process-global; refresh our flag only.
                 w.set_lang_en(crate::i18n::is_en());
                 // Command-bar visibility is a global preference.
@@ -2323,6 +2344,7 @@ fn open_window(
         let store = store.clone();
         let bufs_theme = bufs.clone();
         let proc_weak = proc_win.as_weak();
+        let docker_weak = docker_win.as_weak();
         let registry = registry.clone();
         window.on_toggle_theme(move || {
             let Some(w) = weak.upgrade() else { return };
@@ -2333,6 +2355,9 @@ fn open_window(
             // is a separate instance) so an open process window follows.
             if let Some(p) = proc_weak.upgrade() {
                 sync_proc_theme(&w, &p);
+            }
+            if let Some(docker) = docker_weak.upgrade() {
+                sync_docker_theme(&w, &docker);
             }
             let pref = if next_dark { "dark" } else { "light" };
             {

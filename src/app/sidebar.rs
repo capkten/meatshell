@@ -5,11 +5,14 @@ fn dynamic_sidebar_visible(active: bool, collapsed: bool) -> bool {
 }
 
 pub(super) fn docker_refresh_needed(
-    dynamic_ui_active: bool,
+    _dynamic_ui_active: bool,
     sidebar_visible: bool,
     window_open: bool,
 ) -> bool {
-    sidebar_visible || (dynamic_ui_active && window_open)
+    // `dynamic_ui_active` describes the main window only. A detached Docker
+    // window remains a live user-visible surface when the main window is
+    // unfocused, minimized, or occluded, so its open state must stand alone.
+    sidebar_visible || window_open
 }
 
 #[cfg(test)]
@@ -20,7 +23,7 @@ mod docker_lifecycle_tests {
     fn docker_refresh_is_needed_only_when_sidebar_or_window_is_visible() {
         assert!(docker_refresh_needed(true, false, true));
         assert!(docker_refresh_needed(false, true, true));
-        assert!(!docker_refresh_needed(false, false, true));
+        assert!(docker_refresh_needed(false, false, true));
         assert!(!docker_refresh_needed(true, false, false));
     }
 

@@ -71,3 +71,57 @@ The pre-existing untracked `.superpowers/brainstorm/` directory was not touched.
 ### Commit
 
 Committed as `feat: connect docker monitor to active tab lifecycle`.
+
+## Review follow-up
+
+### Findings and fixes
+
+1. Fixed detached-window refresh gating. `dynamic_ui_active` belongs to the
+   main window and can become false for focus, minimize, or occlusion while a
+   detached Docker window remains visible. Docker refresh eligibility now
+   treats `sidebar_visible || window_open` as the surface decision. The
+   existing sidebar helper still gates the sidebar for active, expanded, and
+   non-zen state; a hidden Docker window therefore remains idle.
+2. Added `docker-containers`, `docker-images`, and `docker-details` model
+   properties to `AppWindow`. Each is initialized once and the exact same
+   `ModelRc` is attached to both AppWindow and the retained DockerWindow.
+3. Extended the existing theme, scale, wallpaper, and cross-window preference
+   paths to synchronize the retained DockerWindow without creating another
+   window or changing unrelated detached windows.
+4. Audited the additional lifecycle files. `resource_ui.rs`, `sidebar.rs`,
+   `tab_transfer.rs`, `session/struct/prompts.rs`, `ui/app.slint`, and
+   `session_event.rs` each retain only Docker lifecycle, model, theme, teardown,
+   reconnect, or invalidation wiring required by Task 6.
+
+### Review TDD evidence
+
+The new regression assertion was run before the production change and failed
+on the old implementation for `dynamic_ui_active=false,
+sidebar_visible=false, window_open=true`. After the helper change, the focused
+visibility suite passed 2/2.
+
+### Required verification order
+
+```
+cargo fmt --all -- --check
+passed
+
+cargo clippy --all-targets -- -D warnings
+failed only on the known repository-wide pre-existing baseline (77/78
+diagnostics by target); no Task 6-specific diagnostic after the fix
+
+cargo test --locked
+302 passed; 0 failed
+
+cargo check
+passed
+```
+
+The focused lifecycle tests also passed:
+
+```
+cargo test app::sidebar::docker_lifecycle_tests
+2 passed; 0 failed
+```
+
+The follow-up is committed as a focused fix to the Task 6 implementation.

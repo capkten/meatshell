@@ -497,6 +497,9 @@ export component AppWindow inherits Window {
     in property <int> docker-container-count;
     in property <int> docker-running-count;
     in property <int> docker-image-count;
+    in property <[DockerContainerRow]> docker-containers;
+    in property <[DockerImageRow]> docker-images;
+    in property <[DockerDetailRow]> docker-details;
     in-out property <bool> docker-window-open: false;
     in property <bool> system-info-available; // connected Linux session only (#268)
     in property <[SysMetricRow]> sys-metrics;
