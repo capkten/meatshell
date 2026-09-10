@@ -37,6 +37,7 @@ pub(crate) struct ConnectCtx {
     /// route here so a later detach/merge can retarget the running pumps
     /// at another window without respawning them (#tab-detach).
     pub(crate) tab_routes: crate::app::core::TabRoutes,
+    pub(crate) docker: Rc<crate::app::docker::DockerController>,
 }
 
 pub(crate) struct PendingHostKey {

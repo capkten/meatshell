@@ -672,6 +672,16 @@ pub(super) fn sync_system_info_theme(main: &AppWindow, sys: &SystemInfoWindow) {
     sys.set_wp_tint(main.get_wp_tint());
 }
 
+pub(super) fn sync_docker_theme(main: &AppWindow, docker: &DockerWindow) {
+    docker.set_dark_mode(main.get_dark_mode());
+    docker.set_ui_scale(main.get_ui_scale());
+    docker.set_ui_font_family(main.get_ui_font_family());
+    docker.set_wallpaper_img(main.get_wallpaper_img());
+    docker.set_wallpaper_active(main.get_wallpaper_active());
+    docker.set_wp_accent(main.get_wp_accent());
+    docker.set_wp_tint(main.get_wp_tint());
+}
+
 pub(super) fn place_system_info_window(main: &AppWindow, sys: &SystemInfoWindow) {
     let Some((mon_x, mon_y, mon_w, mon_h)) = main
         .window()
@@ -734,6 +744,25 @@ pub(super) fn place_process_window(main: &AppWindow, process: &ProcWindow) {
     let x = origin.x + monitor_size.width.saturating_sub(window_size.width) as i32 / 2;
     let y = origin.y + monitor_size.height.saturating_sub(window_size.height) as i32 / 2;
     process
+        .window()
+        .set_position(slint::PhysicalPosition::new(x, y));
+}
+
+pub(super) fn place_docker_window(main: &AppWindow, docker: &DockerWindow) {
+    let monitor = main
+        .window()
+        .with_winit_window(|ww| ww.current_monitor().or_else(|| ww.primary_monitor()))
+        .flatten();
+    let Some(monitor) = monitor else { return };
+    let origin = monitor.position();
+    let monitor_size = monitor.size();
+    let window_size = docker
+        .window()
+        .with_winit_window(|ww| ww.outer_size())
+        .unwrap_or_default();
+    let x = origin.x + monitor_size.width.saturating_sub(window_size.width) as i32 / 2;
+    let y = origin.y + monitor_size.height.saturating_sub(window_size.height) as i32 / 2;
+    docker
         .window()
         .set_position(slint::PhysicalPosition::new(x, y));
 }

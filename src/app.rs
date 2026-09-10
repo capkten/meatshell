@@ -7,7 +7,7 @@
 //!   * Route Slint callbacks to the right domain module.
 mod auth_dialogs;
 pub(crate) mod core;
-mod docker;
+pub(crate) mod docker;
 #[cfg(windows)]
 mod jump_list;
 pub mod launch;
@@ -213,6 +213,7 @@ fn teardown_window(
     sftp_handles: &SftpHandles,
     proc_weak: &slint::Weak<ProcWindow>,
     sys_weak: &slint::Weak<SystemInfoWindow>,
+    docker_weak: &slint::Weak<DockerWindow>,
 ) {
     abort_window_prompts(window_id);
     {
@@ -232,6 +233,9 @@ fn teardown_window(
         let _ = w.hide();
     }
     if let Some(w) = sys_weak.upgrade() {
+        let _ = w.hide();
+    }
+    if let Some(w) = docker_weak.upgrade() {
         let _ = w.hide();
     }
 }
@@ -587,6 +591,7 @@ fn open_window(
     // Per-tab SSH handles (shell only; lives on Slint thread via Rc).
     let handles: Rc<RefCell<HashMap<String, SessionHandle>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    let docker_slot: Rc<RefCell<Option<Rc<DockerController>>>> = Rc::new(RefCell::new(None));
 
     // Per-tab SFTP handles — Arc<Mutex> so the event-pump OS thread and the
     // Slint UI thread can both post SftpCommands.
@@ -1926,7 +1931,6 @@ fn open_window(
     let tab_statuses: TabStatuses = Arc::new(Mutex::new(HashMap::new()));
     let local_snap: LocalSnap = Arc::new(Mutex::new(SystemSnapshot::default()));
     let local_net_hist: NetHist = Arc::new(Mutex::new(vec![0.0; NET_HISTORY_LEN]));
-    let docker_slot: Rc<RefCell<Option<Rc<DockerController>>>> = Rc::new(RefCell::new(None));
     let docker = DockerController::new(
         runtime.clone(),
         handles.clone(),
@@ -2011,6 +2015,8 @@ fn open_window(
             sys_win: sys_win.clone(),
             proc_weak: proc_win.as_weak(),
             sys_weak: sys_win.as_weak(),
+            docker_win: docker_win.clone(),
+            docker_weak: docker_win.as_weak(),
             docker: docker_slot.clone(),
         },
     );
@@ -2121,6 +2127,7 @@ fn open_window(
         local_net_hist.clone(),
         sftp_follow_cd.clone(),
         core.tab_routes.clone(),
+        docker.clone(),
         tab_titles.clone(),
     );
 
@@ -2134,8 +2141,17 @@ fn open_window(
         let docker = docker.clone();
         window.on_refresh_sidebar(move || {
             if let Some(w) = weak.upgrade() {
-                docker.refresh_target(target_for_tab(&w.get_active_tab_id(), &statuses));
-                docker.render();
+                let target = target_for_tab(&w.get_active_tab_id(), &statuses);
+                let needs_refresh = docker.begin_target(target) || docker.target_needs_refresh();
+                if needs_refresh
+                    && docker_refresh_needed(
+                        w.get_dynamic_ui_active() && !w.get_zen_mode(),
+                        sidebar_updates_visible(&w),
+                        w.get_docker_window_open(),
+                    )
+                {
+                    docker.refresh_now();
+                }
                 refresh_sidebar(&w, &statuses, &local, &net);
             }
         });
@@ -2151,16 +2167,34 @@ fn open_window(
         window.on_open_docker(move || {
             let Some(main) = weak.upgrade() else { return };
             let target = target_for_tab(&main.get_active_tab_id(), &statuses);
-            docker.refresh_target(target);
-            docker_win.set_dark_mode(main.get_dark_mode());
-            docker_win.set_ui_scale(main.get_ui_scale());
-            docker_win.set_wallpaper_active(main.get_wallpaper_active());
-            docker_win.set_wallpaper_img(main.get_wallpaper_img());
+            docker.begin_target(target);
+            sync_docker_theme(&main, &docker_win);
             main.set_docker_window_open(true);
             docker.render();
             refresh_sidebar(&main, &statuses, &local, &net);
             let _ = docker_win.show();
+            place_docker_window(&main, &docker_win);
+            docker.refresh_now();
             docker_win.window().with_winit_window(|w| w.focus_window());
+        });
+    }
+
+    {
+        let docker = docker.clone();
+        let weak = window.as_weak();
+        window.on_invalidate_docker_target(move |tab_id| {
+            docker.invalidate_target(tab_id.as_str());
+            if let Some(w) = weak.upgrade() {
+                if w.get_active_tab_id() == tab_id
+                    && docker_refresh_needed(
+                        w.get_dynamic_ui_active() && !w.get_zen_mode(),
+                        sidebar_updates_visible(&w),
+                        w.get_docker_window_open(),
+                    )
+                {
+                    docker.refresh_now();
+                }
+            }
         });
     }
 
@@ -2178,6 +2212,41 @@ fn open_window(
         docker_win.on_refresh({
             let docker = docker.clone();
             move || docker.refresh_now()
+        });
+        docker_win.on_win_drag({
+            let weak = docker_win.as_weak();
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    w.window().with_winit_window(|ww| {
+                        let _ = ww.drag_window();
+                    });
+                    schedule_slint_pointer_ungrab(weak.clone());
+                }
+            }
+        });
+        docker_win.on_win_resize_east({
+            let weak = docker_win.as_weak();
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    use i_slint_backend_winit::winit::window::ResizeDirection;
+                    w.window().with_winit_window(|ww| {
+                        let _ = ww.drag_resize_window(ResizeDirection::East);
+                    });
+                    schedule_slint_pointer_ungrab(weak.clone());
+                }
+            }
+        });
+        docker_win.on_win_resize_se({
+            let weak = docker_win.as_weak();
+            move || {
+                if let Some(w) = weak.upgrade() {
+                    use i_slint_backend_winit::winit::window::ResizeDirection;
+                    w.window().with_winit_window(|ww| {
+                        let _ = ww.drag_resize_window(ResizeDirection::SouthEast);
+                    });
+                    schedule_slint_pointer_ungrab(weak.clone());
+                }
+            }
         });
         docker_win.on_search_changed({
             let docker = docker.clone();
@@ -2604,6 +2673,7 @@ fn open_window(
             sftp_follow_cd: sftp_follow_cd.clone(),
             store: store.clone(),
             tab_routes: core.tab_routes.clone(),
+            docker: docker.clone(),
         },
     );
 
@@ -2670,7 +2740,11 @@ fn open_window(
 
             // Everything (status, CPU/mem/swap, both graphs) follows the
             // active tab; refresh_sidebar reads the stores we just updated.
-            if sidebar_updates_visible(&window) {
+            if docker_refresh_needed(
+                window.get_dynamic_ui_active() && !window.get_zen_mode(),
+                sidebar_updates_visible(&window),
+                window.get_docker_window_open(),
+            ) {
                 tick_docker.render();
                 refresh_sidebar(&window, &tick_statuses, &tick_local, &tick_net);
             }
@@ -2680,6 +2754,30 @@ fn open_window(
     // WindowState timers vec, which forget_window_state drops on close
     // (Slint timers stop when dropped) — no leaking needed.
     window_timers.borrow_mut().push(timer);
+
+    // Docker has its own cadence: it must keep a detached window live even
+    // when the main window is unfocused, while remaining completely idle when
+    // both the sidebar block and detached window are hidden.
+    let docker_timer = slint::Timer::default();
+    let docker_tick_weak = window.as_weak();
+    let docker_tick = docker.clone();
+    docker_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_secs(5),
+        move || {
+            let Some(w) = docker_tick_weak.upgrade() else {
+                return;
+            };
+            if docker_refresh_needed(
+                w.get_dynamic_ui_active() && !w.get_zen_mode(),
+                sidebar_updates_visible(&w),
+                w.get_docker_window_open(),
+            ) {
+                docker_tick.refresh_now();
+            }
+        },
+    );
+    window_timers.borrow_mut().push(docker_timer);
 
     // OS file drag-and-drop → upload to the active session's SFTP directory,
     // but only when the file is dropped over the file-list area.
@@ -2695,6 +2793,7 @@ fn open_window(
         let close_sftp_handles = sftp_handles.clone();
         let ev_proc_weak = proc_win.as_weak();
         let ev_sys_weak = sys_win.as_weak();
+        let ev_docker_weak = docker_win.as_weak();
         let ev_store = store.clone();
         let ev_activity = activity.clone();
         let ev_exit_confirmed = exit_confirmed.clone();
@@ -3051,6 +3150,7 @@ fn open_window(
                             &close_sftp_handles,
                             &ev_proc_weak,
                             &ev_sys_weak,
+                            &ev_docker_weak,
                         );
                         if ev_registry.unregister(window_id) {
                             let _ = slint::quit_event_loop();
@@ -3067,6 +3167,7 @@ fn open_window(
         let weak = window.as_weak();
         let proc_weak = proc_win.as_weak();
         let sys_weak = sys_win.as_weak();
+        let docker_weak = docker_win.as_weak();
         let cc_store = store.clone();
         let close_handles = handles.clone();
         let close_sftp_handles = sftp_handles.clone();
@@ -3095,6 +3196,7 @@ fn open_window(
                 &close_sftp_handles,
                 &proc_weak,
                 &sys_weak,
+                &docker_weak,
             );
             if close_registry.unregister(window_id) {
                 let _ = slint::quit_event_loop();
@@ -3133,6 +3235,7 @@ fn open_window(
         let close_sftp_handles = sftp_handles.clone();
         let wc_proc_weak = proc_win.as_weak();
         let wc_sys_weak = sys_win.as_weak();
+        let wc_docker_weak = docker_win.as_weak();
         let wc_store = store.clone();
         let wc_exit_confirmed = exit_confirmed.clone();
         let wc_registry = registry.clone();
@@ -3153,6 +3256,7 @@ fn open_window(
                         &close_sftp_handles,
                         &wc_proc_weak,
                         &wc_sys_weak,
+                        &wc_docker_weak,
                     );
                     let _ = w.hide();
                     if wc_registry.unregister(window_id) {
@@ -3700,6 +3804,7 @@ fn wire_session_callbacks(
     local_net_hist: NetHist,
     sftp_follow_cd: Arc<std::sync::atomic::AtomicBool>,
     tab_routes: TabRoutes,
+    docker: Rc<DockerController>,
     tab_titles: Rc<RefCell<HashMap<String, String>>>,
 ) {
     // Working set of port forwards (#56) for the session being created/edited.
@@ -4960,6 +5065,7 @@ fn wire_session_callbacks(
                 sftp_follow_cd: sftp_follow_cd.clone(),
                 store: store.clone(),
                 tab_routes: tab_routes.clone(),
+                docker: docker.clone(),
             };
             start_session_in_tab(&tab_id, session, &ctx);
         });
@@ -5818,6 +5924,7 @@ fn wire_key_input(
                     }
                     // Fresh session: the first OSC 7 after reconnect follows.
                     ctx.sftp_last_cwd.lock().unwrap().remove(tab_id.as_str());
+                    ctx.docker.invalidate_target(tab_id.as_str());
                     if let Some(w) = ctx.weak.upgrade() {
                         set_terminal_row(&w, tab_id.as_str(), |t| {
                             t.status =

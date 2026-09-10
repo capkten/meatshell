@@ -16,7 +16,8 @@ use crate::sftp::{SftpHandles, SftpLastCwd};
 use crate::ssh::SessionHandle;
 use crate::terminal::{RenderGates, TermBuffers};
 use crate::ui::{
-    AppWindow, PaneInfo, ProcWindow, SplitterInfo, SystemInfoWindow, TabInfo, TerminalState,
+    AppWindow, DockerWindow, PaneInfo, ProcWindow, SplitterInfo, SystemInfoWindow, TabInfo,
+    TerminalState,
 };
 
 /// Where a tab's session events are currently delivered. Session pump
@@ -75,6 +76,9 @@ pub struct WindowState {
     pub sys_win: Rc<SystemInfoWindow>,
     pub proc_weak: slint::Weak<ProcWindow>,
     pub sys_weak: slint::Weak<SystemInfoWindow>,
+    #[allow(dead_code)]
+    pub docker_win: Rc<DockerWindow>,
+    pub docker_weak: slint::Weak<DockerWindow>,
     #[allow(dead_code)]
     pub docker: Rc<RefCell<Option<Rc<super::docker::DockerController>>>>,
 }

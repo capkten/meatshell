@@ -489,6 +489,7 @@ export component AppWindow inherits Window {
     callback open-system-info();
     in-out property <bool> system-info-window-open: false;
     callback open-docker();
+    callback invalidate-docker-target(string);
     in-out property <bool> docker-visible: false;
     in property <string> docker-target;
     in property <string> docker-status;

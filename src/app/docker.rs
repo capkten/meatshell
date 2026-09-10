@@ -91,6 +91,22 @@ impl DockerUiState {
         self.in_flight = false;
     }
 
+    pub(super) fn invalidate_target(&mut self, tab_id: &str) -> bool {
+        if !matches!(&self.target, DockerTarget::Remote { tab_id: id, .. } if id == tab_id) {
+            return false;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.status = DockerStatus::Loading;
+        self.snapshot = None;
+        self.container_error = None;
+        self.image_error = None;
+        self.detail_error = None;
+        self.selected_id = None;
+        self.details.clear();
+        self.in_flight = false;
+        true
+    }
+
     fn set_tab(&mut self, tab: DockerTab) {
         if self.active_tab != tab {
             self.active_tab = tab;
@@ -227,18 +243,15 @@ impl DockerController {
             window,
         })
     }
-    pub(super) fn refresh_target(&self, target: DockerTarget) {
-        let refresh = {
+    pub(super) fn begin_target(&self, target: DockerTarget) -> bool {
+        let changed = {
             let mut s = self.state.lock().unwrap();
             let changed = s.target != target;
             s.begin_target(target);
-            changed || s.snapshot.is_none()
+            changed
         };
-        if refresh {
-            self.refresh_now();
-        } else {
-            self.render();
-        }
+        self.render();
+        changed
     }
 
     pub(super) fn refresh_now(&self) {
@@ -295,6 +308,19 @@ impl DockerController {
                 apply_snapshot(&state, &main, &window, generation, &target, result)
             });
         });
+    }
+
+    pub(super) fn invalidate_target(&self, tab_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        if !state.invalidate_target(tab_id) {
+            return;
+        }
+        drop(state);
+        self.render();
+    }
+
+    pub(super) fn target_needs_refresh(&self) -> bool {
+        self.state.lock().unwrap().snapshot.is_none()
     }
 
     pub(super) fn set_query(&self, query: String) {
@@ -835,6 +861,21 @@ mod tests {
             success_detail_result(),
         );
         assert!(state.lock().unwrap().details.is_empty());
+    }
+
+    #[test]
+    fn invalidating_current_remote_target_clears_data_and_advances_generation() {
+        let mut state = DockerUiState::ready_for(DockerTarget::Remote {
+            tab_id: "ssh".into(),
+            label: "server".into(),
+        });
+        let generation = state.generation;
+        state.snapshot = Some(snapshot_with_running_and_stopped_containers());
+        state.in_flight = true;
+        assert!(state.invalidate_target("ssh"));
+        assert_eq!(state.generation, generation + 1);
+        assert!(state.snapshot.is_none());
+        assert!(!state.in_flight);
     }
 
     #[test]

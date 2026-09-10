@@ -4,6 +4,35 @@ fn dynamic_sidebar_visible(active: bool, collapsed: bool) -> bool {
     active && !collapsed
 }
 
+pub(super) fn docker_refresh_needed(
+    dynamic_ui_active: bool,
+    sidebar_visible: bool,
+    window_open: bool,
+) -> bool {
+    sidebar_visible || (dynamic_ui_active && window_open)
+}
+
+#[cfg(test)]
+mod docker_lifecycle_tests {
+    use super::docker_refresh_needed;
+
+    #[test]
+    fn docker_refresh_is_needed_only_when_sidebar_or_window_is_visible() {
+        assert!(docker_refresh_needed(true, false, true));
+        assert!(docker_refresh_needed(false, true, true));
+        assert!(!docker_refresh_needed(false, false, true));
+        assert!(!docker_refresh_needed(true, false, false));
+    }
+
+    #[test]
+    fn docker_refresh_visibility_transitions_never_refresh_when_both_surfaces_hide() {
+        assert!(docker_refresh_needed(true, true, false));
+        assert!(docker_refresh_needed(true, false, true));
+        assert!(docker_refresh_needed(true, true, true));
+        assert!(!docker_refresh_needed(false, false, false));
+    }
+}
+
 pub(super) fn sidebar_updates_visible(win: &AppWindow) -> bool {
     dynamic_sidebar_visible(win.get_dynamic_ui_active(), win.get_sidebar_collapsed())
 }

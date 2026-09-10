@@ -90,6 +90,7 @@ pub(super) fn apply_session_event_to_window(
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 1;
             }
+            win.invoke_invalidate_docker_target(tab_id.into());
             if win.get_active_tab_id().as_str() == tab_id
                 && (sidebar_updates_visible(win) || win.get_system_info_window_open())
             {
@@ -130,6 +131,7 @@ pub(super) fn apply_session_event_to_window(
             if let Some(st) = statuses.lock().unwrap().get_mut(tab_id) {
                 st.state = 2;
             }
+            win.invoke_invalidate_docker_target(tab_id.into());
             if win.get_active_tab_id().as_str() == tab_id
                 && (sidebar_updates_visible(win) || win.get_system_info_window_open())
             {

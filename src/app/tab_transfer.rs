@@ -491,6 +491,7 @@ pub(super) fn close_window_now(core: &Rc<AppCore>, window_id: u64) {
             &st.sftp_handles,
             &st.proc_weak,
             &st.sys_weak,
+            &st.docker_weak,
         );
         let _ = win.hide();
     }
