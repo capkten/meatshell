@@ -2,7 +2,8 @@
 
 Date: 2026-09-10 (Asia/Shanghai)
 Branch: `codex/docker-sidebar`
-Verified implementation base: `d309a8c` (`fix: pause docker monitor in zen mode`)
+Final verified head: `c8e4c0a` (`fix: harden Docker inspect and refresh state`)
+Pre-final-fix baseline: `d309a8c` (`fix: pause docker monitor in zen mode`)
 
 ## Scope and contracts reviewed
 
