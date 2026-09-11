@@ -45,7 +45,7 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
 
     __ms_docker_option_takes_value() {
         case "$1:$2" in
-            run:--name|run:-e|run:--env|run:--env-file|run:-h|run:--hostname|run:-l|run:--label|run:--mount|run:--network|run:--publish|run:-p|run:--volume|run:-v|run:--workdir|run:-w|run:--user|run:-u|run:--restart|run:--platform|run:--entrypoint|run:--stop-timeout|run:--memory|run:--cpus|run:--pull|run:--detach-keys|exec:-e|exec:--env|exec:--env-file|exec:--workdir|exec:-w|exec:--user|exec:-u|exec:--detach-keys|start:--detach-keys|stop:--signal|stop:-s|stop:--time|stop:-t|logs:--since|logs:--tail|logs:--until|inspect:--format|inspect:-f|inspect:--type)
+            run:--name|run:-e|run:--env|run:--env-file|run:-h|run:--hostname|run:-l|run:--label|run:--mount|run:--network|run:--net|run:--publish|run:-p|run:--volume|run:-v|run:--workdir|run:-w|run:--user|run:-u|run:--restart|run:--platform|run:--entrypoint|run:--stop-timeout|run:--memory|run:-m|run:--cpus|run:--pull|run:-c|run:--detach-keys|exec:-e|exec:--env|exec:--env-file|exec:--workdir|exec:-w|exec:--user|exec:-u|exec:--detach-keys|start:--detach-keys|stop:--signal|stop:-s|stop:--time|stop:-t|logs:--since|logs:--tail|logs:--until|inspect:--format|inspect:-f|inspect:--type)
                 return 0
                 ;;
             *)
@@ -54,15 +54,74 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
         esac
     }
 
-    __ms_docker_option_is_boolean() {
+    __ms_docker_short_option_takes_value() {
         case "$1:$2" in
-            run:-d|run:--detach|run:-i|run:--interactive|run:-t|run:--tty|run:--rm|run:--init|run:--privileged|run:--read-only|run:-it|run:-ti|run:-di|run:-id|run:-dit|run:-dti|run:-tid|exec:-d|exec:--detach|exec:-i|exec:--interactive|exec:-t|exec:--tty|exec:--privileged|exec:-it|exec:-ti|exec:-di|exec:-id|start:-a|start:--attach|start:-i|start:--interactive|rm:-f|rm:--force|rm:-l|rm:--link|rm:-v|rm:--volumes|logs:-f|logs:--follow|logs:-t|logs:--timestamps|logs:--details|inspect:-s|inspect:--size)
+            run:e|run:h|run:l|run:p|run:v|run:w|run:u|run:c|run:m|exec:e|exec:w|exec:u|stop:s|stop:t|inspect:f)
                 return 0
                 ;;
             *)
                 return 1
                 ;;
         esac
+    }
+
+    __ms_docker_short_option_is_boolean() {
+        case "$1:$2" in
+            run:d|run:i|run:t|run:P|exec:d|exec:i|exec:t|start:a|start:i|rm:f|rm:l|rm:v|logs:f|logs:t|inspect:s)
+                return 0
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    }
+
+    __ms_docker_option_has_attached_value() {
+        case "$1:$2" in
+            run:--name=*|run:--env=*|run:--env-file=*|run:--hostname=*|run:--label=*|run:--mount=*|run:--network=*|run:--net=*|run:--publish=*|run:--volume=*|run:--workdir=*|run:--user=*|run:--restart=*|run:--platform=*|run:--entrypoint=*|run:--stop-timeout=*|run:--memory=*|run:--cpus=*|run:--pull=*|run:--detach-keys=*|exec:--env=*|exec:--env-file=*|exec:--workdir=*|exec:--user=*|exec:--detach-keys=*|start:--detach-keys=*|stop:--signal=*|stop:--time=*|logs:--since=*|logs:--tail=*|logs:--until=*|inspect:--format=*|inspect:--type=*)
+                return 0
+                ;;
+        esac
+
+        case "$2" in
+            -?*)
+                local flags="${2#-}"
+                local flag
+                while [ -n "$flags" ]; do
+                    flag="${flags%"${flags#?}"}"
+                    flags="${flags#?}"
+                    if __ms_docker_short_option_takes_value "$1" "$flag"; then
+                        [ -n "$flags" ] && return 0
+                        return 1
+                    fi
+                    __ms_docker_short_option_is_boolean "$1" "$flag" || return 1
+                done
+                ;;
+        esac
+        return 1
+    }
+
+    __ms_docker_option_is_boolean() {
+        case "$1:$2" in
+            run:--detach|run:--interactive|run:--tty|run:--rm|run:--init|run:--privileged|run:--read-only|run:--publish-all|exec:--detach|exec:--interactive|exec:--tty|exec:--privileged|start:--attach|start:--interactive|rm:--force|rm:--link|rm:--volumes|logs:--follow|logs:--timestamps|logs:--details|inspect:--size)
+                return 0
+                ;;
+        esac
+
+        case "$2" in
+            -?*)
+                local flags="${2#-}"
+                local flag
+                [ -n "$flags" ] || return 1
+                while [ -n "$flags" ]; do
+                    flag="${flags%"${flags#?}"}"
+                    flags="${flags#?}"
+                    __ms_docker_short_option_is_boolean "$1" "$flag" || return 1
+                done
+                return 0
+                ;;
+        esac
+        return 1
     }
 
     __ms_docker_images() {
@@ -125,6 +184,9 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
             fi
             if [ "$end_options" -eq 0 ] && [ "$token" = "--" ]; then
                 end_options=1
+                continue
+            fi
+            if [ "$end_options" -eq 0 ] && __ms_docker_option_has_attached_value "$subcommand" "$token"; then
                 continue
             fi
             if [ "$end_options" -eq 0 ] && __ms_docker_option_takes_value "$subcommand" "$token"; then
@@ -193,6 +255,9 @@ if [ "$__ms_docker_completion_mode" = fallback ] && [ -z "${__ms_docker_completi
             fi
             if [ "$end_options" -eq 0 ] && [ "$token" = "--" ]; then
                 end_options=1
+                continue
+            fi
+            if [ "$end_options" -eq 0 ] && __ms_docker_option_has_attached_value "$subcommand" "$token"; then
                 continue
             fi
             if [ "$end_options" -eq 0 ] && __ms_docker_option_takes_value "$subcommand" "$token"; then
@@ -294,6 +359,11 @@ mod tests {
         assert!(DOCKER_COMPLETION_SETUP.contains("docker image ls"));
         assert!(DOCKER_COMPLETION_SETUP.contains("docker ps -a"));
         assert!(DOCKER_COMPLETION_SETUP.contains("2>/dev/null"));
+    }
+
+    #[test]
+    fn setup_recognizes_docker_network_alias() {
+        assert!(DOCKER_COMPLETION_SETUP.contains("run:--net=*"));
     }
 
     #[cfg(unix)]
@@ -431,6 +501,41 @@ fi
             assert_eq!(
                 bash_candidates(&["docker", "exec", "-it", "we"], 3),
                 vec!["web".to_string()]
+            );
+        }
+
+        #[test]
+        fn bash_run_accepts_boolean_flag_bundles_in_any_order() {
+            for flags in ["-itd", "-idt", "-tdi"] {
+                assert_eq!(
+                    bash_candidates(&["docker", "run", flags, "ng"], 3),
+                    vec!["nginx:latest".to_string()],
+                    "flag bundle {flags}"
+                );
+            }
+        }
+
+        #[test]
+        fn bash_accepts_attached_option_values_before_resource_candidates() {
+            assert_eq!(
+                bash_candidates(&["docker", "run", "--name=foo", "ng"], 3),
+                vec!["nginx:latest".to_string()]
+            );
+            assert_eq!(
+                bash_candidates(&["docker", "inspect", "--format=json", "ng"], 3),
+                vec!["nginx:latest".to_string()]
+            );
+            assert_eq!(
+                bash_candidates(&["docker", "stop", "-t10", "wo"], 3),
+                vec!["worker".to_string()]
+            );
+        }
+
+        #[test]
+        fn bash_run_accepts_the_network_alias_before_the_image() {
+            assert_eq!(
+                bash_candidates(&["docker", "run", "--net=host", "ng"], 3),
+                vec!["nginx:latest".to_string()]
             );
         }
 
