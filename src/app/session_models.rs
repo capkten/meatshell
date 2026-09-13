@@ -441,7 +441,7 @@ pub(super) fn session_from_draft(
     } else {
         draft.private_key_path.to_string().replace('\\', "/")
     };
-    let kind = SessionKind::from_str(&draft.kind.to_string());
+    let kind = SessionKind::from_str(draft.kind.as_ref());
     let auto_name = match kind {
         SessionKind::Serial => format!("{} @{}", draft.serial_port, draft.baud_rate),
         _ if draft.user.trim().is_empty() => draft.host.to_string(),
@@ -463,7 +463,7 @@ pub(super) fn session_from_draft(
             draft.port as u16
         },
         user: draft.user.to_string(),
-        auth: AuthMethod::from_str(&draft.auth.to_string()),
+        auth: AuthMethod::from_str(draft.auth.as_ref()),
         password,
         private_key_path,
         private_key_inline,

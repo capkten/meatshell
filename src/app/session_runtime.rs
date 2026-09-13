@@ -377,7 +377,7 @@ pub(super) fn start_session_in_tab(tab_id: &str, session: Session, ctx: &Connect
                         Err(_) => break,
                     }
                 }
-                let ui_batch: Vec<SessionEvent> = drained.drain(..).collect();
+                let ui_batch = std::mem::take(&mut drained);
                 if ui_batch.is_empty() {
                     continue;
                 }

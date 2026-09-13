@@ -1836,6 +1836,10 @@ async fn list_dirs_only_impl(sftp: &SftpSession, path: &str) -> Result<Vec<(Stri
 }
 
 /// Emit a transfer-progress event.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "SFTP progress fields map directly to the public transfer event"
+)]
 fn emit_transfer(
     events: &UnboundedSender<SessionEvent>,
     id: &str,

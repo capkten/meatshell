@@ -73,7 +73,10 @@ impl TriggerEngine {
             let keep = trigger.rule.expect.len().saturating_sub(1).max(256);
             if trigger.buffer.len() > keep {
                 let split = trigger.buffer.len() - keep;
-                let split = trigger.buffer.ceil_char_boundary(split);
+                let mut split = split;
+                while split > 0 && !trigger.buffer.is_char_boundary(split) {
+                    split -= 1;
+                }
                 trigger.buffer.drain(..split);
             }
         }
@@ -211,6 +214,10 @@ const ZMODEM_CANCEL: [u8; 16] = [
 
 const PROMPT_SETUP_PREFIX: &str = "test -z \"$FISH_VERSION\"";
 const PROMPT_SETUP_SUFFIX: &str = "__ms7'";
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "marker is asserted only by prompt setup tests")
+)]
 const PROMPT_SETUP_HISTORY_MARKER: &str = "__MEATSHELL_INTERNAL_SETUP_1";
 const PROMPT_SETUP_DONE: &str = "\u{1b}]699;ready\u{07}";
 const PROMPT_BODY_PREFIX: &str = "test -z \"$FISH_VERSION\" && eval '__msc(){ __c=\"$(fc -ln -1 2>/dev/null)\"; [ -n \"$__c\" ] && [ \"$__c\" != \"$__cl\" ] && { __cl=\"$__c\"; printf \"\\033]697;%s\\007\" \"$__c\"; }; }; __ms7(){ printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"; __msc; }; if [ -n \"$ZSH_VERSION\" ]; then autoload -Uz add-zsh-hook 2>/dev/null; add-zsh-hook precmd __ms7; else PROMPT_COMMAND=\"__ms7${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"; fi; : __MEATSHELL_INTERNAL_SETUP_1; if [ -n \"$BASH_VERSION\" ]; then __md=\"$(history 2>/dev/null | { __md=\"\"; while read -r __mn __mr; do case \"$__mr\" in *\"__ms7()\"*\"PROMPT_COMMAND=\"*) __mn=\"${__mn%\\*}\"; __md=\"$__mn $__md\";; esac; done; printf \"%s\" \"$__md\"; })\"; for __mn in $__md; do history -d \"$__mn\" 2>/dev/null; done; unset __md __mn __mr; fi; __cl=\"$(fc -ln -1 2>/dev/null)\"; ";
@@ -2602,8 +2609,8 @@ fn parse_monitor_block(
                     };
                     let entry = dcu_totals.entry(index).or_default();
                     entry.0 = entry.0.saturating_add(used);
-                    if percent > 0 {
-                        entry.1 = entry.1.max(used.saturating_mul(100) / percent);
+                    if let Some(total) = used.saturating_mul(100).checked_div(percent) {
+                        entry.1 = entry.1.max(total);
                     }
                 }
                 continue;
@@ -2662,7 +2669,7 @@ fn parse_monitor_block(
         }
         *prev_net_at = now;
         // Show busiest first so the default-selected NIC is the active one.
-        net.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        net.sort_by_key(|b| std::cmp::Reverse(b.1 + b.2));
     }
 
     let cpu_percent = if have_cpu {
@@ -2782,6 +2789,10 @@ fn cpu_usage_rows(nums: &[u64]) -> Vec<(String, String)> {
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "monitor parser receives independent sections from the remote sample"
+)]
 fn build_system_details(
     sys: &std::collections::HashMap<String, String>,
     cpu_nums: &[u64],

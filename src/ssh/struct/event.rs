@@ -12,6 +12,10 @@ use super::{
 
 /// Events emitted back to the UI thread.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the event payload is kept direct for the existing UI channel contract"
+)]
 pub enum SessionEvent {
     /// Free-form status text for the tab header / status line.
     Status(String),
@@ -69,8 +73,22 @@ pub enum SessionEvent {
         /// Per-filesystem (mount_point, available_bytes, total_bytes).
         disks: Vec<(String, u64, u64)>,
         /// Effective login name reported by the remote host (`id -un`).
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "legacy resource payload retained for wire compatibility"
+            )
+        )]
         current_user: String,
         /// Top processes by CPU (#23). Empty if the host's `ps` is unusable.
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "legacy resource payload retained for wire compatibility"
+            )
+        )]
         procs: Vec<ProcInfo>,
         /// Per-GPU stats from the remote `nvidia-smi` monitor command.
         /// `None` means this event did not contain accelerator data, so the

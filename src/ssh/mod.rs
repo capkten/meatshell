@@ -7,6 +7,10 @@ pub(crate) mod ppk;
 #[path = "impls/proxy.rs"]
 pub(crate) mod proxy;
 #[path = "impls/ssh.rs"]
+#[expect(
+    clippy::module_inception,
+    reason = "keep the SSH implementation path stable"
+)]
 mod ssh;
 #[path = "impls/ssh_config.rs"]
 pub(crate) mod ssh_config;

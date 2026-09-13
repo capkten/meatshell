@@ -14,8 +14,8 @@ pub(crate) fn normalize_pasted_newlines(text: &str) -> String {
 ///
 /// `btn` follows the xterm conventions (a vt100 `CellMouseButton`):
 ///   0/1/2 = left / middle / right button press,
-///   32    = motion with no button,
-///   35    = motion with a button held,
+///   32    = left-button motion (button held),
+///   35    = motion with no button,
 ///   64/65 = wheel up / down.
 /// `release` marks a button-release event (only meaningful for `btn` 0–2):
 /// X10 encodes it as `btn + 3`, SGR keeps the same code but ends the report
@@ -34,8 +34,8 @@ pub(crate) fn encode_mouse_event(
     rows: u16,
     encoding: vt100::MouseProtocolEncoding,
 ) -> Vec<u8> {
-    let c = (col.clamp(0, cols.saturating_sub(1) as i32) as u16 + 1).clamp(1, 223);
-    let r = (row.clamp(0, rows.saturating_sub(1) as i32) as u16 + 1).clamp(1, 223);
+    let c = col.clamp(0, cols.saturating_sub(1) as i32) as u16 + 1;
+    let r = row.clamp(0, rows.saturating_sub(1) as i32) as u16 + 1;
     match encoding {
         vt100::MouseProtocolEncoding::Sgr => {
             let final_byte = if release { b'm' } else { b'M' };
@@ -43,8 +43,25 @@ pub(crate) fn encode_mouse_event(
         }
         _ => {
             let cb = btn as u16 + if release { 3 } else { 0 } + 32;
-            vec![0x1b, b'[', b'M', cb as u8, (c + 32) as u8, (r + 32) as u8]
+            vec![
+                0x1b,
+                b'[',
+                b'M',
+                cb as u8,
+                (c.min(223) + 32) as u8,
+                (r.min(223) + 32) as u8,
+            ]
         }
+    }
+}
+
+/// Map the Slint terminal-mouse event kind to the xterm button code and
+/// release flag used by `encode_mouse_event`.
+pub(crate) fn terminal_mouse_button(kind: i32, button: i32) -> (u8, bool) {
+    match kind {
+        1 => (button as u8, true),
+        2 => (32 + button as u8, false),
+        _ => (button as u8, false),
     }
 }
 
@@ -73,6 +90,123 @@ pub(crate) fn encode_pasted_text(text: &str, bracketed: bool) -> Vec<u8> {
     bytes.extend_from_slice(filtered.as_bytes());
     bytes.extend_from_slice(b"\x1b[201~");
     bytes
+}
+
+/// Clipboard data prepared off the UI thread for a later confirmation action.
+/// Keeping both protocol variants avoids doing potentially large text work on
+/// Slint's event loop while still allowing confirmation to use the terminal's
+/// current bracketed-paste mode.
+#[derive(Clone)]
+pub(crate) struct PreparedPaste {
+    plain: Vec<u8>,
+    bracketed: Vec<u8>,
+}
+
+impl PreparedPaste {
+    pub(crate) fn new(text: &str) -> Self {
+        Self {
+            plain: encode_pasted_text(text, false),
+            bracketed: encode_pasted_text(text, true),
+        }
+    }
+
+    pub(crate) fn into_bytes(self, bracketed: bool) -> Vec<u8> {
+        if bracketed {
+            self.bracketed
+        } else {
+            self.plain
+        }
+    }
+}
+
+pub(crate) fn paste_requires_review(text: &str, confirm_multiline: bool) -> bool {
+    const FORCE_REVIEW_BYTES: usize = 100 * 1024;
+    text.len() > FORCE_REVIEW_BYTES || (confirm_multiline && text.contains(['\r', '\n']))
+}
+
+/// Keep clipboard data out of Slint's text layout once it is larger than the
+/// compact review card can safely display. The full text remains in Rust for
+/// the explicit confirmation action.
+pub(crate) struct PastePreview {
+    pub(crate) text: String,
+    pub(crate) chunks: Vec<String>,
+    pub(crate) truncated: bool,
+}
+
+fn segment_preview_lines(text: &str) -> String {
+    const MAX_UI_LINE_CHARS: usize = 4_096;
+
+    let mut segmented = String::with_capacity(text.len() + text.len() / MAX_UI_LINE_CHARS);
+    let mut line_chars = 0usize;
+    for ch in text.chars() {
+        if matches!(ch, '\r' | '\n') {
+            segmented.push(ch);
+            line_chars = 0;
+            continue;
+        }
+        if line_chars == MAX_UI_LINE_CHARS {
+            segmented.push('\n');
+            line_chars = 0;
+        }
+        segmented.push(ch);
+        line_chars += 1;
+    }
+    segmented
+}
+
+fn split_preview_chunks(text: &str) -> Vec<String> {
+    const MAX_CHUNK_CHARS: usize = 4_096;
+
+    let mut chunks = Vec::new();
+    let mut chunk = String::with_capacity(MAX_CHUNK_CHARS);
+    let mut chunk_chars = 0usize;
+    for ch in text.chars() {
+        if chunk_chars == MAX_CHUNK_CHARS {
+            chunks.push(std::mem::take(&mut chunk));
+            chunk = String::with_capacity(MAX_CHUNK_CHARS);
+            chunk_chars = 0;
+        }
+        chunk.push(ch);
+        chunk_chars += 1;
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+pub(crate) fn paste_preview(text: &str) -> PastePreview {
+    const BYTE_LIMIT: usize = 1_048_576;
+    const TRUNCATION_MARKER: &str = "\n…";
+
+    if text.len() <= BYTE_LIMIT {
+        let text = segment_preview_lines(text);
+        return PastePreview {
+            chunks: split_preview_chunks(&text),
+            text,
+            truncated: false,
+        };
+    }
+
+    let prefix_limit = BYTE_LIMIT - TRUNCATION_MARKER.len();
+    let mut end = 0usize;
+    for (index, ch) in text.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > prefix_limit {
+            break;
+        }
+        end = next;
+    }
+
+    let mut preview = String::with_capacity(end + TRUNCATION_MARKER.len());
+    preview.push_str(&text[..end]);
+    preview.push_str(TRUNCATION_MARKER);
+    let text = segment_preview_lines(&preview);
+    PastePreview {
+        chunks: split_preview_chunks(&text),
+        text,
+        truncated: true,
+    }
 }
 
 pub(crate) fn terminal_uses_bracketed_paste(bufs: &TermBuffers, tab_id: &str) -> bool {
@@ -353,6 +487,79 @@ mod mouse_encoding_tests {
         let bytes =
             encode_mouse_event(0, false, -5, 999, 80, 24, vt100::MouseProtocolEncoding::Sgr);
         assert_eq!(bytes, b"\x1b[<0;1;24M");
+    }
+
+    #[test]
+    fn sgr_coordinates_above_223_are_preserved() {
+        assert_eq!(
+            encode_mouse_event(
+                0,
+                false,
+                249,
+                259,
+                300,
+                400,
+                vt100::MouseProtocolEncoding::Sgr,
+            ),
+            b"\x1b[<0;250;260M"
+        );
+    }
+
+    #[test]
+    fn x10_coordinates_remain_byte_bounded() {
+        assert_eq!(
+            encode_mouse_event(
+                0,
+                false,
+                249,
+                259,
+                300,
+                400,
+                vt100::MouseProtocolEncoding::Default,
+            ),
+            vec![0x1b, b'[', b'M', 32, 255, 255]
+        );
+    }
+
+    #[test]
+    fn terminal_mouse_button_maps_press_release_and_drag() {
+        assert_eq!(terminal_mouse_button(0, 0), (0, false));
+        assert_eq!(terminal_mouse_button(1, 0), (0, true));
+        assert_eq!(terminal_mouse_button(2, 0), (32, false));
+    }
+
+    #[test]
+    fn terminal_mouse_button_maps_dragged_button() {
+        assert_eq!(terminal_mouse_button(2, 1), (33, false));
+    }
+
+    #[test]
+    fn terminal_mouse_drag_encodes_left_button_motion() {
+        let (button, release) = terminal_mouse_button(2, 0);
+        assert_eq!(
+            encode_mouse_event(
+                button,
+                release,
+                2,
+                2,
+                80,
+                24,
+                vt100::MouseProtocolEncoding::Sgr,
+            ),
+            b"\x1b[<32;3;3M"
+        );
+        assert_eq!(
+            encode_mouse_event(
+                button,
+                release,
+                2,
+                2,
+                80,
+                24,
+                vt100::MouseProtocolEncoding::Default,
+            ),
+            vec![0x1b, b'[', b'M', 64, 35, 35]
+        );
     }
 
     #[test]

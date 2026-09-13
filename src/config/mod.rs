@@ -1,4 +1,8 @@
 #[path = "impls/config.rs"]
+#[expect(
+    clippy::module_inception,
+    reason = "keep the config implementation path stable"
+)]
 mod config;
 #[path = "impls/finalshell.rs"]
 mod finalshell;

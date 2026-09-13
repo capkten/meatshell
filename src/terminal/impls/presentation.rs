@@ -425,8 +425,8 @@ pub(crate) fn render_term_span(span: &HistSpan, row: i32, is_dark: bool) -> Vec<
                 let plain_cjk = contains_cjk(&plain);
                 result.push(TermSpan {
                     text: std::mem::take(&mut plain).into(),
-                    fg: fg.clone(),
-                    bg: bg.clone(),
+                    fg,
+                    bg,
                     bold: span.bold,
                     row,
                     col: plain_col,
@@ -439,8 +439,8 @@ pub(crate) fn render_term_span(span: &HistSpan, row: i32, is_dark: bool) -> Vec<
             }
             result.push(TermSpan {
                 text: "".into(),
-                fg: fg.clone(),
-                bg: bg.clone(),
+                fg,
+                bg,
                 bold: span.bold,
                 row,
                 col,
@@ -479,6 +479,10 @@ pub(crate) fn render_term_span(span: &HistSpan, row: i32, is_dark: bool) -> Vec<
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::items_after_test_module,
+    reason = "keep color emoji tests adjacent to their renderer"
+)]
 mod color_emoji_tests {
     use super::*;
 

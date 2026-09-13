@@ -1,5 +1,9 @@
 use super::*;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tab callback wiring receives the existing window-scoped state handles"
+)]
 pub(super) fn wire_tab_callbacks(
     window: &AppWindow,
     window_id: u64,

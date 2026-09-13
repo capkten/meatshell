@@ -38,8 +38,9 @@ pub(crate) use input::normalize_pasted_newlines;
 pub(crate) use input::windows_process_ctrl_release;
 pub(crate) use input::{
     bare_ctrl_marker_workaround_enabled, encode_command_bar_input, encode_mouse_event,
-    encode_pasted_text, is_terminal_interrupt, key_to_pty_bytes, paste_requires_large_review,
-    should_drop_bare_ctrl_marker, terminal_uses_bracketed_paste,
+    encode_pasted_text, is_terminal_interrupt, key_to_pty_bytes, paste_preview,
+    paste_requires_large_review, paste_requires_review, should_drop_bare_ctrl_marker,
+    terminal_mouse_button, terminal_uses_bracketed_paste, PreparedPaste,
 };
 pub(crate) use json_output::format_json_output;
 pub(crate) use output_highlight::compile_output_rules;

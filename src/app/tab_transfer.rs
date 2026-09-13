@@ -89,7 +89,7 @@ fn window_over(core: &Rc<AppCore>, exclude: u64, gx: f32, gy: f32) -> Option<u64
 
 fn find_tab_row(st: &WindowState, tab_id: &str) -> Option<TabInfo> {
     use slint::Model as _;
-    st.tabs_model.iter().find(|t| t.id.to_string() == tab_id)
+    st.tabs_model.iter().find(|t| t.id == tab_id)
 }
 
 /// Can this tab be moved? Any terminal tab that owns a session handle, in
@@ -107,7 +107,7 @@ fn movable(core: &Rc<AppCore>, window_id: u64, tab_id: &str) -> bool {
     let Some(row) = find_tab_row(st, tab_id) else {
         return false;
     };
-    row.kind.to_string() == "terminal" && st.handles.borrow().contains_key(tab_id)
+    row.kind == "terminal" && st.handles.borrow().contains_key(tab_id)
 }
 
 /// Highlight a window's content area as a merge target.
@@ -289,11 +289,7 @@ pub(super) fn handle_global_tab_drag_drop(
                     let states = core.window_states.borrow();
                     if let Some(st) = states.get(&new_id) {
                         use slint::Model as _;
-                        if let Some(i) = st
-                            .tabs_model
-                            .iter()
-                            .position(|t| t.id.to_string() == "welcome")
-                        {
+                        if let Some(i) = st.tabs_model.iter().position(|t| t.id == "welcome") {
                             st.tabs_model.remove(i);
                         }
                         st.layout.borrow_mut().remove_tab("welcome");
@@ -325,9 +321,7 @@ fn clamped_detach_position(src_win: &AppWindow, gx: f32, gy: f32) -> slint::Phys
     let mut left = gx - 24.0;
     let mut top = gy - 8.0;
     let clamped = src_win.window().with_winit_window(|ww| {
-        let Some(monitor) = ww.current_monitor().or_else(|| ww.primary_monitor()) else {
-            return None;
-        };
+        let monitor = ww.current_monitor().or_else(|| ww.primary_monitor())?;
         let mscale = monitor.scale_factor().max(0.01);
         let mx = monitor.position().x as f32 / mscale as f32;
         let my = monitor.position().y as f32 / mscale as f32;
@@ -378,18 +372,14 @@ pub(super) fn move_tab_between_windows(
         let Some(row) = find_tab_row(&src, tab_id) else {
             return false;
         };
-        if row.kind.to_string() != "terminal" || !src.handles.borrow().contains_key(tab_id) {
+        if row.kind != "terminal" || !src.handles.borrow().contains_key(tab_id) {
             return false;
         }
         (src, dst)
     };
 
     // UI rows travel with the tab.
-    let Some(tab_i) = src
-        .tabs_model
-        .iter()
-        .position(|t| t.id.to_string() == tab_id)
-    else {
+    let Some(tab_i) = src.tabs_model.iter().position(|t| t.id == tab_id) else {
         return false;
     };
     let tab_row = src.tabs_model.row_data(tab_i).unwrap();
@@ -398,7 +388,7 @@ pub(super) fn move_tab_between_windows(
         let mut row = None;
         let mut idx = None;
         for (i, r) in src.terminals_model.iter().enumerate() {
-            if r.id.to_string() == tab_id {
+            if r.id == tab_id {
                 row = Some(r);
                 idx = Some(i);
                 break;

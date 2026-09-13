@@ -91,6 +91,7 @@ pub struct SystemSampler {
 }
 
 #[derive(Clone, Default)]
+#[allow(dead_code)] // reserved for the local system-information window
 pub(crate) struct LocalHardwareInfo {
     pub(crate) os: String,
     pub(crate) kernel: String,
@@ -105,6 +106,7 @@ pub(crate) struct LocalHardwareInfo {
 }
 
 #[derive(Clone, Default)]
+#[allow(dead_code)] // reserved for the local system-information window
 pub(crate) struct LocalGpuInfo {
     pub(crate) name: String,
     pub(crate) vendor: String,

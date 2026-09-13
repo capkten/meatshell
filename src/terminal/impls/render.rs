@@ -20,7 +20,7 @@ pub(crate) fn cell_prefix(chars: &[char]) -> Vec<usize> {
 
 pub(crate) fn char_at_cell_start(prefix: &[usize], target: usize) -> usize {
     let char_count = prefix.len().saturating_sub(1);
-    for index in 0..char_count {
+    for (index, _) in prefix.iter().enumerate().take(char_count) {
         if prefix[index] <= target && target < prefix[index + 1] {
             return index;
         }
@@ -30,7 +30,7 @@ pub(crate) fn char_at_cell_start(prefix: &[usize], target: usize) -> usize {
 
 pub(crate) fn char_after_cell_end(prefix: &[usize], target: usize) -> usize {
     let char_count = prefix.len().saturating_sub(1);
-    for index in 0..char_count {
+    for (index, _) in prefix.iter().enumerate().take(char_count) {
         if prefix[index] > target {
             return index;
         }

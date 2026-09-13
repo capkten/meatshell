@@ -222,7 +222,7 @@ fn local_program(session: &Session) -> (String, Vec<String>) {
             ("wsl.exe".to_string(), args)
         }
         #[cfg(windows)]
-        "powershell" | _ => (
+        _ => (
             "powershell.exe".to_string(),
             vec![
                 "-NoLogo".to_string(),

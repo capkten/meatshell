@@ -37,12 +37,8 @@ pub(crate) fn run_stdio() -> Result<()> {
 }
 
 async fn handle(request: Value) -> Option<Value> {
-    let id = request.get("id").cloned();
+    let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str);
-    if id.is_none() {
-        return None;
-    }
-    let id = id.unwrap_or(Value::Null);
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
     match method {
         Some("initialize") => Some(success_response(id, initialize(&params))),
@@ -62,10 +58,11 @@ fn initialize(params: &Value) -> Value {
         .get("protocolVersion")
         .and_then(Value::as_str)
         .unwrap_or(LATEST_PROTOCOL_VERSION);
-    let protocol_version = SUPPORTED_PROTOCOL_VERSIONS
-        .contains(&requested)
-        .then_some(requested)
-        .unwrap_or(LATEST_PROTOCOL_VERSION);
+    let protocol_version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+        requested
+    } else {
+        LATEST_PROTOCOL_VERSION
+    };
     json!({
         "protocolVersion": protocol_version,
         "capabilities": { "tools": { "listChanged": false } },

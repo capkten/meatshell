@@ -176,9 +176,10 @@ use crate::terminal::c0_letter_key_down;
 use crate::terminal::{
     bare_ctrl_marker_workaround_enabled, cell_prefix, compile_output_rules,
     encode_command_bar_input, encode_mouse_event, encode_pasted_text, is_terminal_interrupt,
-    key_to_pty_bytes, paste_requires_large_review, should_drop_bare_ctrl_marker,
-    terminal_uses_bracketed_paste, CsiState, OutputHighlightPreset, RenderGates, TabRenderGate,
-    TermBuffer, TermBufferHandle, TermBuffers,
+    key_to_pty_bytes, paste_preview, paste_requires_large_review, paste_requires_review,
+    should_drop_bare_ctrl_marker, terminal_mouse_button, terminal_uses_bracketed_paste, CsiState,
+    OutputHighlightPreset, PreparedPaste, RenderGates, TabRenderGate, TermBuffer, TermBufferHandle,
+    TermBuffers,
 };
 #[cfg(test)]
 use crate::terminal::{
@@ -200,6 +201,19 @@ fn tab_title_len(title: &str) -> i32 {
 
 fn should_block_close(exit_confirmed: bool, has_live_sessions: bool) -> bool {
     !exit_confirmed && has_live_sessions
+}
+
+struct PendingPaste {
+    tab_id: String,
+    prepared: PreparedPaste,
+}
+
+fn enqueue_confirmed_paste(
+    sender: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+    paste: PreparedPaste,
+    bracketed: bool,
+) {
+    let _ = sender.send(SessionCommand::RawInput(paste.into_bytes(bracketed)));
 }
 
 /// Tear down one window's workers (SSH + SFTP) and hide its detachable
@@ -1739,7 +1753,7 @@ fn open_window(
     let tabs_model: Rc<VecModel<TabInfo>> = Rc::new(VecModel::default());
     tabs_model.push(TabInfo {
         id: "welcome".into(),
-        title_len: tab_title_len(&t("新标签页", "New tab")),
+        title_len: tab_title_len(t("新标签页", "New tab")),
         title: t("新标签页", "New tab").into(),
         kind: "welcome".into(),
         connected: false,
@@ -1902,7 +1916,7 @@ fn open_window(
                     return;
                 }
                 use slint::Model as _;
-                let Some(row) = terminals_model.iter().find(|r| r.id.to_string() == tab_id) else {
+                let Some(row) = terminals_model.iter().find(|r| r.id == tab_id) else {
                     return;
                 };
                 if direction == 0 {
@@ -2316,7 +2330,7 @@ fn open_window(
         let tabs_model = tabs_model.clone();
         let registry = registry.clone();
         window.on_set_language(move |code| {
-            crate::i18n::set_language(&code.to_string());
+            crate::i18n::set_language(code.as_ref());
             {
                 let mut s = store.borrow_mut();
                 s.set_language(crate::i18n::current_code().to_string());
@@ -2327,7 +2341,7 @@ fn open_window(
             for i in 0..tabs_model.row_count() {
                 if let Some(mut row) = tabs_model.row_data(i) {
                     if row.id.as_str() == "welcome" {
-                        row.title_len = tab_title_len(&t("新标签页", "New tab"));
+                        row.title_len = tab_title_len(t("新标签页", "New tab"));
                         row.title = t("新标签页", "New tab").into();
                         tabs_model.set_row_data(i, row);
                     }
@@ -3013,7 +3027,7 @@ fn open_window(
                             // verifies the native window actually reached the target.
                             if !ev_window_size_tracking_ready.get() {
                                 if let Some(win) = weak.upgrade() {
-                                    if is_wayland_window(&win.window()) {
+                                    if is_wayland_window(win.window()) {
                                         ev_pending_window_size_restore.set(None);
                                         ev_window_size_tracking_ready.set(true);
                                         tracing::info!(
@@ -3023,7 +3037,7 @@ fn open_window(
                                         ev_pending_window_size_restore.get()
                                     {
                                         if let Some(target) = clamp_window_size_to_monitor(
-                                            &win.window(),
+                                            win.window(),
                                             Some(preferred),
                                         ) {
                                             tracing::info!(
@@ -3068,7 +3082,7 @@ fn open_window(
                                 .unwrap_or(false);
                             win.set_window_maximized(maxed);
                             if !ev_window_size_tracking_ready.get()
-                                && is_wayland_window(&win.window())
+                                && is_wayland_window(win.window())
                             {
                                 // The configure size in this event is authoritative
                                 // on Wayland. Accept and persist that actual size;
@@ -3087,7 +3101,7 @@ fn open_window(
                                     let actual =
                                         (size.width as f32 / scale, size.height as f32 / scale);
                                     if let Some(target) =
-                                        clamp_window_size_to_monitor(&win.window(), Some(preferred))
+                                        clamp_window_size_to_monitor(win.window(), Some(preferred))
                                     {
                                         tracing::info!(
                                             "[WINDOW_SIZE] restore requested saved={:.0}x{:.0} \
@@ -3531,7 +3545,7 @@ fn contains_logical(rect: LogicalRect, x: f32, y: f32) -> bool {
 
 fn app_content_area(win: &AppWindow) -> LogicalRect {
     let size = win.window().size();
-    let scale = win.window().scale_factor().max(0.01) as f32;
+    let scale = win.window().scale_factor().max(0.01);
     let mut area = LogicalRect {
         x: 0.0,
         y: if win.get_custom_titlebar() {
@@ -3807,6 +3821,10 @@ fn sync_sessions_for_window(
 /// `host|port|user|password|name`; trailing fields are optional (port → 22,
 /// user → root, password → none, name → user@host). A leading header row such as
 /// `host|port|username|password|name` is skipped. Dedup happens at the call site.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "session callback wiring receives the existing window-scoped state handles"
+)]
 fn wire_session_callbacks(
     window: &AppWindow,
     // Registry id of `window`; connect-time prompts are tagged with it so
@@ -4175,7 +4193,7 @@ fn wire_session_callbacks(
         window.on_remove_session(move |id: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove(&id.to_string());
+                s.remove(id.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -4199,7 +4217,7 @@ fn wire_session_callbacks(
             let mut duplicated = false;
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut copy = orig;
                     copy.id = uuid::Uuid::new_v4().to_string();
                     copy.name = format!("{} (copy)", copy.name);
@@ -4231,7 +4249,7 @@ fn wire_session_callbacks(
             let mut moved = false;
             {
                 let mut s = store.borrow_mut();
-                if let Some(orig) = s.get(&id.to_string()).cloned() {
+                if let Some(orig) = s.get(id.as_ref()).cloned() {
                     let mut target = orig;
                     // "default" is the display label for ungrouped → store empty.
                     target.group = if group.as_str().eq_ignore_ascii_case("default") {
@@ -4438,7 +4456,7 @@ fn wire_session_callbacks(
         window.on_delete_group(move |name: SharedString| {
             {
                 let mut s = store.borrow_mut();
-                s.remove_group(&name.to_string());
+                s.remove_group(name.as_ref());
                 if let Err(err) = s.save() {
                     tracing::warn!("failed to save config: {err:#}");
                 }
@@ -4511,7 +4529,7 @@ fn wire_session_callbacks(
             } else {
                 draft.private_key_path.to_string().replace('\\', "/")
             };
-            let kind = crate::config::SessionKind::from_str(&draft.kind.to_string());
+            let kind = crate::config::SessionKind::from_str(draft.kind.as_ref());
             // Auto-name: serial → port label; otherwise user@host, or just the
             // host when no username was given (#110).
             let auto_name = match kind {
@@ -4541,7 +4559,7 @@ fn wire_session_callbacks(
                     draft.port as u16
                 },
                 user: draft.user.to_string(),
-                auth: AuthMethod::from_str(&draft.auth.to_string()),
+                auth: AuthMethod::from_str(draft.auth.as_ref()),
                 password,
                 // Store the key path with forward slashes uniformly.
                 private_key_path,
@@ -5437,6 +5455,10 @@ fn refresh_panes(
 /// "tabstrip"/"left"/"right"/"up"/"down"/"center"; `None` when the point is
 /// outside every pane. The 30% edge bands trigger a split; the tab strip and
 /// middle drop into the pane's tab group.
+#[expect(
+    clippy::type_complexity,
+    reason = "drag hit-testing returns the pane, zone, and highlight rectangle together"
+)]
 fn drag_target(
     layout: &crate::layout::Layout,
     content: (f32, f32),
@@ -5842,7 +5864,7 @@ fn wire_key_input(
                 if orig.is_empty() {
                     s.add_quick_group(name.to_string());
                 } else {
-                    s.rename_quick_group(&orig.to_string(), name.to_string());
+                    s.rename_quick_group(orig.as_ref(), name.to_string());
                 }
                 let _ = s.save();
             }
@@ -5859,7 +5881,7 @@ fn wire_key_input(
         window.on_delete_quick_group(move |name: SharedString| {
             {
                 let mut s = store_rc.borrow_mut();
-                s.remove_quick_group(&name.to_string());
+                s.remove_quick_group(name.as_ref());
                 let _ = s.save();
             }
             if let Some(w) = weak.upgrade() {
@@ -6321,10 +6343,12 @@ fn wire_key_input(
     }
 
     // Middle-click / Ctrl+Shift+V: paste clipboard text into PTY.
+    let pending_paste: Arc<Mutex<Option<PendingPaste>>> = Arc::new(Mutex::new(None));
     {
         let handles = handles.clone();
         let bufs = bufs.clone();
         let weak = window.as_weak();
+        let pending_paste = pending_paste.clone();
         window.on_paste_from_clipboard(move |tab_id: SharedString| {
             // Clone the (Send) command sender for this tab so the clipboard read
             // can run off the UI thread.  Reading arboard on the event-loop
@@ -6342,18 +6366,43 @@ fn wire_key_input(
                 .unwrap_or(true);
             let weak = weak.clone();
             let tab_id = tab_id.to_string();
+            let pending_paste_thread = pending_paste.clone();
             std::thread::spawn(move || {
                 match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
                     Ok(text) => {
-                        let force_review = text.len() > 100 * 1024;
-                        if text.contains(['\r', '\n']) && (confirm_multiline || force_review) {
+                        if paste_requires_review(&text, confirm_multiline) {
                             let large = paste_requires_large_review(&text);
-                            let preview = text.clone();
+                            let preview = paste_preview(&text);
+                            let preview_text = preview.text;
+                            let detail_chunks = preview.chunks;
+                            let preview_truncated = preview.truncated;
+                            let prepared = PreparedPaste::new(&text);
+                            let pending_paste = pending_paste_thread.clone();
                             let _ = slint::invoke_from_event_loop(move || {
                                 if let Some(w) = weak.upgrade() {
+                                    if let Ok(mut pending) = pending_paste.lock() {
+                                        *pending = Some(PendingPaste {
+                                            tab_id: tab_id.clone(),
+                                            prepared,
+                                        });
+                                    } else {
+                                        return;
+                                    }
+                                    let detail_chunks = ModelRc::from(Rc::new(VecModel::from(
+                                        detail_chunks
+                                            .into_iter()
+                                            .map(SharedString::from)
+                                            .collect::<Vec<_>>(),
+                                    )));
                                     w.set_paste_confirm_tab(tab_id.into());
-                                    w.set_paste_confirm_text(text.into());
-                                    w.set_paste_confirm_preview(preview.into());
+                                    w.set_paste_confirm_text(String::new().into());
+                                    w.set_paste_confirm_preview(if large {
+                                        String::new().into()
+                                    } else {
+                                        preview_text.into()
+                                    });
+                                    w.set_paste_confirm_detail_chunks(detail_chunks);
+                                    w.set_paste_confirm_preview_truncated(preview_truncated);
                                     w.set_paste_confirm_large(large);
                                     w.set_paste_confirm_open(true);
                                 }
@@ -6374,6 +6423,7 @@ fn wire_key_input(
         let handles_paste = handles.clone();
         let bufs_paste = bufs.clone();
         let weak = window.as_weak();
+        let pending_paste = pending_paste.clone();
         window.on_paste_confirmed(move |tab_id: SharedString| {
             let Some(sender) = handles_paste
                 .borrow()
@@ -6383,16 +6433,41 @@ fn wire_key_input(
                 return;
             };
             let Some(w) = weak.upgrade() else { return };
-            let text = w.get_paste_confirm_text().to_string();
+            let Some(pending) = pending_paste.lock().ok().and_then(|mut pending| {
+                if pending.as_ref().map(|item| item.tab_id.as_str()) != Some(tab_id.as_str()) {
+                    return None;
+                }
+                pending.take()
+            }) else {
+                return;
+            };
             let bracketed = terminal_uses_bracketed_paste(&bufs_paste, tab_id.as_str());
-            let _ = sender.send(SessionCommand::RawInput(encode_pasted_text(
-                &text, bracketed,
+            enqueue_confirmed_paste(&sender, pending.prepared, bracketed);
+            w.set_paste_confirm_text(String::new().into());
+            w.set_paste_confirm_preview(String::new().into());
+            w.set_paste_confirm_detail_chunks(ModelRc::from(Rc::new(
+                VecModel::<SharedString>::default(),
             )));
             w.set_paste_confirm_open(false);
         });
     }
 
-    window.on_paste_confirm_cancelled(|| {});
+    {
+        let pending_paste = pending_paste.clone();
+        let weak = window.as_weak();
+        window.on_paste_confirm_cancelled(move || {
+            if let Ok(mut pending) = pending_paste.lock() {
+                pending.take();
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_paste_confirm_text(String::new().into());
+                w.set_paste_confirm_preview(String::new().into());
+                w.set_paste_confirm_detail_chunks(ModelRc::from(Rc::new(
+                    VecModel::<SharedString>::default(),
+                )));
+            }
+        });
+    }
 
     // Context menu → 清空缓存: reset the local vt100 buffer (drops scrollback),
     // wipe the displayed screen, then nudge the remote to redraw a fresh prompt.
@@ -6772,11 +6847,7 @@ fn wire_key_input(
                     let (rows, cols) = screen.size();
                     if buf.mouse_tracked {
                         let encoding = screen.mouse_protocol_encoding();
-                        let (btn, release) = match kind {
-                            1 => (button as u8, true),  // release
-                            2 => (35, false),           // drag motion with button held
-                            _ => (button as u8, false), // press
-                        };
+                        let (btn, release) = terminal_mouse_button(kind, button);
                         Some(encode_mouse_event(
                             btn, release, col, row, cols, rows, encoding,
                         ))

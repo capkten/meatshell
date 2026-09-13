@@ -38,6 +38,7 @@ export component ConfirmDialog inherits Rectangle {
     in property <string> title: @tr("Please confirm");
     in property <string> message;
     in property <string> detail;                  // optional, e.g. the file path
+    in property <[string]> detail-chunks;         // large detail split for safe layout
     in property <string> confirm-label: @tr("Confirm");
     // Opt in per call site: destructive confirmations must not become
     // keyboard-confirmable merely because they share this component.
@@ -135,7 +136,7 @@ export component ConfirmDialog inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            if root.detail != "" && root.large-detail : Rectangle {
+            if root.large-detail && (root.detail != "" || root.detail-chunks.length > 0) : Rectangle {
                 vertical-stretch: 1;
                 min-height: 220px;
                 background: Theme.bg-root;
@@ -150,17 +151,31 @@ export component ConfirmDialog inherits Rectangle {
                     width: parent.width - 2px;
                     height: parent.height - 2px;
                     viewport-width: self.visible-width;
-                    viewport-height: max(self.visible-height, detail-text.preferred-height + 16px);
+                    viewport-height: max(self.visible-height, detail-content.preferred-height + 16px);
 
-                    detail-text := Text {
+                    detail-content := VerticalLayout {
                         x: 8px;
                         y: 8px;
                         width: max(1px, detail-scroll.visible-width - 16px);
-                        text: root.detail;
-                        color: Theme.text-primary;
-                        font-family: Theme.font-mono;
-                        font-size: Theme.fs-sm;
-                        wrap: word-wrap;
+                        spacing: 0px;
+
+                        for chunk in root.detail-chunks : Text {
+                            width: parent.width;
+                            text: chunk;
+                            color: Theme.text-primary;
+                            font-family: Theme.font-mono;
+                            font-size: Theme.fs-sm;
+                            wrap: word-wrap;
+                        }
+
+                        if root.detail-chunks.length == 0 && root.detail != "" : Text {
+                            width: parent.width;
+                            text: root.detail;
+                            color: Theme.text-primary;
+                            font-family: Theme.font-mono;
+                            font-size: Theme.fs-sm;
+                            wrap: word-wrap;
+                        }
                     }
                 }
             }

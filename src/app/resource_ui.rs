@@ -327,6 +327,7 @@ pub(super) fn tuple5_rows(rows: &[(String, String, String, String, String)]) -> 
         .collect()
 }
 
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn nonempty_or_dash(value: impl Into<String>) -> String {
     let value = value.into();
     if value.trim().is_empty() {
@@ -336,6 +337,7 @@ pub(super) fn nonempty_or_dash(value: impl Into<String>) -> String {
     }
 }
 
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn local_hardware_info() -> &'static LocalHardwareInfo {
     static INFO: OnceLock<LocalHardwareInfo> = OnceLock::new();
     INFO.get_or_init(|| {
@@ -377,6 +379,7 @@ pub(super) fn local_hardware_info() -> &'static LocalHardwareInfo {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn fill_local_gpu_info(info: &mut LocalHardwareInfo) {
     let output = std::process::Command::new("powershell")
         .args([
@@ -452,6 +455,7 @@ pub(super) fn fill_local_gpu_info(info: &mut LocalHardwareInfo) {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn json_values(value: &serde_json::Value) -> Vec<serde_json::Value> {
     if let Some(items) = value.as_array() {
         items.clone()
@@ -463,6 +467,7 @@ pub(super) fn json_values(value: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn nonempty_prefer(primary: &str, fallback: &str) -> String {
     if primary.trim().is_empty() {
         fallback.trim().to_string()
@@ -472,6 +477,7 @@ pub(super) fn nonempty_prefer(primary: &str, fallback: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn gpu_from_registry_json(gpu: &serde_json::Value) -> Option<LocalGpuInfo> {
     let get_str = |key: &str| {
         gpu.get(key)
@@ -512,8 +518,10 @@ pub(super) fn gpu_from_registry_json(gpu: &serde_json::Value) -> Option<LocalGpu
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn fill_local_gpu_info(_info: &mut LocalHardwareInfo) {}
 
+#[allow(dead_code)] // reserved for the local system-information window
 pub(super) fn local_system_details(snap: &SystemSnapshot) -> SystemDetails {
     let mem_used = snap.mem_used_mib.saturating_mul(1024 * 1024);
     let mem_total = snap.mem_total_mib.saturating_mul(1024 * 1024);

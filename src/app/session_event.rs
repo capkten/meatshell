@@ -4,6 +4,10 @@ fn process_stats_refreshes_sidebar(sidebar_visible: bool, system_info_open: bool
     sidebar_visible || system_info_open
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "UI event application receives the window-scoped runtime dependencies"
+)]
 pub(super) fn apply_session_event_to_window(
     win: &AppWindow,
     window_id: u64,
@@ -540,7 +544,8 @@ mod process_stats_refresh_tests {
 thread_local! {
     /// Prompts awaiting a decision; the front one is shown. Lives on the Slint
     /// event-loop thread (all access is from there).
-    pub(super) static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> = RefCell::new(VecDeque::new());
+    pub(super) static HOSTKEY_QUEUE: RefCell<VecDeque<PendingHostKey>> =
+        const { RefCell::new(VecDeque::new()) };
     /// host:port → decision, remembered for this run so a duplicate prompt
     /// (second connection to the same host) is answered without a new dialog.
     pub(super) static HOSTKEY_DECIDED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
