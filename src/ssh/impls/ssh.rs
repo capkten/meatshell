@@ -234,6 +234,7 @@ const PROMPT_INTERACTIVE_SHELL_PROBE_ZSH: &str = "\u{1b}]698;zsh\u{07}";
 const PROMPT_INTERACTIVE_SHELL_PROBE_DONE: &str = "\u{1b}]699;probe-ready\u{07}";
 
 const PROMPT_SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const PROMPT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const PROMPT_SHELL_PROBE_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +398,36 @@ fn prompt_setup_mode(disabled: bool, probe_result: PromptSetupProbeResult) -> Pr
             PromptSetupProbeResult::Unsupported => PromptSetupMode::Disabled,
             PromptSetupProbeResult::Unavailable => PromptSetupMode::InteractiveProbe,
         }
+    }
+}
+
+fn initial_prompt_setup_phase(mode: PromptSetupMode) -> PromptSetupPhase {
+    match mode {
+        PromptSetupMode::Disabled => PromptSetupPhase::None,
+        PromptSetupMode::KnownSupported | PromptSetupMode::InteractiveProbe => {
+            PromptSetupPhase::InteractiveProbe
+        }
+    }
+}
+
+fn prompt_setup_phase_has_deadline(phase: PromptSetupPhase) -> bool {
+    matches!(
+        phase,
+        PromptSetupPhase::InteractiveProbe | PromptSetupPhase::FullSetup
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptSetupTimeoutAction {
+    ReleaseProbeOutput,
+    DropFullSetupEcho,
+}
+
+fn prompt_setup_timeout_action(phase: PromptSetupPhase) -> Option<PromptSetupTimeoutAction> {
+    match phase {
+        PromptSetupPhase::InteractiveProbe => Some(PromptSetupTimeoutAction::ReleaseProbeOutput),
+        PromptSetupPhase::FullSetup => Some(PromptSetupTimeoutAction::DropFullSetupEcho),
+        PromptSetupPhase::None => None,
     }
 }
 
@@ -2081,13 +2112,32 @@ async fn run_session(
                     None => std::future::pending().await,
                 }
             } => {
-                if prompt_setup_phase == PromptSetupPhase::InteractiveProbe {
+                if prompt_setup_phase_has_deadline(prompt_setup_phase) {
+                    let timed_out_phase = prompt_setup_phase;
                     prompt_setup_phase = PromptSetupPhase::None;
                     prompt_setup_deadline = None;
                     suppress_echo = false;
-                    let mut text = std::mem::take(&mut echo_buf);
-                    strip_interactive_shell_probe_echo(&mut text);
-                    let _ = events.send(SessionEvent::Output(text));
+                    match prompt_setup_timeout_action(timed_out_phase) {
+                        Some(PromptSetupTimeoutAction::ReleaseProbeOutput) => {
+                            let mut text = std::mem::take(&mut echo_buf);
+                            strip_interactive_shell_probe_echo(&mut text);
+                            let _ = events.send(SessionEvent::Output(text));
+                        }
+                        Some(PromptSetupTimeoutAction::DropFullSetupEcho) => {
+                            // The buffer is private setup echo. Do not render a
+                            // partial 14 KB command when a server never emits
+                            // the completion marker; later PTY output follows
+                            // the normal path and keeps the terminal usable.
+                            echo_buf.clear();
+                            late_prompt_echo_pending = true;
+                            tracing::warn!(
+                                host = %session.host,
+                                elapsed_ms = session_started.elapsed().as_millis(),
+                                "shell integration setup timed out; continuing without integration"
+                            );
+                        }
+                        None => {}
+                    }
                 }
             }
             cmd = commands.recv() => {
@@ -2289,17 +2339,13 @@ async fn run_session(
                             );
                         }
 
-                        // Inject PROMPT_COMMAND after the first real shell output,
-                        // unless shell integration is disabled for this session
-                        // (e.g. a Windows pwsh/cmd server) (#140).
+                        // Start with a short readiness probe after the first real
+                        // shell output. The full PROMPT_COMMAND body is sent only
+                        // after the interactive shell proves it is consuming
+                        // input, so a login banner cannot receive the long setup
+                        // command before the prompt is ready.
                         if !prompt_injected && !chunk.trim().is_empty() {
-                            let phase = match shell_setup_mode {
-                                PromptSetupMode::KnownSupported => PromptSetupPhase::FullSetup,
-                                PromptSetupMode::InteractiveProbe => {
-                                    PromptSetupPhase::InteractiveProbe
-                                }
-                                PromptSetupMode::Disabled => PromptSetupPhase::None,
-                            };
+                            let phase = initial_prompt_setup_phase(shell_setup_mode);
                             if phase == PromptSetupPhase::None {
                                 // The detected shell is unsupported or the user
                                 // disabled integration for this session.
@@ -2307,11 +2353,9 @@ async fn run_session(
                             } else {
                                 prompt_injected = true;
                                 prompt_setup_phase = phase;
-                                prompt_setup_deadline = (phase
-                                    == PromptSetupPhase::InteractiveProbe)
-                                    .then(|| {
-                                        tokio::time::Instant::now() + PROMPT_SHELL_PROBE_TIMEOUT
-                                    });
+                                prompt_setup_deadline = Some(
+                                    tokio::time::Instant::now() + PROMPT_SHELL_PROBE_TIMEOUT,
+                                );
                                 suppress_echo = true;
                                 // Keep buffering until the private marker arrives:
                                 // slow Linux/macOS PTYs may echo input after several
@@ -2379,7 +2423,9 @@ async fn run_session(
                                         if shell_probe_supported =>
                                     {
                                         prompt_setup_phase = PromptSetupPhase::FullSetup;
-                                        prompt_setup_deadline = None;
+                                        prompt_setup_deadline = Some(
+                                            tokio::time::Instant::now() + PROMPT_SETUP_TIMEOUT,
+                                        );
                                         echo_buf.clear();
                                         let _ = channel.data(prompt_setup.as_bytes()).await;
                                         continue;
@@ -2393,6 +2439,7 @@ async fn run_session(
                                     }
                                     PromptSetupPhase::FullSetup => {
                                         prompt_setup_phase = PromptSetupPhase::None;
+                                        prompt_setup_deadline = None;
                                         suppress_echo = false;
                                         late_prompt_echo_pending = false;
                                         if let Some(cwd) = extract_osc7_path(&tail) {
@@ -3566,14 +3613,45 @@ fn _assert_handle_send() {
 #[cfg(test)]
 mod prompt_setup_echo_tests {
     use super::{
-        bound_prompt_setup_echo, interactive_shell_probe_supported, prompt_body,
-        prompt_setup_echo_end, prompt_setup_mode, prompt_setup_probe_result,
-        prompt_setup_supported, strip_late_prompt_setup_echo, strip_pending_prompt_setup_echo,
-        strip_prompt_setup_echo, take_after_prompt_marker, take_after_prompt_setup_done,
-        PromptSetupMode, PromptSetupProbeResult, PROMPT_INTERACTIVE_SHELL_PROBE_BASH,
+        bound_prompt_setup_echo, initial_prompt_setup_phase, interactive_shell_probe_supported,
+        prompt_body, prompt_setup_echo_end, prompt_setup_mode, prompt_setup_phase_has_deadline,
+        prompt_setup_probe_result, prompt_setup_supported, prompt_setup_timeout_action,
+        strip_late_prompt_setup_echo, strip_pending_prompt_setup_echo, strip_prompt_setup_echo,
+        take_after_prompt_marker, take_after_prompt_setup_done, PromptSetupMode, PromptSetupPhase,
+        PromptSetupProbeResult, PromptSetupTimeoutAction, PROMPT_INTERACTIVE_SHELL_PROBE_BASH,
         PROMPT_INTERACTIVE_SHELL_PROBE_DONE, PROMPT_SETUP_DONE, PROMPT_SETUP_HISTORY_MARKER,
         PROMPT_SETUP_PREFIX,
     };
+
+    #[test]
+    fn supported_shells_start_with_the_short_interactive_readiness_probe() {
+        assert_eq!(
+            initial_prompt_setup_phase(PromptSetupMode::KnownSupported),
+            PromptSetupPhase::InteractiveProbe
+        );
+        assert_eq!(
+            initial_prompt_setup_phase(PromptSetupMode::InteractiveProbe),
+            PromptSetupPhase::InteractiveProbe
+        );
+    }
+
+    #[test]
+    fn readiness_and_full_setup_phases_are_recoverable_by_deadline() {
+        assert!(prompt_setup_phase_has_deadline(
+            PromptSetupPhase::InteractiveProbe
+        ));
+        assert!(prompt_setup_phase_has_deadline(PromptSetupPhase::FullSetup));
+        assert!(!prompt_setup_phase_has_deadline(PromptSetupPhase::None));
+        assert_eq!(
+            prompt_setup_timeout_action(PromptSetupPhase::InteractiveProbe),
+            Some(PromptSetupTimeoutAction::ReleaseProbeOutput)
+        );
+        assert_eq!(
+            prompt_setup_timeout_action(PromptSetupPhase::FullSetup),
+            Some(PromptSetupTimeoutAction::DropFullSetupEcho)
+        );
+        assert_eq!(prompt_setup_timeout_action(PromptSetupPhase::None), None);
+    }
 
     #[test]
     fn only_bash_and_zsh_receive_prompt_setup() {
